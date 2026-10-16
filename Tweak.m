@@ -1,4 +1,4 @@
-// EchoMod.dylib — FPS unlock + FPS counter for Fortnite iOS 3.6 (Echo client)
+// NEWLIB.dylib — FPS unlock + FPS counter for Fortnite iOS 3.6 (Echo client)
 // Plain Objective-C runtime hooks. No theos/Logos required.
 //
 // What it does:

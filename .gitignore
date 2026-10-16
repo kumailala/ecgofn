@@ -1,4 +1,9 @@
 # build output
+NEWLIB.dylib
+NEWLIB_arm64.dylib
+NEWLIB_arm64e.dylib
+
+# old name (kept so a stale copy can't be committed)
 EchoMod.dylib
 EchoMod_arm64.dylib
 EchoMod_arm64e.dylib

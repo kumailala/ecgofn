@@ -30,14 +30,14 @@ The first push pops up a browser sign-in (Git Credential Manager) or asks for a 
 (Classic token with `repo` scope). Nothing else to configure.
 
 ### Getting the dylib
-1. Push (or **Actions → Build EchoMod.dylib → Run workflow** to re-run on demand).
+1. Push (or **Actions → Build NEWLIB.dylib → Run workflow** to re-run on demand).
 2. Wait ~1–2 min, open the green run.
-3. Under **Artifacts**, download **EchoMod.dylib** (arrives as a `.zip` — unzip to get the dylib).
+3. Under **Artifacts**, download **NEWLIB.dylib** (arrives as a `.zip` — unzip to get the dylib).
 4. The run's **Verify** step prints the arch (`arm64 arm64e`), the install name
-   (`@executable_path/EchoMod.dylib`) and a sha256, so you can confirm it's a real fat dylib.
+   (`@executable_path/NEWLIB.dylib`) and a sha256, so you can confirm it's a real fat dylib.
 
 ### What the workflow does
-`checkout → show Xcode/SDK → ./build.sh EchoMod.dylib → verify (lipo/otool) → upload artifact`.
+`checkout → show Xcode/SDK → ./build.sh NEWLIB.dylib → verify (lipo/otool) → upload artifact`.
 It triggers on pushes touching `echomod/**`, and manually via `workflow_dispatch`.
 
 ### Notes
@@ -47,7 +47,7 @@ It triggers on pushes touching `echomod/**`, and manually via `workflow_dispatch
 - macOS runner minutes are free on public repos; on private they bill at 10× (a build is ~1–2 min,
   so it's negligible).
 - Optional `gh` CLI shortcut instead of the website:
-  `gh run watch` then `gh run download -n EchoMod.dylib`.
+  `gh run watch` then `gh run download -n NEWLIB.dylib`.
 
 ---
 

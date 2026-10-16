@@ -1,4 +1,4 @@
-name: Build EchoMod.dylib
+name: Build NEWLIB.dylib
 
 on:
   push:
@@ -22,21 +22,21 @@ jobs:
       - name: Build fat dylib
         run: |
           chmod +x build.sh
-          ./build.sh EchoMod.dylib
+          ./build.sh NEWLIB.dylib
 
       - name: Verify
         run: |
           set -e
           echo "== architectures =="
-          lipo -info EchoMod.dylib
+          lipo -info NEWLIB.dylib
           echo "== install name =="
-          otool -D EchoMod.dylib
+          otool -D NEWLIB.dylib
           echo "== sha256 =="
-          shasum -a 256 EchoMod.dylib
+          shasum -a 256 NEWLIB.dylib
 
-      - name: Upload EchoMod.dylib
+      - name: Upload NEWLIB.dylib
         uses: actions/upload-artifact@v4
         with:
-          name: EchoMod.dylib
-          path: EchoMod.dylib
+          name: NEWLIB.dylib
+          path: NEWLIB.dylib
           if-no-files-found: error
