@@ -35,7 +35,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <math.h>
 
@@ -498,12 +498,21 @@ typedef struct { float x, y; }   FV2;
 
 // --- safe memory access ----------------------------------------------------------------
 
+// <mach/mach_vm.h> is marked "unsupported" in the iOS SDK, so resolve the (present-in-
+// libSystem) function at runtime instead of relying on the header.
+typedef kern_return_t (*MvReadFn)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
+                                  mach_vm_address_t, mach_vm_size_t *);
+static MvReadFn gMvRead = NULL;
+
 static BOOL safe_read(uintptr_t addr, void *dst, size_t n) {
     if (addr < 0x100000000ULL) return NO;
-    vm_size_t got = 0;
-    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
-                                              (mach_vm_address_t)addr, (mach_vm_size_t)n,
-                                              (mach_vm_address_t)(uintptr_t)dst, &got);
+    if (!gMvRead) {
+        gMvRead = (MvReadFn)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        if (!gMvRead) return NO;
+    }
+    mach_vm_size_t got = 0;
+    kern_return_t kr = gMvRead(mach_task_self(), (mach_vm_address_t)addr,
+                               (mach_vm_size_t)n, (mach_vm_address_t)(uintptr_t)dst, &got);
     return (kr == KERN_SUCCESS && got == n);
 }
 
