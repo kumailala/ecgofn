@@ -18,3 +18,6 @@ EchoMod_arm64e.dylib
 
 # misc
 *.log
+
+# any stray dylib
+*.dylib
