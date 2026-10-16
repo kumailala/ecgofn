@@ -1,0 +1,42 @@
+name: Build EchoMod.dylib
+
+on:
+  push:
+  workflow_dispatch:        # lets you hit "Run workflow" manually
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14        # ships Xcode; needed for the iOS SDK + arm64e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: Build fat dylib
+        run: |
+          chmod +x build.sh
+          ./build.sh EchoMod.dylib
+
+      - name: Verify
+        run: |
+          set -e
+          echo "== architectures =="
+          lipo -info EchoMod.dylib
+          echo "== install name =="
+          otool -D EchoMod.dylib
+          echo "== sha256 =="
+          shasum -a 256 EchoMod.dylib
+
+      - name: Upload EchoMod.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoMod.dylib
+          path: EchoMod.dylib
+          if-no-files-found: error

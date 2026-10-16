@@ -1,0 +1,15 @@
+# build output
+EchoMod.dylib
+EchoMod_arm64.dylib
+EchoMod_arm64e.dylib
+
+# never commit game/IPA dumps
+*.ipa
+*.pak
+*.sig
+
+# macOS
+.DS_Store
+
+# misc
+*.log

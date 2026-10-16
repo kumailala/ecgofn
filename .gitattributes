@@ -1,0 +1,12 @@
+# Shell scripts / ObjC / YAML must be LF or the macOS runner chokes on `\r`.
+*.sh   text eol=lf
+*.m    text eol=lf
+*.h    text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+
+# binaries — never touch
+*.dylib binary
+*.ipa   binary
+*.pak   binary
