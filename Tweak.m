@@ -58,6 +58,9 @@ static dispatch_source_t gPlatTimer = nil;
 @end
 static NSMutableArray<EchoOverheadLabel *> *gLabels = nil;
 
+// engine address probe result (filled in by probeEngine() in section 6, shown in the HUD panel)
+static BOOL gProbeInRange = NO;
+
 #pragma mark - runtime helper
 
 static void exchange(Class cls, SEL sel, IMP newImp, IMP *storeOrig) {
@@ -251,10 +254,11 @@ static void installPlatformOverlay(void) {
                 total++;
                 if (L.nx >= 0.0 && L.nx <= 1.0 && L.ny >= 0.0 && L.ny <= 1.0) onscreen++;
             }
+            NSString *eng = gProbeInRange ? @"ok" : @"NO";
             setPlatLines(@[
                 @"[EchoMod] platform test",
                 [NSString stringWithFormat:@"labels: %d  onscreen: %d", total, onscreen],
-                [NSString stringWithFormat:@"engine: %@", gProbeInRange ? @"ok" : @"NO"],
+                [NSString stringWithFormat:@"engine: %@", eng],
                 [NSString stringWithFormat:@"tick: %d", ++tick],
             ]);
         });
@@ -438,7 +442,7 @@ static uintptr_t gImgBase     = 0;
 static uintptr_t gImgEnd      = 0;
 static uintptr_t gProbeProj   = 0;
 static uintptr_t gProbePlat   = 0;
-static BOOL      gProbeInRange = NO;
+// (gProbeInRange is declared up top, next to gLabels, because the HUD panel reads it)
 
 // Upper bound of the main image by walking its Mach-O load commands. The header is always
 // mapped, so this is safe to read; we never touch the resolved function addresses.
