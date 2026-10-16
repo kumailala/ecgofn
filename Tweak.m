@@ -14,14 +14,19 @@
 //        before real per-player platform data is wired in.
 //   4) Startup alert: a one-shot "dylib loaded OK" popup with an OK button, so you can confirm
 //        injection even if the overlays never render.
-//   5) Overhead labels (TEST SCAFFOLD): floating "platform" labels drawn per-frame at
-//        screen positions and hidden the instant they leave the screen ("only when visible").
-//        Driven by synthetic motion for now — the ONLY block to replace for real data is
-//        fillTestLabels() in section 5 (player head world-pos -> projected (nx, ny)).
+//   5) Overhead labels: a per-frame layer of floating labels drawn at each player's projected
+//        head position (world -> screen via the engine's own ProjectWorldLocationToScreen), so
+//        they track players in 3D instead of sitting on a flat overlay. Hidden the instant they
+//        leave the screen. The real data comes from section 7.
 //   6) Engine address probe (SAFE): resolves offline-recovered engine function addresses against
 //        the live ASLR slide and reports whether they land inside the main image. No hooking and
 //        no dereferencing of game code, so it cannot crash the app. This is the gate that proves
-//        our offline symbol map is usable before any real hook is attempted.
+//        our offline symbol map is usable before any real engine access is attempted.
+//   7) Real player data (NO hooks): calls the engine's GetPlayerController / GetGameState directly
+//        and reads memory through mach_vm_read_overwrite (which never faults on a bad address),
+//        then projects each player's pawn position to screen. No inline hooking, because iOS
+//        code-signing blocks patching __TEXT on a non-jailbroken app. All offsets/addresses were
+//        recovered offline from the decrypted binary (research/NOTES.md).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -29,7 +34,10 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <stdatomic.h>
+#include <math.h>
 
 static _Atomic int gMetalFrames   = 0;
 static _Atomic int gDisplayFrames = 0;
@@ -60,6 +68,10 @@ static NSMutableArray<EchoOverheadLabel *> *gLabels = nil;
 
 // engine address probe result (filled in by probeEngine() in section 6, shown in the HUD panel)
 static BOOL gProbeInRange = NO;
+
+// engine-data diagnostics (filled in section 7, shown in the HUD panel)
+static BOOL gDiagEngine, gDiagPC, gDiagGameState;
+static int  gDiagPlayers, gDiagDrawn;
 
 #pragma mark - runtime helper
 
@@ -249,17 +261,17 @@ static void installPlatformOverlay(void) {
         dispatch_source_set_event_handler(timer, ^{
             static int tick = 0;
             attachScene(gPlatOverlay); // self-heal if the scene connected after install
-            int total = 0, onscreen = 0;
+            int onscreen = 0;
             for (EchoOverheadLabel *L in gLabels) {
-                total++;
                 if (L.nx >= 0.0 && L.nx <= 1.0 && L.ny >= 0.0 && L.ny <= 1.0) onscreen++;
             }
             NSString *eng = gProbeInRange ? @"ok" : @"NO";
             setPlatLines(@[
-                @"[EchoMod] platform test",
-                [NSString stringWithFormat:@"labels: %d  onscreen: %d", total, onscreen],
-                [NSString stringWithFormat:@"engine: %@", eng],
-                [NSString stringWithFormat:@"tick: %d", ++tick],
+                @"[EchoMod] overhead labels",
+                [NSString stringWithFormat:@"engine: %@  pc: %@", eng, gDiagPC ? @"Y" : @"n"],
+                [NSString stringWithFormat:@"gs: %@  players: %d  drawn: %d",
+                    gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagDrawn],
+                [NSString stringWithFormat:@"onscreen: %d  tick: %d", onscreen, ++tick],
             ]);
         });
         gPlatTimer = timer;         // keep alive (see note at top)
@@ -322,6 +334,7 @@ static void showLoadedAlert(int attempt) {
 @end
 
 static void updateOverheadLabels(void);   // fwd
+static void fillPlayerLabels(void);       // fwd (real player data, defined in section 7)
 
 @interface EchoLabelTicker : NSObject
 @end
@@ -340,47 +353,17 @@ static BOOL pointOnScreen(CGFloat nx, CGFloat ny) {
     return nx >= 0.0 && nx <= 1.0 && ny >= 0.0 && ny <= 1.0;
 }
 
-// ---- TEST SOURCE -------------------------------------------------------------------------
-// No real player data yet, so drive the labels with slow synthetic motion. This is the ONLY
-// block that changes when real data lands: replace it with
-//     for each visible player:  (nx, ny) = project(headWorldPos);  text = platform
-// ------------------------------------------------------------------------------------------
-static void fillTestLabels(void) {
-    static const int kCount = 3;
-    if (!gLabels) return;
-
-    while ((int)gLabels.count < kCount) {
-        EchoOverheadLabel *L = [[EchoOverheadLabel alloc] init];
-        L.text = @"platform";
-
-        UILabel *v = [[UILabel alloc] init];
-        v.text            = L.text;
-        v.font            = [UIFont boldSystemFontOfSize:13.0];
-        v.textColor       = [UIColor whiteColor];
-        v.textAlignment   = NSTextAlignmentCenter;
-        v.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
-        v.layer.cornerRadius = 4.0;
-        v.clipsToBounds   = YES;
-        L.view = v;
-        [gLabelRoot addSubview:v];
-        [gLabels addObject:L];
-    }
-
-    double t = CACurrentMediaTime() - gLabelT0;
-    for (NSUInteger i = 0; i < gLabels.count; i++) {
-        EchoOverheadLabel *L = gLabels[i];
-        double ph = t * 0.5 + i * 2.1;
-        L.nx = 0.30 + 0.20 * i + 0.06 * sin(ph);
-        L.ny = 0.45 + 0.05 * cos(ph * 1.3);
-        if (i == 2) L.nx = 0.92 + 0.16 * sin(ph);  // drifts off-screen to exercise the gate
-    }
-}
+// ---- player data source --------------------------------------------------------------
+// Real labels come from section 7 (fillPlayerLabels): each player's pawn world position,
+// projected to screen with the engine's own ProjectWorldLocationToScreen. If the engine
+// pointers can't be resolved yet, no labels are shown (rather than fake ones).
+// ---------------------------------------------------------------------------------------
 
 static void updateOverheadLabels(void) {
     if (!gLabelRoot) return;
     attachScene(gLabelWindow);
 
-    fillTestLabels();
+    fillPlayerLabels();
 
     CGSize sz = gLabelRoot.bounds.size;
     for (EchoOverheadLabel *L in gLabels) {
@@ -440,6 +423,7 @@ static const uintptr_t kSym_OnRep_Platform               = 0x1012b7fd8;
 
 static uintptr_t gImgBase     = 0;
 static uintptr_t gImgEnd      = 0;
+static intptr_t  gSlide       = 0;
 static uintptr_t gProbeProj   = 0;
 static uintptr_t gProbePlat   = 0;
 // (gProbeInRange is declared up top, next to gLabels, because the HUD panel reads it)
@@ -463,6 +447,7 @@ static void probeEngine(void) {
     const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
     if (!h) return;
     intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    gSlide = slide;
 
     imageBounds(h, &gImgBase, &gImgEnd);
     gProbeProj = (uintptr_t)((intptr_t)kSym_ProjectWorldLocationToScreen + slide);
@@ -474,6 +459,199 @@ static void probeEngine(void) {
           (void *)gImgBase, (void *)gImgEnd, (long)slide);
     NSLog(@"[EchoMod]   ProjectWorldLocationToScreen=%p  GetPlayerPlatform=%p  inRange=%d",
           (void *)gProbeProj, (void *)gProbePlat, (int)gProbeInRange);
+}
+
+#pragma mark - 7) real player data -> 3D overhead labels (no hooks)
+
+// Everything here is a *direct call* to an engine function plus *safe* memory reads
+// (mach_vm_read_overwrite never faults on a bad address). No inline hooking, because iOS
+// code-signing blocks patching __TEXT on a non-jailbroken app.
+//
+// Addresses/offsets recovered offline from the decrypted binary (see research/NOTES.md):
+//
+//   global 0x105817be8        GEngine/GWorld (UObject; vtable slot 0x148 == UObject::GetWorld)
+//   native 0x101b3f8a8        GetGameState(WorldContext) -> AGameStateBase*
+//   native 0x1016d9c60        GetPlayerController(WorldContext, index) -> APlayerController*
+//   native 0x101d94a08        ProjectWorldLocationToScreen(this, FVector, FVector2D*, bool)
+//   native 0x102d35e60        K2_GetActorLocation(this) -> FVector (3 floats)
+//
+//   UWorld::GameState             +0x148
+//   AGameStateBase::PlayerArray   +0x330 (Data) / +0x338 (Num)   [TArray<APlayerState*>]
+//   AController::Pawn             +0x348
+//   AActor location (3 floats)    +0x190
+
+#define A_GLOBAL_ENGINE        0x105817be8ULL
+#define A_NATIVE_GETGAMESTATE  0x101b3f8a8ULL
+#define A_NATIVE_GETPC         0x1016d9c60ULL
+#define A_NATIVE_PWLS          0x101d94a08ULL
+
+#define OFF_WORLD_GAMESTATE    0x148
+#define OFF_GS_PLAYERARRAY     0x330
+#define OFF_GS_PLAYERARRAY_NUM 0x338
+#define OFF_CTRL_PAWN          0x348
+#define OFF_ACTOR_LOCATION     0x190
+
+typedef struct { float x, y, z; } FV3;
+typedef struct { float x, y; }   FV2;
+
+#define SYM(va) ((uintptr_t)((intptr_t)(va) + gSlide))
+
+// --- safe memory access ----------------------------------------------------------------
+
+static BOOL safe_read(uintptr_t addr, void *dst, size_t n) {
+    if (addr < 0x100000000ULL) return NO;
+    vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
+                                              (mach_vm_address_t)addr, (mach_vm_size_t)n,
+                                              (mach_vm_address_t)(uintptr_t)dst, &got);
+    return (kr == KERN_SUCCESS && got == n);
+}
+
+static uintptr_t rd_ptr(uintptr_t addr) {
+    uintptr_t v = 0;
+    return safe_read(addr, &v, sizeof v) ? v : 0;
+}
+
+static int32_t rd_i32(uintptr_t addr) {
+    int32_t v = 0;
+    return safe_read(addr, &v, sizeof v) ? v : 0;
+}
+
+// A UE UObject's first word is its vtable, which lives inside the main image.
+static BOOL looks_like_uobject(uintptr_t p) {
+    if (p < 0x100000000ULL || (p & 0x7)) return NO;
+    uintptr_t vt = rd_ptr(p);
+    return (vt >= gImgBase && vt < gImgEnd);
+}
+
+static BOOL sane_vec(FV3 v) {
+    return isfinite(v.x) && isfinite(v.y) && isfinite(v.z) &&
+           fabsf(v.x) < 1.0e6f && fabsf(v.y) < 1.0e6f && fabsf(v.z) < 1.0e6f;
+}
+
+// --- resolved engine entry points ------------------------------------------------------
+
+static void *(*gfn_GetGameState)(void *)            = NULL;   // (WorldContext)
+static void *(*gfn_GetPlayerController)(void *, int32_t) = NULL; // (WorldContext, index)
+static BOOL  (*gfn_PWLS)(void *, FV3, FV2 *, BOOL)  = NULL;   // (this, world, out, rel)
+
+// --- diagnostics (shown in the top-right panel) ----------------------------------------
+// (the globals are declared up top, next to gProbeInRange, because the panel reads them)
+
+static void *gEngine   = NULL;
+static void *gLocalPC  = NULL;
+static void *gGameState = NULL;
+
+// Resolve the entry points once. Safe: only computes addresses + one validated global read.
+static void resolveEngine(void) {
+    if (!gSlide) return;
+    if (!gfn_GetGameState)       gfn_GetGameState       = (void *)SYM(A_NATIVE_GETGAMESTATE);
+    if (!gfn_GetPlayerController) gfn_GetPlayerController = (void *)SYM(A_NATIVE_GETPC);
+    if (!gfn_PWLS)               gfn_PWLS               = (void *)SYM(A_NATIVE_PWLS);
+
+    uintptr_t eng = rd_ptr(SYM(A_GLOBAL_ENGINE));
+    if (looks_like_uobject(eng)) {
+        gEngine = (void *)eng;
+        gDiagEngine = YES;
+    }
+}
+
+// --- the real label source -------------------------------------------------------------
+
+static EchoOverheadLabel *labelAtIndex(NSUInteger i) {
+    if (!gLabels) return nil;
+    while (gLabels.count <= i) {
+        EchoOverheadLabel *L = [[EchoOverheadLabel alloc] init];
+        UILabel *v = [[UILabel alloc] init];
+        v.text            = @"platform";
+        v.font            = [UIFont boldSystemFontOfSize:13.0];
+        v.textColor       = [UIColor whiteColor];
+        v.textAlignment   = NSTextAlignmentCenter;
+        v.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+        v.layer.cornerRadius = 4.0;
+        v.clipsToBounds   = YES;
+        L.view = v;
+        L.text = @"platform";
+        if (gLabelRoot) [gLabelRoot addSubview:v];
+        [gLabels addObject:L];
+    }
+    return gLabels[i];
+}
+
+static void fillPlayerLabels(void) {
+    if (!gLabels) return;
+    resolveEngine();
+
+    gDiagPC = NO; gDiagGameState = NO; gDiagPlayers = 0; gDiagDrawn = 0;
+
+    if (!gEngine || !gfn_GetPlayerController || !gfn_GetGameState || !gfn_PWLS) {
+        for (EchoOverheadLabel *L in gLabels) L.nx = -1.0;   // hide everything
+        return;
+    }
+
+    // local player controller (drives the projection)
+    if (!looks_like_uobject((uintptr_t)gLocalPC)) {
+        void *pc = gfn_GetPlayerController(gEngine, 0);
+        if (looks_like_uobject((uintptr_t)pc)) gLocalPC = pc;
+    }
+    if (!looks_like_uobject((uintptr_t)gLocalPC)) {
+        for (EchoOverheadLabel *L in gLabels) L.nx = -1.0;
+        return;
+    }
+    gDiagPC = YES;
+
+    // game state -> PlayerArray (TArray<APlayerState*>)
+    void *gs = gfn_GetGameState(gEngine);
+    if (!looks_like_uobject((uintptr_t)gs)) gs = NULL;
+    gGameState = gs;
+
+    uintptr_t psData = 0;
+    int32_t   psNum  = 0;
+    if (gs) {
+        gDiagGameState = YES;
+        psData = rd_ptr((uintptr_t)gs + OFF_GS_PLAYERARRAY);
+        psNum  = rd_i32((uintptr_t)gs + OFF_GS_PLAYERARRAY_NUM);
+    }
+    if (psNum < 0) psNum = 0;
+    if (psNum > 64) psNum = 64;
+    gDiagPlayers = psNum;
+
+    CGSize sz = gLabelRoot ? gLabelRoot.bounds.size : CGSizeZero;
+    CGFloat scale = [UIScreen mainScreen].scale;
+    if (scale <= 0.0) scale = 1.0;
+
+    NSUInteger used = 0;
+    for (int32_t i = 0; i < psNum; i++) {
+        uintptr_t ps = rd_ptr(psData + (uintptr_t)i * 8);
+        if (!looks_like_uobject(ps)) continue;
+
+        uintptr_t pawn = rd_ptr(ps + OFF_CTRL_PAWN);
+        if (!looks_like_uobject(pawn)) continue;
+
+        FV3 loc = {0, 0, 0};
+        if (!safe_read(pawn + OFF_ACTOR_LOCATION, &loc, sizeof loc)) continue;
+        if (!sane_vec(loc)) continue;
+
+        loc.z += 92.0f;   // aim just above the head
+
+        FV2 out = {0, 0};
+        BOOL ok = gfn_PWLS(gLocalPC, loc, &out, NO);
+        if (!ok) continue;
+
+        CGFloat nx = (out.x / scale) / (sz.width  > 0 ? sz.width  : 1.0);
+        CGFloat ny = (out.y / scale) / (sz.height > 0 ? sz.height : 1.0);
+        if (!pointOnScreen(nx, ny)) continue;
+
+        EchoOverheadLabel *L = labelAtIndex(used);
+        if (!L) break;
+        L.text = @"platform";
+        L.nx = nx;
+        L.ny = ny;
+        used++;
+    }
+
+    gDiagDrawn = (int)used;
+    for (NSUInteger i = used; i < gLabels.count; i++) gLabels[i].nx = -1.0;  // hide the rest
 }
 
 #pragma mark - init
