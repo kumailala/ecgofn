@@ -18,11 +18,17 @@
 //        screen positions and hidden the instant they leave the screen ("only when visible").
 //        Driven by synthetic motion for now — the ONLY block to replace for real data is
 //        fillTestLabels() in section 5 (player head world-pos -> projected (nx, ny)).
+//   6) Engine address probe (SAFE): resolves offline-recovered engine function addresses against
+//        the live ASLR slide and reports whether they land inside the main image. No hooking and
+//        no dereferencing of game code, so it cannot crash the app. This is the gate that proves
+//        our offline symbol map is usable before any real hook is attempted.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #include <stdatomic.h>
 
 static _Atomic int gMetalFrames   = 0;
@@ -248,6 +254,7 @@ static void installPlatformOverlay(void) {
             setPlatLines(@[
                 @"[EchoMod] platform test",
                 [NSString stringWithFormat:@"labels: %d  onscreen: %d", total, onscreen],
+                [NSString stringWithFormat:@"engine: %@", gProbeInRange ? @"ok" : @"NO"],
                 [NSString stringWithFormat:@"tick: %d", ++tick],
             ]);
         });
@@ -417,6 +424,54 @@ static void installLabelLayer(void) {
     });
 }
 
+#pragma mark - 6) engine address probe (SAFE: no hooking, no deref of game code)
+
+// Preferred (unslid) VM addresses recovered offline from the decrypted binary by scanning the
+// UE reflection registration tables in __DATA for { name_string_ptr, code_ptr } pairs.
+// See research/NOTES.md (kept outside the public repo). Nothing is hooked here — we only
+// resolve the runtime address and prove it lands inside the main image's mapped range.
+static const uintptr_t kSym_ProjectWorldLocationToScreen = 0x100e7b304;
+static const uintptr_t kSym_GetPlayerPlatform            = 0x101acf364;
+static const uintptr_t kSym_OnRep_Platform               = 0x1012b7fd8;
+
+static uintptr_t gImgBase     = 0;
+static uintptr_t gImgEnd      = 0;
+static uintptr_t gProbeProj   = 0;
+static uintptr_t gProbePlat   = 0;
+static BOOL      gProbeInRange = NO;
+
+// Upper bound of the main image by walking its Mach-O load commands. The header is always
+// mapped, so this is safe to read; we never touch the resolved function addresses.
+static void imageBounds(const struct mach_header_64 *h, uintptr_t *lo, uintptr_t *hi) {
+    uintptr_t a = (uintptr_t)h, end = (uintptr_t)h;
+    const struct load_command *lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const struct segment_command_64 *)lc;
+            if (s->vmsize && s->vmaddr + s->vmsize > end) end = s->vmaddr + s->vmsize;
+        }
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    *lo = a; *hi = end;
+}
+
+static void probeEngine(void) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!h) return;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+
+    imageBounds(h, &gImgBase, &gImgEnd);
+    gProbeProj = (uintptr_t)((intptr_t)kSym_ProjectWorldLocationToScreen + slide);
+    gProbePlat = (uintptr_t)((intptr_t)kSym_GetPlayerPlatform + slide);
+    gProbeInRange = (gProbeProj >= gImgBase && gProbeProj < gImgEnd &&
+                     gProbePlat >= gImgBase && gProbePlat < gImgEnd);
+
+    NSLog(@"[EchoMod] engine probe: base=%p end=%p slide=%ld",
+          (void *)gImgBase, (void *)gImgEnd, (long)slide);
+    NSLog(@"[EchoMod]   ProjectWorldLocationToScreen=%p  GetPlayerPlatform=%p  inRange=%d",
+          (void *)gProbeProj, (void *)gProbePlat, (int)gProbeInRange);
+}
+
 #pragma mark - init
 
 __attribute__((constructor)) static void EchoModInit(void) {
@@ -458,6 +513,7 @@ __attribute__((constructor)) static void EchoModInit(void) {
             installOverlay();
             installPlatformOverlay();
             installLabelLayer();
+            probeEngine();
             showLoadedAlert(0);
         });
     }];

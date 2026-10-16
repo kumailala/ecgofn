@@ -158,7 +158,7 @@ sg.ResolutionQuality=100.000000
 
 ## Dylib self-test (does it load at all?)
 
-`Tweak.m` now has **three** independent proofs that the dylib is injected and running. Any one
+`Tweak.m` now has several independent proofs that the dylib is injected and running. Any one
 of them showing up is enough; if you see none, the dylib isn't loaded (injection/re-sign problem,
 not code):
 
@@ -166,11 +166,14 @@ not code):
    OK ✅ (injection test)"* with an **OK** button. Presented on the game's top-most view
    controller (retries for a few seconds if the UI isn't up yet).
 2. **FPS counter** — top-left, live number.
-3. **Platform HUD** — top-right, live test text with a climbing `tick`.
+3. **Platform HUD** — top-right, live test text with a climbing `tick` and an `engine: ok/NO` line.
+4. **Engine probe** — the `engine:` line above; `ok` means the offline symbol map resolved to real
+   code addresses in the live process.
 
 Also logs to the device console (`NSLog`):
 ```
 [EchoMod] dylib loaded — constructor ran
+[EchoMod] engine probe: base=0x... end=0x... slide=...
 [EchoMod] loaded alert presented on <VC class>
 ```
 (Use Console.app / `idevicesyslog` on the connected device to see these.)
@@ -209,24 +212,64 @@ Everything synthetic is inside `fillTestLabels()`:
 //   (nx, ny) = project(headWorldPos);  text = platform
 ```
 
-### Why the real version is a separate job (recon findings)
+### Recon findings
 
-`FortniteClient` is decrypted, but its symbol table is only 1,937 entries and holds **only
-third-party exports** (PhysX, Vivox, `AVPlayer`, `GKPlayer`). The engine names we need exist
-only as **UE reflection strings**, not callable symbols:
+`FortniteClient` is **decrypted** (no `LC_ENCRYPTION_INFO_64`) and is built from
+`++Fortnite+Release-3.6+Full` (UE4.19-era). Its symbol table is only 1,937 entries and holds
+**only third-party exports** (PhysX, Vivox, `AVPlayer`, `GKPlayer`) — no engine symbols.
+
+But the engine names exist as **UE reflection strings**, and the registration tables in `__DATA`
+store `{ name_string_ptr, code_ptr }` pairs. Scanning those recovers
+**26,420 function names with addresses** (kept in `../research/fortnite36_symbols.json`, outside
+this public repo). Everything we need is in there:
 
 ```
-ProjectWorldLocationToScreen   GetPlatformName / PlatformName
-AccountId / PlatformAccountId  PlayerState / PlayerStates / GetOwningPlayerState
-SFortNameplateIndicator        GetNameplatesEnabled / SetNameplatesEnabled
+GetPlayerPlatform          OnRep_Platform          <-- platform is a replicated PlayerState property
+GetPlatformName            IsMobilePlatform / IsConsolePlatform / IsPS4Platform / IsXboxPlatform
+ProjectWorldLocationToScreen                       <-- world -> screen
+DeprojectScreenPositionToWorld
+GetPlayerController / GetPlayerPawn / GetOwningPlayerState / GetGameState
+AddActorIndicator / AreIndicatorsEnabled           <-- Fortnite's HUD actor-indicator system
+GetNameplatesEnabled / SetNameplatesEnabled
 ```
 
-So real data needs actual RE (find the UWorld/GameState, walk `PlayerArray`, read each pawn's
-head position, get the camera view matrix, project). Two viable routes:
-1. **Our own projection** — resolve the engine's `ProjectWorldLocationToScreen` via the UFunction
-   registry, or reimplement the matrix math from the camera.
-2. **Piggyback the nameplates** — the game already draws nameplates at the right place and only
-   when visible; hooking the nameplate widget gets positioning *and* visibility for free.
+`OnRep_Platform` is the key one: it's the **replicated-property callback**, so the client already
+receives every player's platform. The data exists on-device; we just have to read it.
+
+### Address → runtime address
+
+The recovered addresses are preferred (unslid) VM addresses. At runtime the image is ASLR-slid:
+
+```c
+real = image_base + (symbol_addr - 0x100000000);   // 0x100000000 == __TEXT vmaddr
+```
+
+### Step 3 (current): engine address probe (SAFE)
+
+`Tweak.m` section 6 resolves `ProjectWorldLocationToScreen` and `GetPlayerPlatform` against the
+live slide, walks the main image's `LC_SEGMENT_64`s to get its mapped bounds, and reports whether
+the resolved addresses land inside it. **No hooking and no dereferencing of game code**, so it
+cannot crash. The top-right panel shows `engine: ok` / `engine: NO`, and `NSLog` prints:
+
+```
+[EchoMod] engine probe: base=0x... end=0x... slide=...
+[EchoMod]   ProjectWorldLocationToScreen=0x...  GetPlayerPlatform=0x...  inRange=1
+```
+
+`engine: ok` proves the offline symbol map is usable on-device — the gate before any real hook.
+
+### Two routes for real data
+
+1. **Our own projection** — resolve the engine's `ProjectWorldLocationToScreen` and feed real
+   `(nx, ny)` into `fillTestLabels()`. Caveat: projection only means "in front of the camera",
+   not "not occluded", so a projection-only label would show **through walls**.
+2. **Piggyback the nameplates / actor indicators** — the game already draws those at the right
+   place **and only when visible**; hooking that gets positioning *and* correct visibility for free.
+   This is the preferred route (it keeps the "only when visible" rule honest).
+
+Both still need **member offsets** (World → GameState → PlayerArray → Pawn → Location, and the
+PlayerState `Platform` property), which are the next RE step, plus on-device validation —
+because a wrong offset is a crash, not a wrong number.
 
 ## Platform HUD (older panel notes)
 
