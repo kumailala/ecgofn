@@ -34,6 +34,11 @@ static UILabel   *gPlatLabel  = nil;
 static UIWindow  *gPlatOverlay = nil;
 static const CGFloat gPlatWidth = 300.0;
 
+// dispatch sources are ARC-managed objects: a *local* one is released when the enclosing
+// block ends, so the timer never fires. Keep strong refs or the overlay never updates.
+static dispatch_source_t gFpsTimer  = nil;
+static dispatch_source_t gPlatTimer = nil;
+
 #pragma mark - runtime helper
 
 static void exchange(Class cls, SEL sel, IMP newImp, IMP *storeOrig) {
@@ -159,6 +164,7 @@ static void installOverlay(void) {
             gFpsLabel.text = [NSString stringWithFormat:@"FPS: %d%@", fps,
                               gUseDisplay ? @" (disp)" : @""];
         });
+        gFpsTimer = timer;          // keep alive (see note at top)
         dispatch_resume(timer);
     });
 }
@@ -210,6 +216,9 @@ static void installPlatformOverlay(void) {
         gPlatOverlay  = w;
         gPlatLabel    = l;
 
+        // draw something immediately so the panel is visible even before the first tick
+        setPlatLines(@[ @"[EchoMod] platform HUD — TEST", @"starting…" ]);
+
         // heartbeat: if "tick" keeps climbing, the overlay is live and updating.
         dispatch_source_t timer =
             dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -230,6 +239,7 @@ static void installPlatformOverlay(void) {
                 @"player2 : TEST",
             ]);
         });
+        gPlatTimer = timer;         // keep alive (see note at top)
         dispatch_resume(timer);
     });
 }
