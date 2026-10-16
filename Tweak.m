@@ -625,7 +625,7 @@ static void fillPlayerLabels(void) {
     if (psNum > 64) psNum = 64;
     gDiagPlayers = psNum;
 
-    CGSize sz = gLabelRoot ? gLabelRoot.bounds.size : CGSizeZero;
+    CGSize sz = gLabelRoot ? gLabelRoot.bounds.size : CGSizeMake(0, 0);
     CGFloat scale = [UIScreen mainScreen].scale;
     if (scale <= 0.0) scale = 1.0;
 
