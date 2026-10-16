@@ -182,7 +182,53 @@ scene connects late), so they show on scene-based apps too.
 ## Platform HUD (in progress — test scaffold only)
 
 The final goal is a standalone HUD overlay that lists the players in the lobby/match and the
-**platform** each one is on. That needs real per-player data, which isn't wired up yet.
+**platform** each one is on, drawn **above their heads** and only while they're visible.
+
+### Step 2 (current): overhead "platform" labels
+
+`Tweak.m` section 5 (`#pragma mark - 5) overhead "platform" labels`) is a small label layer:
+
+- A dedicated transparent overlay window + a pool of `UILabel`s, updated **every frame** by a
+  `CADisplayLink` (so labels can track moving targets instead of stuttering at 1 Hz).
+- Each label is positioned by normalized `(nx, ny)` in `0..1` — resolution independent.
+- **Visibility gate:** `pointOnScreen()` hides a label the moment its point leaves the screen.
+  That's the "only show when visible" rule; with real data it's the same check plus the engine's
+  own occlusion/visibility result.
+- The top-right panel is now a status readout: `labels: N  onscreen: M`.
+
+**The labels currently say `"platform"` and move synthetically** (one deliberately drifts
+off-screen so you can watch the gate work). That's the placeholder: the render path, the
+per-frame update and the visibility gate are all real.
+
+### The seam for real data
+
+Everything synthetic is inside `fillTestLabels()`:
+
+```objc
+// replace this with, per visible player:
+//   (nx, ny) = project(headWorldPos);  text = platform
+```
+
+### Why the real version is a separate job (recon findings)
+
+`FortniteClient` is decrypted, but its symbol table is only 1,937 entries and holds **only
+third-party exports** (PhysX, Vivox, `AVPlayer`, `GKPlayer`). The engine names we need exist
+only as **UE reflection strings**, not callable symbols:
+
+```
+ProjectWorldLocationToScreen   GetPlatformName / PlatformName
+AccountId / PlatformAccountId  PlayerState / PlayerStates / GetOwningPlayerState
+SFortNameplateIndicator        GetNameplatesEnabled / SetNameplatesEnabled
+```
+
+So real data needs actual RE (find the UWorld/GameState, walk `PlayerArray`, read each pawn's
+head position, get the camera view matrix, project). Two viable routes:
+1. **Our own projection** — resolve the engine's `ProjectWorldLocationToScreen` via the UFunction
+   registry, or reimplement the matrix math from the camera.
+2. **Piggyback the nameplates** — the game already draws nameplates at the right place and only
+   when visible; hooking the nameplate widget gets positioning *and* visibility for free.
+
+## Platform HUD (older panel notes)
 
 **Step 1 (done): prove the overlay renders.** `Tweak.m` now builds a second overlay window
 (top-right, `EchoPlatformOverlay` globals `gPlatOverlay` / `gPlatLabel`) with its own 0.5 s

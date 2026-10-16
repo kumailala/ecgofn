@@ -14,6 +14,10 @@
 //        before real per-player platform data is wired in.
 //   4) Startup alert: a one-shot "dylib loaded OK" popup with an OK button, so you can confirm
 //        injection even if the overlays never render.
+//   5) Overhead labels (TEST SCAFFOLD): floating "platform" labels drawn per-frame at
+//        screen positions and hidden the instant they leave the screen ("only when visible").
+//        Driven by synthetic motion for now — the ONLY block to replace for real data is
+//        fillTestLabels() in section 5 (player head world-pos -> projected (nx, ny)).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -38,6 +42,15 @@ static const CGFloat gPlatWidth = 300.0;
 // block ends, so the timer never fires. Keep strong refs or the overlay never updates.
 static dispatch_source_t gFpsTimer  = nil;
 static dispatch_source_t gPlatTimer = nil;
+
+// overhead "platform" labels (test scaffold; implemented in section 5, counted by the HUD panel)
+@interface EchoOverheadLabel : NSObject
+@property (nonatomic, strong) UILabel *view;
+@property (nonatomic, copy)   NSString *text;
+@property (nonatomic, assign) CGFloat nx;   // 0..1 across the screen
+@property (nonatomic, assign) CGFloat ny;   // 0..1 down the screen
+@end
+static NSMutableArray<EchoOverheadLabel *> *gLabels = nil;
 
 #pragma mark - runtime helper
 
@@ -227,16 +240,15 @@ static void installPlatformOverlay(void) {
         dispatch_source_set_event_handler(timer, ^{
             static int tick = 0;
             attachScene(gPlatOverlay); // self-heal if the scene connected after install
-            UIDevice *d = [UIDevice currentDevice];
+            int total = 0, onscreen = 0;
+            for (EchoOverheadLabel *L in gLabels) {
+                total++;
+                if (L.nx >= 0.0 && L.nx <= 1.0 && L.ny >= 0.0 && L.ny <= 1.0) onscreen++;
+            }
             setPlatLines(@[
-                @"[EchoMod] platform HUD — TEST",
-                [NSString stringWithFormat:@"app : %@",
-                    [[NSBundle mainBundle] bundleIdentifier] ?: @"?"],
-                [NSString stringWithFormat:@"dev : %@ / %@", d.model, d.systemVersion],
+                @"[EchoMod] platform test",
+                [NSString stringWithFormat:@"labels: %d  onscreen: %d", total, onscreen],
                 [NSString stringWithFormat:@"tick: %d", ++tick],
-                @"----",
-                @"player1 : TEST",
-                @"player2 : TEST",
             ]);
         });
         gPlatTimer = timer;         // keep alive (see note at top)
@@ -290,6 +302,121 @@ static void showLoadedAlert(int attempt) {
     });
 }
 
+#pragma mark - 5) overhead "platform" labels (test scaffold)
+
+// A floating label. In the real build, (nx, ny) is the *projected* head position of a player
+// (world -> screen); here it's driven by synthetic motion so the render path can be proven.
+// (Interface lives up top because the HUD panel counts the labels.)
+@implementation EchoOverheadLabel
+@end
+
+static void updateOverheadLabels(void);   // fwd
+
+@interface EchoLabelTicker : NSObject
+@end
+
+@implementation EchoLabelTicker
+- (void)tick:(CADisplayLink *)link { updateOverheadLabels(); }
+@end
+
+static UIWindow        *gLabelWindow = nil;
+static UIView          *gLabelRoot   = nil;
+static CADisplayLink   *gLabelLink   = nil;
+static EchoLabelTicker *gLabelTicker = nil;
+static CFTimeInterval   gLabelT0     = 0;
+
+static BOOL pointOnScreen(CGFloat nx, CGFloat ny) {
+    return nx >= 0.0 && nx <= 1.0 && ny >= 0.0 && ny <= 1.0;
+}
+
+// ---- TEST SOURCE -------------------------------------------------------------------------
+// No real player data yet, so drive the labels with slow synthetic motion. This is the ONLY
+// block that changes when real data lands: replace it with
+//     for each visible player:  (nx, ny) = project(headWorldPos);  text = platform
+// ------------------------------------------------------------------------------------------
+static void fillTestLabels(void) {
+    static const int kCount = 3;
+    if (!gLabels) return;
+
+    while ((int)gLabels.count < kCount) {
+        EchoOverheadLabel *L = [[EchoOverheadLabel alloc] init];
+        L.text = @"platform";
+
+        UILabel *v = [[UILabel alloc] init];
+        v.text            = L.text;
+        v.font            = [UIFont boldSystemFontOfSize:13.0];
+        v.textColor       = [UIColor whiteColor];
+        v.textAlignment   = NSTextAlignmentCenter;
+        v.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+        v.layer.cornerRadius = 4.0;
+        v.clipsToBounds   = YES;
+        L.view = v;
+        [gLabelRoot addSubview:v];
+        [gLabels addObject:L];
+    }
+
+    double t = CACurrentMediaTime() - gLabelT0;
+    for (NSUInteger i = 0; i < gLabels.count; i++) {
+        EchoOverheadLabel *L = gLabels[i];
+        double ph = t * 0.5 + i * 2.1;
+        L.nx = 0.30 + 0.20 * i + 0.06 * sin(ph);
+        L.ny = 0.45 + 0.05 * cos(ph * 1.3);
+        if (i == 2) L.nx = 0.92 + 0.16 * sin(ph);  // drifts off-screen to exercise the gate
+    }
+}
+
+static void updateOverheadLabels(void) {
+    if (!gLabelRoot) return;
+    attachScene(gLabelWindow);
+
+    fillTestLabels();
+
+    CGSize sz = gLabelRoot.bounds.size;
+    for (EchoOverheadLabel *L in gLabels) {
+        UILabel *v = L.view;
+        [v sizeToFit];
+        CGSize ts = v.bounds.size;
+        v.frame = CGRectMake(0, 0, ts.width + 14.0, ts.height + 4.0);
+
+        // "only when visible": drop the label the moment its point leaves the screen.
+        BOOL onScreen = pointOnScreen(L.nx, L.ny);
+        v.hidden = !onScreen;
+        if (!onScreen) continue;
+
+        v.center = CGPointMake(L.nx * sz.width, L.ny * sz.height);
+    }
+}
+
+static void installLabelLayer(void) {
+    if (gLabelWindow) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gLabelWindow) return;
+
+        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel            = UIWindowLevelAlert + 1;
+        w.backgroundColor        = [UIColor clearColor];
+        w.userInteractionEnabled = NO;   // never eat touches meant for the game
+
+        UIViewController *vc = [[UIViewController alloc] init];
+        vc.view.backgroundColor        = [UIColor clearColor];
+        vc.view.userInteractionEnabled = NO;
+        w.rootViewController = vc;
+
+        w.hidden = NO;                   // NOT makeKeyAndVisible
+        attachScene(w);
+        gLabelWindow = w;
+        gLabelRoot   = vc.view;
+        gLabels      = [NSMutableArray array];
+        gLabelT0     = CACurrentMediaTime();
+
+        // per-frame update so labels track the world instead of stuttering at 1 Hz
+        gLabelTicker = [[EchoLabelTicker alloc] init];
+        gLabelLink = [CADisplayLink displayLinkWithTarget:gLabelTicker
+                                                 selector:@selector(tick:)];
+        [gLabelLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    });
+}
+
 #pragma mark - init
 
 __attribute__((constructor)) static void EchoModInit(void) {
@@ -330,6 +457,7 @@ __attribute__((constructor)) static void EchoModInit(void) {
                 postNotificationName:NSProcessInfoPowerStateDidChangeNotification object:p];
             installOverlay();
             installPlatformOverlay();
+            installLabelLayer();
             showLoadedAlert(0);
         });
     }];
