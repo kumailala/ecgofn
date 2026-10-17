@@ -389,6 +389,7 @@ static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static BOOL  gOptHudLayout = YES;
 static BOOL  gOptLowGfx = YES;
 static BOOL  gOptVisOnly = YES;
+static BOOL  gOptAutoSprint = YES;
 static float gCamTime = 0;
 
 static float gOptSmooth = 0.35f;
@@ -1116,6 +1117,15 @@ static void updateESP(void) {
         pawns = gPawns; pc = gLocalPC; localPawn = gLocalPawn;
     }
 
+    if (gOptAutoSprint && looks_like_uobject(pc) && gInputCtx && rd_u8(gInputCtx + 0xB0) == 1) {
+        BOOL adsNow = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
+        if (!adsNow && !gFiring) {
+            uint8_t one = 1;
+            if (rd_u8(pc + 0xFE5) != 1) wr_bytes(pc + 0xFE5, &one, 1);
+            if (rd_u8(pc + 0xFE6) != 1) wr_bytes(pc + 0xFE6, &one, 1);
+        }
+    }
+
     EchoFrame *frame = [[EchoFrame alloc] init];
     frame.eb = [UIBezierPath bezierPath];
     frame.tb = [UIBezierPath bezierPath];
@@ -1441,6 +1451,7 @@ static void saveOptions(void) {
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
     [d setBool:gOptVisOnly forKey:@"echo.vis"];
+    [d setBool:gOptAutoSprint forKey:@"echo.sprint"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1462,6 +1473,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
     if ([d objectForKey:@"echo.vis"]) gOptVisOnly = [d boolForKey:@"echo.vis"];
+    if ([d objectForKey:@"echo.sprint"]) gOptAutoSprint = [d boolForKey:@"echo.sprint"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1487,6 +1499,7 @@ static void loadOptions(void) {
         case 10: gOptHudLayout = on; break;
         case 11: gOptLowGfx = on; break;
         case 12: gOptVisOnly = on; break;
+        case 13: gOptAutoSprint = on; break;
     }
     saveOptions();
 }
@@ -1612,6 +1625,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Enable HUD layout tool", gOptHudLayout, 10);
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
+        addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
