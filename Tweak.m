@@ -68,6 +68,9 @@ static BOOL gDiagAds, gDiagLock;
 static int  gDiagCam = -1;
 static NSString *gBoneDiag = @"bones: not tried";
 static int gDiagBs = 0;
+static NSString *gScreenDiagA = @"";
+static NSString *gScreenDiagB = @"";
+static void updateScreenDiag(void);
 static BOOL gFiring = NO;
 
 #pragma mark - runtime helper
@@ -258,6 +261,7 @@ static void installPlatformOverlay(void) {
         dispatch_source_set_event_handler(timer, ^{
             static int tick = 0;
             attachScene(gPlatOverlay); // self-heal if the scene connected after install
+            updateScreenDiag();
             NSString *eng = gDiagEngine ? @"ok" : (gProbeInRange ? @"no-obj" : @"NO");
             setPlatLines(@[
                 @"[EchoMod] tap E for menu",
@@ -265,6 +269,8 @@ static void installPlatformOverlay(void) {
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
                 [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
+                gScreenDiagA,
+                gScreenDiagB,
                 [NSString stringWithFormat:@"actors: %d  tick: %d", gDiagActors, ++tick],
             ]);
         });
@@ -1524,6 +1530,52 @@ static void probeEngine(void) {
     NSLog(@"[EchoMod] image base=%p end=%p slide=%ld", (void *)gImgBase, (void *)gImgEnd, (long)slide);
 }
 
+
+
+#pragma mark - 8b) fullscreen diagnostics + fix
+
+static UIView *findMetalView(UIView *v) {
+    if ([v.layer isKindOfClass:[CAMetalLayer class]]) return v;
+    for (UIView *sub in v.subviews) {
+        UIView *r = findMetalView(sub);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static void updateScreenDiag(void) {
+    static CFTimeInterval lastFix = 0;
+    UIScreen *sc = UIScreen.mainScreen;
+    CGRect b = sc.bounds, nb = sc.nativeBounds;
+    gScreenDiagA = [NSString stringWithFormat:@"scr %.0fx%.0f nat %.0fx%.0f x%.1f", b.size.width, b.size.height, nb.size.width, nb.size.height, sc.scale];
+
+    UIWindow *gw = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scn in UIApplication.sharedApplication.connectedScenes) {
+            if (![scn isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scn).windows) {
+                if (w == gOverlay || w == gPlatOverlay || w == gLabelWindow || w == gMenuWindow) continue;
+                if (!gw || w.windowLevel < gw.windowLevel) gw = w;
+            }
+        }
+    }
+    if (!gw) { gScreenDiagB = @"win: none"; return; }
+
+    UIView *root = gw.rootViewController.view ?: gw;
+    UIView *mv = findMetalView(root);
+    CGSize dr = CGSizeZero;
+    if (mv) dr = ((CAMetalLayer *)mv.layer).drawableSize;
+    gScreenDiagB = [NSString stringWithFormat:@"win %.0fx%.0f root %.0fx%.0f mv %.0fx%.0f dr %.0fx%.0f",
+                    gw.frame.size.width, gw.frame.size.height, root.frame.size.width, root.frame.size.height,
+                    mv ? mv.frame.size.width : 0, mv ? mv.frame.size.height : 0, dr.width, dr.height];
+
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastFix < 2.0) return;
+    lastFix = now;
+    if (!CGRectEqualToRect(gw.frame, b)) gw.frame = b;
+    if (root != gw && !CGRectEqualToRect(root.frame, gw.bounds)) root.frame = gw.bounds;
+    if (mv && mv != root && !CGRectEqualToRect(mv.frame, root.bounds)) mv.frame = root.bounds;
+}
 
 #pragma mark - 9) force low graphics (config files, applied before the engine reads them)
 
