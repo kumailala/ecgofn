@@ -4,7 +4,7 @@ set -e
 
 OUT="${1:-NEWLIB.dylib}"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-FRAMEWORKS="-framework Foundation -framework UIKit -framework QuartzCore"
+FRAMEWORKS="-framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics"
 FLAGS="-isysroot $SDK -fobjc-arc -O2 -Wall"
 
 echo "SDK: $SDK"
