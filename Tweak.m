@@ -367,6 +367,7 @@ static void showLoadedAlert(int attempt) {
 #define OFF_WEAPON_DATA          0x368
 #define A_KISMET_TRACE           0x102552e04ULL
 #define A_SET_GAMEPAD_TYPE       0x1028fa310ULL
+#define A_PLATFORM_CACHE         0x10425c868ULL
 #define A_FIRE_START             0x10219b908ULL
 #define A_FIRE_STOP              0x1017c6e84ULL
 #define OFF_WEAPONDEF_STATHANDLE 0x508
@@ -390,6 +391,8 @@ static BOOL  gOptHudLayout = YES;
 static BOOL  gOptLowGfx = YES;
 static BOOL  gOptVisOnly = YES;
 static BOOL  gOptAutoSprint = YES;
+static BOOL  gOptPeek = NO;
+static int32_t gPeekOrig = -2;
 static float gCamTime = 0;
 
 static float gOptSmooth = 0.35f;
@@ -794,6 +797,22 @@ static void applyPs4Glyphs(void) {
     }
 }
 
+static void applySettingsPeek(void) {
+    uintptr_t pa = SYM(A_PLATFORM_CACHE);
+    int32_t cur = rd_i32(pa);
+    if (gOptPeek) {
+        if (cur != 0) {
+            if (gPeekOrig == -2) gPeekOrig = cur;
+            int32_t z = 0;
+            wr_bytes(pa, &z, 4);
+        }
+    } else if (gPeekOrig != -2) {
+        int32_t o = gPeekOrig;
+        wr_bytes(pa, &o, 4);
+        gPeekOrig = -2;
+    }
+}
+
 static void applyHudLayoutFlag(void) {
     if (!gRuntimeOpts || !objectNamed(gRuntimeOpts, "Default__FortRuntimeOptions")) {
         gRuntimeOpts = 0;
@@ -815,7 +834,7 @@ static void scanPawns(void) {
     gNamesObj = rd_ptr(SYM(A_GLOBAL_GNAMES));
     if (!gBoneCache) gBoneCache = [NSMutableDictionary dictionary];
     gDiagEngine = looks_like_uobject(gEngine);
-    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); applyPs4Glyphs(); }
+    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); applyPs4Glyphs(); applySettingsPeek(); }
     gDiagWorld = NO; gDiagPC = NO; gDiagGameState = NO;
     gDiagPlayers = 0; gDiagPawns = 0; gDiagActors = 0; gDiagBones = 0;
     if (!gDiagEngine) { publishPawns(nil, 0, 0); return; }
@@ -1500,6 +1519,7 @@ static void loadOptions(void) {
         case 11: gOptLowGfx = on; break;
         case 12: gOptVisOnly = on; break;
         case 13: gOptAutoSprint = on; break;
+        case 14: gOptPeek = on; break;
     }
     saveOptions();
 }
@@ -1626,6 +1646,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
+        addSwitch(panel, &y, @"Peek hidden settings tabs", gOptPeek, 14);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
