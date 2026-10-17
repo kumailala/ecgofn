@@ -801,17 +801,12 @@ static void applyPs4Glyphs(void) {
 static uintptr_t gUiClasses[kMaxUiClasses];
 static int gNumUiClasses = 0;
 static CFAbsoluteTime gUiLastBuild = 0, gUiLastApply = 0;
-static NSMutableString *gUiLog = nil;
-static int gUiLogLines = 0;
 
 static BOOL uiNameWanted(NSString *n) {
     if (!n.length || [n hasPrefix:@"Default__"]) return NO;
-    static NSSet *exact = nil;
-    if (!exact) exact = [NSSet setWithObjects:@"FortOptionsTab", @"FortVideoOptions", @"FortInputOptions",
-                         @"FortGamepadInputOptions", @"FortGameOptions", @"FortOptionsMenuSetting", nil];
-    if ([exact containsObject:n]) return YES;
-    if (![n hasSuffix:@"_C"]) return NO;
-    return [n containsString:@"Option"] || [n containsString:@"VideoSetting"] || [n containsString:@"Brightness"];
+    if ([n isEqualToString:@"FortGamepadInputOptions"]) return YES;
+    if (![n hasSuffix:@"_C"] || ![n containsString:@"Option"]) return NO;
+    return [n containsString:@"Controller"] || [n containsString:@"Gamepad"];
 }
 
 static void buildUiClasses(void) {
@@ -835,15 +830,6 @@ static void buildUiClasses(void) {
     }
     free(buf);
     gNumUiClasses = n;
-}
-
-static void logUi(NSString *line) {
-    if (!gUiLog) gUiLog = [NSMutableString string];
-    if (gUiLogLines > 300) return;
-    [gUiLog appendFormat:@"%@\n", line];
-    gUiLogLines++;
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    if (docs) [gUiLog writeToFile:[docs stringByAppendingPathComponent:@"EchoMod_ui.txt"] atomically:NO encoding:NSUTF8StringEncoding error:nil];
 }
 
 static void unhideSettings(void) {
@@ -882,8 +868,6 @@ static void unhideSettings(void) {
             uintptr_t fn = vt >= 0x100000000ULL ? rd_ptr(vt + 0x250) : 0;
             if (fn < 0x100000000ULL) continue;
             ((void (*)(void *, uint8_t))fn)((void *)obj, 0);
-            NSString *cn = fname_string(rd_i32(cls + 0x18));
-            logUi([NSString stringWithFormat:@"unhid %@ (%@) was %d", nm, cn, vis]);
         }
     }
     free(buf);
@@ -1724,7 +1708,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
-        addSwitch(panel, &y, @"Show all settings tabs", gOptUnhide, 14);
+        addSwitch(panel, &y, @"Show controller settings tab", gOptUnhide, 14);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
