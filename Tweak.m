@@ -72,6 +72,7 @@ static NSString *gScreenDiagA = @"";
 static NSString *gScreenDiagB = @"";
 static void updateScreenDiag(void);
 static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
+static int gDiagVis;
 static BOOL gFiring = NO;
 
 #pragma mark - runtime helper
@@ -268,7 +269,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n"],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -985,12 +986,18 @@ static float wrap180(float a) {
 
 typedef struct { uintptr_t pawn; FV3 aim; CGFloat sx, sy; BOOL onCross; } AimCand;
 
-static BOOL pawnVisible(uintptr_t pawn) {
-    uintptr_t mesh = rd_ptr(pawn + OFF_CHAR_MESH);
-    if (mesh < 0x100000000ULL) return NO;
-    float a = rd_f32(mesh + OFF_PRIM_LASTRENDER), b = rd_f32(mesh + OFF_PRIM_LASTRENDER_SCR);
-    float t = (isfinite(a) && a > b) ? a : (isfinite(b) ? b : 0.0f);
-    return t > 0.0f && gCamTime - t < 0.30f;
+typedef struct { float x, y, z; } LosVec;
+typedef BOOL (*LosFn)(void *, void *, LosVec, BOOL);
+
+static BOOL pawnVisible(uintptr_t pawn, uintptr_t pc, FV3 cam) {
+    uintptr_t vt = rd_ptr(pc);
+    if (vt < 0x100000000ULL) return YES;
+    uintptr_t fn = rd_ptr(vt + 0x650);
+    if (fn < 0x100000000ULL) return YES;
+    LosVec v = { cam.x, cam.y, cam.z };
+    BOOL r = ((LosFn)fn)((void *)pc, (void *)pawn, v, NO) & 1;
+    if (r) gDiagVis++;
+    return r;
 }
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
@@ -1058,6 +1065,7 @@ static void updateESP(void) {
     gDiagDrawn = 0;
     gDiagAds = NO;
     gDiagLock = NO;
+    gDiagVis = 0;
 
     CGSize sz = gLabelRoot.bounds.size;
     AimCand cands[64];
@@ -1198,7 +1206,7 @@ static void updateESP(void) {
             tg.c = CGPointMake(cx, ptop - 10);
             [frame.tags addObject:tg];
 
-            if (!ep.team && !downed && nc < 64 && (!gOptVisOnly || pawnVisible(ep.pawn))) {
+            if (!ep.team && !downed && nc < 64 && (!gOptVisOnly || pawnVisible(ep.pawn, pc, cam))) {
                 FV3 aim = gOptAimBody ? bodyW : headW;
                 CGFloat ax, ay; float ad;
                 if (project(&view, aim, &ax, &ay, &ad)) {
@@ -1525,7 +1533,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Trigger bot (auto shoot)", gOptTrigger, 9);
         addSwitch(panel, &y, @"Enable HUD layout tool", gOptHudLayout, 10);
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
-        addSwitch(panel, &y, @"Smart aim: visible targets only", gOptVisOnly, 12);
+        addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
