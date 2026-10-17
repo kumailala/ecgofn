@@ -564,11 +564,9 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
     EchoBoneMap *cached = gBoneCache[key];
     if (cached) {
         if (cached->n > 0 && gCSOff < 0) {
-            NSMutableString *d = [NSMutableString stringWithFormat:@"retry csOff N=%d
-", cached->boneCount];
+            NSMutableString *d = [NSMutableString stringWithFormat:@"retry csOff N=%d\n", cached->boneCount];
             discoverComponentSpace(mesh, cached->boneCount, d);
-            [d appendFormat:@"csOff=%d
-", gCSOff];
+            [d appendFormat:@"csOff=%d\n", gCSOff];
             gBoneDiag = [NSString stringWithFormat:@"bones: sel=%d N=%d cs=%d", cached->n, cached->boneCount, gCSOff];
             if (gCSOff < 0) writeDiagFile(d);
         }
