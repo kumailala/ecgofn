@@ -66,6 +66,7 @@ static BOOL gDiagEngine, gDiagWorld, gDiagPC, gDiagGameState;
 static int  gDiagPlayers, gDiagPawns, gDiagActors, gDiagDrawn, gDiagBones;
 static BOOL gDiagAds, gDiagLock;
 static int  gDiagCam = -1;
+static NSString *gBoneDiag = @"bones: not tried";
 
 #pragma mark - runtime helper
 
@@ -257,10 +258,11 @@ static void installPlatformOverlay(void) {
             attachScene(gPlatOverlay); // self-heal if the scene connected after install
             NSString *eng = gDiagEngine ? @"ok" : (gProbeInRange ? @"no-obj" : @"NO");
             setPlatLines(@[
-                @"[EchoMod] ESP + aim",
+                @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
                 [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n"],
+                gBoneDiag,
                 [NSString stringWithFormat:@"actors: %d  tick: %d", gDiagActors, ++tick],
             ]);
         });
@@ -318,9 +320,8 @@ static void showLoadedAlert(int attempt) {
 #pragma mark - 5) engine walk (memory only, no engine calls)
 
 // Offsets come from the MobileDumper-7 SDK dump of this exact build; the two addresses are the
-// GEngine pointer and the GNames slot recovered from the binary / dumper. Everything is read
-// with mach_vm_read_overwrite, which never faults, so a wrong value shows up in the panel
-// instead of crashing.
+// GEngine pointer and the GNames slot. Everything is read with mach_vm_read_overwrite, which
+// never faults, so a wrong value shows up in the panel instead of crashing.
 
 #define A_GLOBAL_ENGINE          0x105817be8ULL
 #define A_GLOBAL_GNAMES          0x10550E5C0ULL
@@ -345,7 +346,10 @@ static void showLoadedAlert(int attempt) {
 #define OFF_PC_ACKPAWN           0x380
 #define OFF_PC_CAMMGR            0x398
 #define OFF_CHAR_MESH            0x378
+#define OFF_CHAR_CAPSULE         0x388
+#define OFF_CAPSULE_HALFHEIGHT   0x670
 #define OFF_SKINNED_SKELMESH     0x678
+#define OFF_SKELMESH_REFBONES    0x138
 #define OFF_PS_NAME              0x3B0
 #define OFF_FORTPS_PLATFORM      0x768
 #define OFF_ATHENA_TEAM          0xF60
@@ -355,9 +359,12 @@ static void showLoadedAlert(int attempt) {
 
 static const int kCamCacheOffsets[4] = { 0x390, 0x1990, 0x900, 0x1F00 };
 
-static const BOOL    kAimbotEnabled = YES;
-static const float   kAimSmooth     = 0.55f;
-static const BOOL    kSkeletonEnabled = YES;
+static BOOL  gOptBoxes = YES, gOptSkeleton = YES, gOptTags = YES;
+static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
+static BOOL  gOptAimBody = NO;
+static float gOptSmooth = 0.35f;
+static float gOptFov = 0.30f;
+static int   gOptDelay = 1;
 
 typedef struct { float x, y, z; } FV3;
 typedef struct { float q[4]; float t[3]; float tp; float s[3]; float sp; } FXform;
@@ -452,7 +459,7 @@ static BOOL looks_like_xform(const FXform *x) {
     float qq = x->q[0] * x->q[0] + x->q[1] * x->q[1] + x->q[2] * x->q[2] + x->q[3] * x->q[3];
     if (!(qq > 0.95f && qq < 1.05f)) return NO;
     for (int i = 0; i < 3; i++) {
-        if (!isfinite(x->t[i]) || fabsf(x->t[i]) > 5000.0f) return NO;
+        if (!isfinite(x->t[i]) || fabsf(x->t[i]) > 100000.0f) return NO;
         if (!isfinite(x->s[i]) || fabsf(x->s[i]) < 0.01f || fabsf(x->s[i]) > 10.0f) return NO;
     }
     return YES;
@@ -466,6 +473,8 @@ static BOOL looks_like_xform(const FXform *x) {
     int idx[kMaxSel];
     int link[kMaxSel];
     int head;
+    int neck;
+    int pelvis;
     int boneCount;
 }
 @end
@@ -485,9 +494,10 @@ static NSArray<EchoPawn *> *gPawns = nil;
 static uintptr_t gLocalPC = 0;
 static uintptr_t gLocalPawn = 0;
 static uintptr_t gEngine = 0;
-static int gCSOffs[2] = { -1, -1 };
-static int gCSCount = 0;
+static int gCSOff = -1;
 static NSMutableDictionary<NSNumber *, EchoBoneMap *> *gBoneCache = nil;
+static CFTimeInterval gLastDiagWrite = 0;
+static int gDiagWrites = 0;
 
 static const char *kBoneNames[kMaxSel] = {
     "head", "neck_01", "spine_05", "spine_04", "spine_03", "spine_02", "spine_01", "pelvis",
@@ -506,115 +516,119 @@ static void publishPawns(NSArray<EchoPawn *> *list, uintptr_t pc, uintptr_t loca
     }
 }
 
-static void discoverComponentSpace(uintptr_t mesh) {
-    if (gCSCount > 0) return;
-    int found[16];
-    int nf = 0;
+static void writeDiagFile(NSString *text) {
+    CFTimeInterval now = CACurrentMediaTime();
+    if (gDiagWrites >= 4 || (gDiagWrites > 0 && now - gLastDiagWrite < 15.0)) return;
+    gDiagWrites++;
+    gLastDiagWrite = now;
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!dir) return;
+    [text writeToFile:[dir stringByAppendingPathComponent:@"EchoMod_bones.txt"]
+           atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void discoverComponentSpace(uintptr_t mesh, int32_t N, NSMutableString *diag) {
+    if (gCSOff >= 0) return;
+    float bestExt = 0.0f;
+    int best = -1;
     FXform probe[6];
-    for (int off = 0x680; off <= 0xCC0 && nf < 16; off += 8) {
+    for (int off = 0x680; off <= 0xCC0; off += 8) {
         uintptr_t data = rd_ptr(mesh + (uintptr_t)off);
         int32_t num = rd_i32(mesh + (uintptr_t)off + 8);
         int32_t mx = rd_i32(mesh + (uintptr_t)off + 12);
-        if (data < 0x100000000ULL || (data & 0xF) || num < 30 || num > 600 || mx < num || mx > 2000) continue;
-        if (!safe_read(data, probe, sizeof probe)) continue;
-        BOOL ok = YES;
-        for (int i = 0; i < 6; i++) if (!looks_like_xform(&probe[i])) { ok = NO; break; }
+        if (data < 0x100000000ULL || (data & 0xF) || num < 20 || num > 700 || mx < num) continue;
+        BOOL ok = safe_read(data, probe, sizeof probe);
+        for (int i = 0; ok && i < 6; i++) if (!looks_like_xform(&probe[i])) ok = NO;
         if (!ok) continue;
 
         FXform *all = (FXform *)malloc((size_t)num * sizeof(FXform));
         if (!all) continue;
-        float maxZ = 0.0f;
+        float ext = 0.0f;
         if (safe_read(data, all, (size_t)num * sizeof(FXform))) {
-            for (int i = 0; i < num; i++) if (all[i].t[2] > maxZ) maxZ = all[i].t[2];
+            for (int i = 0; i < num; i++) {
+                float l = sqrtf(all[i].t[0] * all[i].t[0] + all[i].t[1] * all[i].t[1] + all[i].t[2] * all[i].t[2]);
+                if (l > ext) ext = l;
+            }
         }
         free(all);
-        if (maxZ > 130.0f && maxZ < 260.0f) found[nf++] = off;
+        [diag appendFormat:@"cand off=0x%X num=%d max=%d ext=%.1f\n", off, num, mx, ext];
+        if (num == N && ext > bestExt) { bestExt = ext; best = off; }
     }
-    if (nf == 0) return;
-
-    int pick = 0;
-    for (int i = 0; i + 1 < nf; i++) {
-        if (found[i + 1] == found[i] + 16) { gCSOffs[0] = found[i]; gCSOffs[1] = found[i + 1]; gCSCount = 2; return; }
-    }
-    gCSOffs[0] = found[pick];
-    gCSCount = 1;
+    if (best >= 0 && bestExt > 60.0f) gCSOff = best;
 }
 
-static uintptr_t componentSpaceArray(uintptr_t mesh, int32_t *num) {
-    if (gCSCount == 0) return 0;
-    int which = 0;
-    if (gCSCount == 2) {
-        int32_t r = rd_i32(mesh + (uintptr_t)gCSOffs[1] + 16 + 4);
-        which = (r == 1) ? 1 : 0;
-    }
-    uintptr_t base = mesh + (uintptr_t)gCSOffs[which];
-    *num = rd_i32(base + 8);
-    return rd_ptr(base);
-}
-
-static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
+static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
     uintptr_t skel = rd_ptr(mesh + OFF_SKINNED_SKELMESH);
-    if (!looks_like_uobject(skel)) return nil;
+    if (!looks_like_uobject(skel)) { gBoneDiag = @"bones: no skeletal mesh"; return nil; }
     NSNumber *key = @(skel);
     EchoBoneMap *cached = gBoneCache[key];
-    if (cached) return cached->n > 0 ? cached : nil;
-
-    int32_t N = 0;
-    if (!componentSpaceArray(mesh, &N) || N < 30 || N > 600) return nil;
-
-    uintptr_t refData = 0;
-    for (int off = 0x40; off <= 0x2F8 && !refData; off += 8) {
-        uintptr_t data = rd_ptr(skel + (uintptr_t)off);
-        int32_t num = rd_i32(skel + (uintptr_t)off + 8);
-        if (num != N || data < 0x100000000ULL || (data & 3)) continue;
-        int32_t probe[3 * 24];
-        if (!safe_read(data, probe, sizeof probe)) continue;
-        BOOL ok = (probe[2] == -1);
-        for (int i = 1; i < 24 && ok; i++) {
-            int32_t nameIdx = probe[i * 3];
-            int32_t parent = probe[i * 3 + 2];
-            if (parent < 0 || parent >= i || nameIdx <= 0 || nameIdx > 4000000) ok = NO;
+    if (cached) {
+        if (cached->n > 0 && gCSOff < 0) {
+            NSMutableString *d = [NSMutableString stringWithFormat:@"retry csOff N=%d
+", cached->boneCount];
+            discoverComponentSpace(mesh, cached->boneCount, d);
+            [d appendFormat:@"csOff=%d
+", gCSOff];
+            gBoneDiag = [NSString stringWithFormat:@"bones: sel=%d N=%d cs=%d", cached->n, cached->boneCount, gCSOff];
+            if (gCSOff < 0) writeDiagFile(d);
         }
-        if (ok) refData = data;
+        return cached->n > 0 ? cached : nil;
     }
-    EchoBoneMap *m = [[EchoBoneMap alloc] init];
-    m->n = 0; m->head = -1; m->boneCount = N;
 
-    if (refData) {
-        int32_t *info = (int32_t *)malloc((size_t)N * 12);
-        if (info && safe_read(refData, info, (size_t)N * 12)) {
+    uintptr_t refData = rd_ptr(skel + OFF_SKELMESH_REFBONES);
+    int32_t N = rd_i32(skel + OFF_SKELMESH_REFBONES + 8);
+    NSMutableString *diag = [NSMutableString stringWithFormat:@"skel=%p refData=%p N=%d\n", (void *)skel, (void *)refData, N];
+
+    EchoBoneMap *m = [[EchoBoneMap alloc] init];
+    m->n = 0; m->head = -1; m->neck = -1; m->pelvis = -1; m->boneCount = N;
+
+    if (refData > 0x100000000ULL && N >= 20 && N <= 700) {
+        int32_t *info = (int32_t *)malloc((size_t)N * 16);
+        if (info && safe_read(refData, info, (size_t)N * 16)) {
             int selBone[kMaxSel];
             for (int k = 0; k < kMaxSel; k++) selBone[k] = -1;
+            int named = 0;
             for (int i = 0; i < N; i++) {
-                NSString *nm = fname_string(info[i * 3]);
+                NSString *nm = fname_string(info[i * 4]);
                 if (!nm) continue;
-                NSString *lower = nm.lowercaseString;
+                named++;
+                if (i < 12) [diag appendFormat:@"bone[%d]=%@ parent=%d\n", i, nm, info[i * 4 + 2]];
+                const char *lower = nm.lowercaseString.UTF8String;
                 for (int k = 0; k < kMaxSel; k++) {
-                    if (kBoneNames[k] && selBone[k] < 0 && strcmp(lower.UTF8String, kBoneNames[k]) == 0) { selBone[k] = i; break; }
+                    if (kBoneNames[k] && selBone[k] < 0 && strcmp(lower, kBoneNames[k]) == 0) { selBone[k] = i; break; }
                 }
             }
+            [diag appendFormat:@"named=%d\n", named];
             int count = 0;
             for (int k = 0; k < kMaxSel; k++) {
                 if (selBone[k] < 0) continue;
                 m->idx[count] = selBone[k];
                 if (k == 0) m->head = count;
+                if (k == 1) m->neck = count;
+                if (k == 7) m->pelvis = count;
                 count++;
             }
             for (int a = 0; a < count; a++) {
                 m->link[a] = -1;
-                int p = info[m->idx[a] * 3 + 2];
+                int p = info[m->idx[a] * 4 + 2];
                 int guard = 0;
-                while (p >= 0 && guard++ < 64) {
+                while (p >= 0 && p < N && guard++ < 64) {
                     int found = -1;
                     for (int b = 0; b < count; b++) if (m->idx[b] == p) { found = b; break; }
                     if (found >= 0) { m->link[a] = found; break; }
-                    p = info[p * 3 + 2];
+                    p = info[p * 4 + 2];
                 }
             }
             m->n = (count >= 8) ? count : 0;
+            [diag appendFormat:@"selected=%d\n", count];
         }
         if (info) free(info);
     }
+
+    discoverComponentSpace(mesh, N, diag);
+    [diag appendFormat:@"csOff=%d\n", gCSOff];
+    gBoneDiag = [NSString stringWithFormat:@"bones: sel=%d N=%d cs=%d", m->n, N, gCSOff];
+    if (m->n == 0 || gCSOff < 0) writeDiagFile(diag);
     gBoneCache[key] = m;
     return m->n > 0 ? m : nil;
 }
@@ -717,13 +731,10 @@ static void scanPawns(void) {
                 else if (plat.length) ep.tag = [NSString stringWithFormat:@"[%@]", plat];
                 else ep.tag = @"player";
 
-                if (kSkeletonEnabled) {
-                    uintptr_t mesh = rd_ptr(a + OFF_CHAR_MESH);
-                    if (looks_like_uobject(mesh)) {
-                        discoverComponentSpace(mesh);
-                        ep.bones = buildBoneMap(mesh);
-                        if (ep.bones) gDiagBones++;
-                    }
+                uintptr_t mesh = rd_ptr(a + OFF_CHAR_MESH);
+                if (looks_like_uobject(mesh)) {
+                    ep.bones = buildBoneMap(mesh, ep);
+                    if (ep.bones && gCSOff >= 0) gDiagBones++;
                 }
                 [out addObject:ep];
             }
@@ -737,6 +748,23 @@ static void scanPawns(void) {
 
 #pragma mark - 6) ESP drawing + aimbot
 
+@interface EchoTag : NSObject
+@property (nonatomic, copy)   NSString *text;
+@property (nonatomic, assign) CGPoint c;
+@end
+@implementation EchoTag
+@end
+
+@interface EchoFrame : NSObject
+@property (nonatomic, strong) UIBezierPath *eb;
+@property (nonatomic, strong) UIBezierPath *tb;
+@property (nonatomic, strong) UIBezierPath *ebn;
+@property (nonatomic, strong) UIBezierPath *tbn;
+@property (nonatomic, strong) NSMutableArray<EchoTag *> *tags;
+@end
+@implementation EchoFrame
+@end
+
 static UIWindow        *gLabelWindow = nil;
 static UIView          *gLabelRoot   = nil;
 static CADisplayLink   *gLabelLink   = nil;
@@ -744,8 +772,10 @@ static CAShapeLayer    *gBoxEnemy    = nil;
 static CAShapeLayer    *gBoxTeam     = nil;
 static CAShapeLayer    *gBoneEnemy   = nil;
 static CAShapeLayer    *gBoneTeam    = nil;
+static CAShapeLayer    *gFovRing     = nil;
 static NSMutableArray<UILabel *> *gTagPool = nil;
 static NSMutableArray<NSString *> *gTagText = nil;
+static NSMutableArray<EchoFrame *> *gHistory = nil;
 static dispatch_source_t gScanTimer  = nil;
 static uintptr_t gAimTarget = 0;
 
@@ -809,6 +839,38 @@ static float wrap180(float a) {
     return a;
 }
 
+typedef struct { uintptr_t pawn; FV3 aim; CGFloat sx, sy; } AimCand;
+
+static void applyFrame(EchoFrame *f, CGSize sz) {
+    for (NSUInteger i = 0; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
+    if (gOptTags) {
+        NSUInteger i = 0;
+        for (EchoTag *t in f.tags) {
+            UILabel *tag = tagAtIndex(i);
+            if (![gTagText[i] isEqualToString:t.text]) {
+                gTagText[i] = t.text;
+                tag.text = t.text;
+                [tag sizeToFit];
+                CGSize ts = tag.bounds.size;
+                tag.bounds = CGRectMake(0, 0, ts.width + 8, ts.height + 2);
+            }
+            tag.center = CGPointMake(t.c.x, t.c.y - tag.bounds.size.height * 0.5);
+            tag.hidden = NO;
+            i++;
+        }
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    gBoxEnemy.path  = gOptBoxes ? f.eb.CGPath : nil;
+    gBoxTeam.path   = gOptBoxes ? f.tb.CGPath : nil;
+    gBoneEnemy.path = gOptSkeleton ? f.ebn.CGPath : nil;
+    gBoneTeam.path  = gOptSkeleton ? f.tbn.CGPath : nil;
+    gFovRing.hidden = !(gOptAimbot && gOptShowFov);
+    CGFloat r = gOptFov * sz.height;
+    gFovRing.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(sz.width * 0.5 - r, sz.height * 0.5 - r, r * 2, r * 2)].CGPath;
+    [CATransaction commit];
+}
+
 static void updateESP(void) {
     if (!gLabelRoot) return;
     attachScene(gLabelWindow);
@@ -819,21 +881,26 @@ static void updateESP(void) {
         pawns = gPawns; pc = gLocalPC; localPawn = gLocalPawn;
     }
 
-    UIBezierPath *enemyBox  = [UIBezierPath bezierPath];
-    UIBezierPath *teamBox   = [UIBezierPath bezierPath];
-    UIBezierPath *enemyBone = [UIBezierPath bezierPath];
-    UIBezierPath *teamBone  = [UIBezierPath bezierPath];
-    NSUInteger used = 0;
+    EchoFrame *frame = [[EchoFrame alloc] init];
+    frame.eb = [UIBezierPath bezierPath];
+    frame.tb = [UIBezierPath bezierPath];
+    frame.ebn = [UIBezierPath bezierPath];
+    frame.tbn = [UIBezierPath bezierPath];
+    frame.tags = [NSMutableArray array];
     gDiagDrawn = 0;
     gDiagAds = NO;
     gDiagLock = NO;
 
+    CGSize sz = gLabelRoot.bounds.size;
+    AimCand cands[64];
+    int nc = 0;
     FV3 cam = {0,0,0}, rot = {0,0,0};
     float fov = 0;
-    if (pc && pawns.count && readCamera(pc, &cam, &rot, &fov)) {
+    BOOL haveCam = (pc && pawns.count && readCamera(pc, &cam, &rot, &fov));
+
+    if (haveCam) {
         float pr = rot.x * (float)M_PI / 180.0f, yr = rot.y * (float)M_PI / 180.0f, rr = rot.z * (float)M_PI / 180.0f;
         float sp = sinf(pr), cp = cosf(pr), sy = sinf(yr), cy = cosf(yr), sr = sinf(rr), cr = cosf(rr);
-        CGSize sz = gLabelRoot.bounds.size;
         EchoView view;
         view.cam = cam;
         view.fwd   = (FV3){ cp * cy, cp * sy, sp };
@@ -842,59 +909,67 @@ static void updateESP(void) {
         view.tanHalf = tanf(fov * (float)M_PI / 360.0f);
         view.aspect = sz.height > 0 ? (float)(sz.width / sz.height) : 1.0f;
 
-        uintptr_t bestPawn = 0;
-        FV3 bestAim = {0,0,0};
-        float bestDist = 1.0e30f;
-        BOOL keepLock = NO;
-        FV3 lockAim = {0,0,0};
-
         for (EchoPawn *ep in pawns) {
             if (rd_u8(ep.pawn + OFF_FORTPAWN_DYING)) continue;
             BOOL downed = rd_u8(ep.pawn + OFF_FORTPAWN_DBNO) != 0;
 
-            uintptr_t mesh = rd_ptr(ep.pawn + OFF_CHAR_MESH);
-            FXform c2w;
-            FV3 feet;
-            BOOL haveMesh = (mesh >= 0x100000000ULL) && safe_read(mesh + OFF_SCENE_C2W, &c2w, sizeof c2w) &&
-                            looks_like_xform(&c2w);
-            if (haveMesh) {
-                feet = (FV3){ c2w.t[0], c2w.t[1], c2w.t[2] };
-            } else {
-                uintptr_t root = rd_ptr(ep.pawn + OFF_ACTOR_ROOT);
-                if (root < 0x100000000ULL) continue;
-                if (!safe_read(root + OFF_SCENE_LOCATION, &feet, sizeof feet)) continue;
-                feet.z -= 88.0f;
+            FV3 center = {0,0,0};
+            float half = 0.0f;
+            BOOL haveCap = NO;
+            uintptr_t cap = rd_ptr(ep.pawn + OFF_CHAR_CAPSULE);
+            if (cap >= 0x100000000ULL) {
+                half = rd_f32(cap + OFF_CAPSULE_HALFHEIGHT);
+                if (half > 20.0f && half < 140.0f &&
+                    safe_read(cap + OFF_SCENE_LOCATION, &center, sizeof center) && sane_vec(center)) haveCap = YES;
             }
-            if (!sane_vec(feet)) continue;
+            if (!haveCap) {
+                uintptr_t root = rd_ptr(ep.pawn + OFF_ACTOR_ROOT);
+                if (root < 0x100000000ULL || !safe_read(root + OFF_SCENE_LOCATION, &center, sizeof center) || !sane_vec(center)) continue;
+                half = 88.0f;
+            }
 
-            FV3 headW = { feet.x, feet.y, feet.z + 166.0f };
+            FV3 feet  = { center.x, center.y, center.z - half };
+            FV3 headW = { center.x, center.y, center.z + half * 0.80f };
+            FV3 bodyW = { center.x, center.y, center.z + half * 0.25f };
+            FV3 topW  = { center.x, center.y, center.z + half };
+
             FV3 pts[kMaxSel];
             BOOL ptOk[kMaxSel];
             memset(ptOk, 0, sizeof ptOk);
             BOOL haveBones = NO;
 
-            if (kSkeletonEnabled && ep.bones && haveMesh) {
-                int32_t bn = 0;
-                uintptr_t arr = componentSpaceArray(mesh, &bn);
-                if (arr && bn == ep.bones->boneCount) {
-                    FXform *bt = (FXform *)malloc((size_t)bn * sizeof(FXform));
-                    if (bt && safe_read(arr, bt, (size_t)bn * sizeof(FXform))) {
-                        for (int k = 0; k < ep.bones->n; k++) {
-                            const FXform *b = &bt[ep.bones->idx[k]];
-                            FV3 lp = { b->t[0] * c2w.s[0], b->t[1] * c2w.s[1], b->t[2] * c2w.s[2] };
-                            FV3 r = qrot(c2w.q, lp);
-                            pts[k] = (FV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
-                            ptOk[k] = sane_vec(pts[k]);
+            if (gOptSkeleton || gOptAimbot) {
+                if (ep.bones && gCSOff >= 0) {
+                    uintptr_t mesh = rd_ptr(ep.pawn + OFF_CHAR_MESH);
+                    FXform c2w;
+                    if (mesh >= 0x100000000ULL && safe_read(mesh + OFF_SCENE_C2W, &c2w, sizeof c2w) && looks_like_xform(&c2w)) {
+                        uintptr_t arr = rd_ptr(mesh + (uintptr_t)gCSOff);
+                        int32_t bn = rd_i32(mesh + (uintptr_t)gCSOff + 8);
+                        if (arr && bn == ep.bones->boneCount) {
+                            FXform *bt = (FXform *)malloc((size_t)bn * sizeof(FXform));
+                            if (bt && safe_read(arr, bt, (size_t)bn * sizeof(FXform))) {
+                                for (int k = 0; k < ep.bones->n; k++) {
+                                    const FXform *b = &bt[ep.bones->idx[k]];
+                                    FV3 lp = { b->t[0] * c2w.s[0], b->t[1] * c2w.s[1], b->t[2] * c2w.s[2] };
+                                    FV3 r = qrot(c2w.q, lp);
+                                    pts[k] = (FV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
+                                    ptOk[k] = sane_vec(pts[k]);
+                                }
+                                haveBones = YES;
+                                int hi = ep.bones->head, ni = ep.bones->neck, pi = ep.bones->pelvis;
+                                if (hi >= 0 && ptOk[hi]) headW = pts[hi];
+                                if (ni >= 0 && pi >= 0 && ptOk[ni] && ptOk[pi]) {
+                                    bodyW = (FV3){ (pts[ni].x + pts[pi].x) * 0.5f, (pts[ni].y + pts[pi].y) * 0.5f, (pts[ni].z + pts[pi].z) * 0.5f };
+                                }
+                            }
+                            if (bt) free(bt);
                         }
-                        haveBones = YES;
-                        int hi = ep.bones->head;
-                        if (hi >= 0 && ptOk[hi]) headW = pts[hi];
                     }
-                    if (bt) free(bt);
                 }
             }
 
-            FV3 topW = haveBones ? (FV3){ headW.x, headW.y, headW.z + 16.0f } : (FV3){ feet.x, feet.y, feet.z + 178.0f };
+            if (haveBones) topW = (FV3){ headW.x, headW.y, headW.z + 16.0f };
+
             CGFloat tx, ty, bx, by; float d1, d2;
             if (!project(&view, topW, &tx, &ty, &d1)) continue;
             if (!project(&view, feet, &bx, &by, &d2)) continue;
@@ -906,12 +981,10 @@ static void updateESP(void) {
             CGFloat cx = (tx + bx) * 0.5 * sz.width;
             if (cx < -w || cx > sz.width + w || pbot < 0 || ptop > sz.height) continue;
 
-            CGRect r = CGRectMake(cx - w * 0.5, ptop, w, h);
-            UIBezierPath *bp = ep.team ? teamBox : enemyBox;
-            [bp appendPath:[UIBezierPath bezierPathWithRect:r]];
+            [(ep.team ? frame.tb : frame.eb) appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(cx - w * 0.5, ptop, w, h)]];
 
             if (haveBones) {
-                UIBezierPath *sp2 = ep.team ? teamBone : enemyBone;
+                UIBezierPath *bp = ep.team ? frame.tbn : frame.ebn;
                 CGPoint scr[kMaxSel];
                 BOOL scrOk[kMaxSel];
                 for (int k = 0; k < ep.bones->n; k++) {
@@ -922,70 +995,71 @@ static void updateESP(void) {
                 for (int k = 0; k < ep.bones->n; k++) {
                     int l = ep.bones->link[k];
                     if (l < 0 || !scrOk[k] || !scrOk[l]) continue;
-                    [sp2 moveToPoint:scr[k]];
-                    [sp2 addLineToPoint:scr[l]];
+                    [bp moveToPoint:scr[k]];
+                    [bp addLineToPoint:scr[l]];
                 }
             }
 
-            float ddx = feet.x - cam.x, ddy = feet.y - cam.y, ddz = feet.z - cam.z;
+            float ddx = center.x - cam.x, ddy = center.y - cam.y, ddz = center.z - cam.z;
             float dist = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0f;
-            NSString *text = [NSString stringWithFormat:@"%@  %.0fm", ep.tag, dist];
-            UILabel *tag = tagAtIndex(used);
-            if (![gTagText[used] isEqualToString:text]) {
-                gTagText[used] = text;
-                tag.text = text;
-                [tag sizeToFit];
-                CGSize ts = tag.bounds.size;
-                tag.bounds = CGRectMake(0, 0, ts.width + 8, ts.height + 2);
-            }
-            tag.center = CGPointMake(cx, ptop - tag.bounds.size.height * 0.5 - 3);
-            tag.hidden = NO;
-            used++;
+            EchoTag *tg = [[EchoTag alloc] init];
+            tg.text = [NSString stringWithFormat:@"%@  %.0fm", ep.tag, dist];
+            tg.c = CGPointMake(cx, ptop - 10);
+            [frame.tags addObject:tg];
 
-            if (!ep.team && !downed) {
-                float adx = headW.x - cam.x, ady = headW.y - cam.y, adz = headW.z - cam.z;
-                float ad = sqrtf(adx * adx + ady * ady + adz * adz);
-                if (ep.pawn == gAimTarget) { keepLock = YES; lockAim = headW; }
-                if (ad < bestDist && tx > -0.05 && tx < 1.05 && ty > -0.05 && ty < 1.05) {
-                    bestDist = ad; bestPawn = ep.pawn; bestAim = headW;
+            if (!ep.team && !downed && nc < 64) {
+                FV3 aim = gOptAimBody ? bodyW : headW;
+                CGFloat ax, ay; float ad;
+                if (project(&view, aim, &ax, &ay, &ad)) {
+                    cands[nc].pawn = ep.pawn;
+                    cands[nc].aim = aim;
+                    cands[nc].sx = (ax - 0.5) * sz.width;
+                    cands[nc].sy = (ay - 0.5) * sz.height;
+                    nc++;
                 }
             }
         }
 
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
-        if (kAimbotEnabled && ads && looks_like_uobject(pc)) {
-            FV3 aim = lockAim;
-            if (!keepLock) { gAimTarget = bestPawn; aim = bestAim; }
-            if (gAimTarget) {
+        if (gOptAimbot && (ads || !gOptAdsOnly) && looks_like_uobject(pc) && nc > 0) {
+            CGFloat R = gOptFov * sz.height;
+            int pick = -1;
+            CGFloat bestD = 1.0e30;
+            for (int i = 0; i < nc; i++) {
+                CGFloat d = hypot(cands[i].sx, cands[i].sy);
+                CGFloat lim = (cands[i].pawn == gAimTarget) ? R * 1.35 : R;
+                if (d <= lim && d < bestD) { bestD = d; pick = i; }
+            }
+            if (pick >= 0) {
+                gAimTarget = cands[pick].pawn;
+                FV3 aim = cands[pick].aim;
                 float dx = aim.x - cam.x, dy = aim.y - cam.y, dz = aim.z - cam.z;
                 float yaw = atan2f(dy, dx) * 180.0f / (float)M_PI;
                 float pitch = atan2f(dz, sqrtf(dx * dx + dy * dy)) * 180.0f / (float)M_PI;
                 FV3 cur;
                 if (safe_read(pc + OFF_CTRL_ROTATION, &cur, sizeof cur) && sane_vec(cur)) {
+                    float f = 1.0f - 0.97f * gOptSmooth;
                     float cp0 = wrap180(cur.x), cy0 = wrap180(cur.y);
-                    FV3 nr = { cp0 + wrap180(pitch - cp0) * kAimSmooth,
-                               cy0 + wrap180(yaw - cy0) * kAimSmooth,
-                               cur.z };
+                    FV3 nr = { cp0 + wrap180(pitch - cp0) * f, cy0 + wrap180(yaw - cy0) * f, cur.z };
                     memcpy((void *)(pc + OFF_CTRL_ROTATION), &nr, sizeof nr);
                     gDiagLock = YES;
                 }
+            } else {
+                gAimTarget = 0;
             }
         } else {
             gAimTarget = 0;
         }
     }
 
-    for (NSUInteger i = used; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
-    gDiagDrawn = (int)used;
-
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    gBoxEnemy.path  = enemyBox.CGPath;
-    gBoxTeam.path   = teamBox.CGPath;
-    gBoneEnemy.path = enemyBone.CGPath;
-    gBoneTeam.path  = teamBone.CGPath;
-    [CATransaction commit];
+    gDiagDrawn = (int)frame.tags.count;
+    if (!gHistory) gHistory = [NSMutableArray array];
+    [gHistory insertObject:frame atIndex:0];
+    while (gHistory.count > 5) [gHistory removeLastObject];
+    NSUInteger di = (NSUInteger)gOptDelay;
+    if (di >= gHistory.count) di = gHistory.count - 1;
+    applyFrame(gHistory[di], sz);
 }
 
 @interface EchoEspTicker : NSObject
@@ -1030,10 +1104,12 @@ static void installLabelLayer(void) {
         gBoxTeam   = makeShapeLayer([UIColor colorWithRed:0.2 green:1.0 blue:0.4 alpha:1.0], 1.5);
         gBoneEnemy = makeShapeLayer([UIColor colorWithRed:1.0 green:0.9 blue:0.2 alpha:1.0], 1.2);
         gBoneTeam  = makeShapeLayer([UIColor colorWithRed:0.4 green:1.0 blue:1.0 alpha:1.0], 1.2);
+        gFovRing   = makeShapeLayer([UIColor colorWithWhite:1.0 alpha:0.5], 1.0);
         [gLabelRoot.layer addSublayer:gBoxEnemy];
         [gLabelRoot.layer addSublayer:gBoxTeam];
         [gLabelRoot.layer addSublayer:gBoneEnemy];
         [gLabelRoot.layer addSublayer:gBoneTeam];
+        [gLabelRoot.layer addSublayer:gFovRing];
 
         gEspTicker = [[EchoEspTicker alloc] init];
         gLabelLink = [CADisplayLink displayLinkWithTarget:gEspTicker selector:@selector(tick:)];
@@ -1052,7 +1128,200 @@ static void installLabelLayer(void) {
     });
 }
 
-#pragma mark - 7) image bounds / slide
+#pragma mark - 7) floating menu
+
+@interface EchoPassWindow : UIWindow
+@end
+@implementation EchoPassWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    if (v == self || v == self.rootViewController.view) return nil;
+    return v;
+}
+@end
+
+static EchoPassWindow *gMenuWindow = nil;
+static UIView *gMenuPanel = nil;
+static UIView *gMenuButton = nil;
+
+static void saveOptions(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:gOptBoxes forKey:@"echo.boxes"];
+    [d setBool:gOptSkeleton forKey:@"echo.skel"];
+    [d setBool:gOptTags forKey:@"echo.tags"];
+    [d setBool:gOptAimbot forKey:@"echo.aim"];
+    [d setBool:gOptAdsOnly forKey:@"echo.ads"];
+    [d setBool:gOptShowFov forKey:@"echo.fovring"];
+    [d setBool:gOptAimBody forKey:@"echo.body"];
+    [d setFloat:gOptSmooth forKey:@"echo.smooth"];
+    [d setFloat:gOptFov forKey:@"echo.fov"];
+    [d setInteger:gOptDelay forKey:@"echo.delay"];
+}
+
+static void loadOptions(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (![d objectForKey:@"echo.smooth"]) return;
+    gOptBoxes = [d boolForKey:@"echo.boxes"];
+    gOptSkeleton = [d boolForKey:@"echo.skel"];
+    gOptTags = [d boolForKey:@"echo.tags"];
+    gOptAimbot = [d boolForKey:@"echo.aim"];
+    gOptAdsOnly = [d boolForKey:@"echo.ads"];
+    gOptShowFov = [d boolForKey:@"echo.fovring"];
+    gOptAimBody = [d boolForKey:@"echo.body"];
+    gOptSmooth = [d floatForKey:@"echo.smooth"];
+    gOptFov = [d floatForKey:@"echo.fov"];
+    gOptDelay = (int)[d integerForKey:@"echo.delay"];
+}
+
+@interface EchoMenuHandler : NSObject
+@property (nonatomic, strong) UILabel *smoothLabel;
+@property (nonatomic, strong) UILabel *fovLabel;
+@end
+@implementation EchoMenuHandler
+- (void)toggled:(UISwitch *)s {
+    BOOL on = s.isOn;
+    switch (s.tag) {
+        case 1: gOptBoxes = on; break;
+        case 2: gOptSkeleton = on; break;
+        case 3: gOptTags = on; break;
+        case 4: gOptAimbot = on; break;
+        case 5: gOptAdsOnly = on; break;
+        case 6: gOptShowFov = on; break;
+    }
+    saveOptions();
+}
+- (void)slid:(UISlider *)s {
+    if (s.tag == 20) { gOptSmooth = s.value; self.smoothLabel.text = [NSString stringWithFormat:@"Smoothness  %.0f%%", s.value * 100]; }
+    if (s.tag == 21) { gOptFov = s.value; self.fovLabel.text = [NSString stringWithFormat:@"Aim FOV  %.0f%%", s.value * 100]; }
+    saveOptions();
+}
+- (void)picked:(UISegmentedControl *)s {
+    if (s.tag == 30) gOptAimBody = (s.selectedSegmentIndex == 1);
+    if (s.tag == 31) gOptDelay = (int)s.selectedSegmentIndex;
+    saveOptions();
+}
+- (void)tapped:(UITapGestureRecognizer *)g {
+    gMenuPanel.hidden = !gMenuPanel.hidden;
+}
+- (void)panned:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:gMenuWindow];
+    gMenuButton.center = CGPointMake(gMenuButton.center.x + t.x, gMenuButton.center.y + t.y);
+    [g setTranslation:CGPointZero inView:gMenuWindow];
+    CGRect b = gMenuButton.frame;
+    CGRect pf = gMenuPanel.frame;
+    pf.origin = CGPointMake(MIN(MAX(b.origin.x - pf.size.width - 8, 4), gMenuWindow.bounds.size.width - pf.size.width - 4),
+                            MIN(MAX(b.origin.y, 4), gMenuWindow.bounds.size.height - pf.size.height - 4));
+    gMenuPanel.frame = pf;
+}
+@end
+
+static EchoMenuHandler *gMenuHandler = nil;
+
+static void addSwitch(UIView *parent, CGFloat *y, NSString *title, BOOL on, NSInteger tag) {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, *y, 170, 31)];
+    l.text = title; l.textColor = [UIColor whiteColor]; l.font = [UIFont systemFontOfSize:14];
+    [parent addSubview:l];
+    UISwitch *s = [[UISwitch alloc] init];
+    s.on = on; s.tag = tag;
+    s.transform = CGAffineTransformMakeScale(0.8, 0.8);
+    s.center = CGPointMake(parent.bounds.size.width - 14 - 25, *y + 15.5);
+    [s addTarget:gMenuHandler action:@selector(toggled:) forControlEvents:UIControlEventValueChanged];
+    [parent addSubview:s];
+    *y += 34;
+}
+
+static UILabel *addSlider(UIView *parent, CGFloat *y, NSString *title, float v, NSInteger tag) {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, *y, parent.bounds.size.width - 28, 20)];
+    l.text = [NSString stringWithFormat:@"%@  %.0f%%", title, v * 100];
+    l.textColor = [UIColor whiteColor]; l.font = [UIFont systemFontOfSize:13];
+    [parent addSubview:l];
+    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(14, *y + 20, parent.bounds.size.width - 28, 28)];
+    s.minimumValue = 0.0f; s.maximumValue = 1.0f; s.value = v; s.tag = tag;
+    [s addTarget:gMenuHandler action:@selector(slid:) forControlEvents:UIControlEventValueChanged];
+    [parent addSubview:s];
+    *y += 52;
+    return l;
+}
+
+static void addSegment(UIView *parent, CGFloat *y, NSString *title, NSArray *items, NSInteger sel, NSInteger tag) {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, *y, parent.bounds.size.width - 28, 20)];
+    l.text = title; l.textColor = [UIColor whiteColor]; l.font = [UIFont systemFontOfSize:13];
+    [parent addSubview:l];
+    UISegmentedControl *s = [[UISegmentedControl alloc] initWithItems:items];
+    s.frame = CGRectMake(14, *y + 22, parent.bounds.size.width - 28, 28);
+    s.selectedSegmentIndex = sel; s.tag = tag;
+    [s addTarget:gMenuHandler action:@selector(picked:) forControlEvents:UIControlEventValueChanged];
+    [parent addSubview:s];
+    *y += 58;
+}
+
+static void installMenu(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gMenuWindow) return;
+        loadOptions();
+
+        EchoPassWindow *w = [[EchoPassWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel     = UIWindowLevelAlert + 2;
+        w.backgroundColor = [UIColor clearColor];
+        UIViewController *vc = [[UIViewController alloc] init];
+        vc.view.backgroundColor = [UIColor clearColor];
+        w.rootViewController = vc;
+        w.hidden = NO;
+        attachScene(w);
+        gMenuWindow = w;
+        gMenuHandler = [[EchoMenuHandler alloc] init];
+
+        CGSize ss = w.bounds.size;
+        UIView *btn = [[UIView alloc] initWithFrame:CGRectMake(ss.width - 66, 110, 46, 46)];
+        btn.backgroundColor = [UIColor colorWithRed:0.1 green:0.45 blue:1.0 alpha:0.85];
+        btn.layer.cornerRadius = 23;
+        btn.layer.borderColor = [UIColor whiteColor].CGColor;
+        btn.layer.borderWidth = 1.5;
+        UILabel *bl = [[UILabel alloc] initWithFrame:btn.bounds];
+        bl.text = @"E"; bl.textAlignment = NSTextAlignmentCenter;
+        bl.textColor = [UIColor whiteColor]; bl.font = [UIFont boldSystemFontOfSize:20];
+        [btn addSubview:bl];
+        [btn addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:gMenuHandler action:@selector(tapped:)]];
+        [btn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:gMenuHandler action:@selector(panned:)]];
+        [vc.view addSubview:btn];
+        gMenuButton = btn;
+
+        CGFloat pw = 270;
+        UIScrollView *panel = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, pw, 100)];
+        panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
+        panel.layer.cornerRadius = 14;
+        panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+        panel.layer.borderWidth = 1.0;
+
+        CGFloat y = 10;
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, y, pw - 28, 24)];
+        title.text = @"EchoMod"; title.textColor = [UIColor whiteColor];
+        title.font = [UIFont boldSystemFontOfSize:17];
+        [panel addSubview:title];
+        y += 32;
+
+        addSwitch(panel, &y, @"Box ESP", gOptBoxes, 1);
+        addSwitch(panel, &y, @"Skeleton ESP", gOptSkeleton, 2);
+        addSwitch(panel, &y, @"Name / distance", gOptTags, 3);
+        addSwitch(panel, &y, @"Aimbot", gOptAimbot, 4);
+        addSwitch(panel, &y, @"Only while aiming (ADS)", gOptAdsOnly, 5);
+        addSwitch(panel, &y, @"Show aim FOV circle", gOptShowFov, 6);
+        addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
+        gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
+        gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
+        addSegment(panel, &y, @"ESP delay (frames)", @[ @"0", @"1", @"2", @"3" ], gOptDelay, 31);
+
+        panel.contentSize = CGSizeMake(pw, y + 8);
+        CGFloat ph = MIN(y + 8, ss.height - 40);
+        CGRect b = btn.frame;
+        panel.frame = CGRectMake(MIN(MAX(b.origin.x - pw - 8, 4), ss.width - pw - 4), MIN(MAX(b.origin.y, 4), ss.height - ph - 4), pw, ph);
+        panel.hidden = YES;
+        [vc.view addSubview:panel];
+        gMenuPanel = panel;
+    });
+}
+
+#pragma mark - 8) image bounds / slide
 
 static void probeEngine(void) {
     const struct mach_header_64 *h = NULL;
@@ -1125,6 +1394,7 @@ __attribute__((constructor)) static void EchoModInit(void) {
             installOverlay();
             installPlatformOverlay();
             installLabelLayer();
+            installMenu();
             showLoadedAlert(0);
         });
     }];
