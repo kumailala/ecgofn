@@ -1688,69 +1688,39 @@ static void forceLowGraphics(void) {
     [[NSFileManager defaultManager] createDirectoryAtPath:dir2 withIntermediateDirectories:YES attributes:nil error:nil];
 
     NSString *ctl =
-        @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]
-"
-        @"bAllowControllers=True
-"
-        @"bGameSupportsMultipleActiveControllers=True
-
-";
+        @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]\n"
+        @"bAllowControllers=True\n"
+        @"bGameSupportsMultipleActiveControllers=True\n\n";
 
     NSString *engine = ctl;
     if (low) {
         engine = [ctl stringByAppendingString:
-            @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]
-"
-            @"FrameRateLock=PUFRL_60
-
-"
-            @"[/Script/Engine.Engine]
-"
-            @"bSmoothFrameRate=False
-"
-            @"bUseFixedFrameRate=False
-
-"
-            @"[SystemSettings]
-"
-            @"t.MaxFPS=120
-"
-            @"sg.ResolutionQuality=100
-"
-            @"sg.ViewDistanceQuality=0
-"
-            @"sg.AntiAliasingQuality=0
-"
-            @"sg.ShadowQuality=0
-"
-            @"sg.PostProcessQuality=0
-"
-            @"sg.TextureQuality=0
-"
-            @"sg.EffectsQuality=0
-"
-            @"sg.FoliageQuality=0
-"];
+            @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]\n"
+            @"FrameRateLock=PUFRL_60\n\n"
+            @"[/Script/Engine.Engine]\n"
+            @"bSmoothFrameRate=False\n"
+            @"bUseFixedFrameRate=False\n\n"
+            @"[SystemSettings]\n"
+            @"t.MaxFPS=120\n"
+            @"sg.ResolutionQuality=100\n"
+            @"sg.ViewDistanceQuality=0\n"
+            @"sg.AntiAliasingQuality=0\n"
+            @"sg.ShadowQuality=0\n"
+            @"sg.PostProcessQuality=0\n"
+            @"sg.TextureQuality=0\n"
+            @"sg.EffectsQuality=0\n"
+            @"sg.FoliageQuality=0\n"];
     }
     NSString *profiles = low ?
-        @"[IPhoneX DeviceProfile]
-"
-        @"+CVars=sg.ResolutionQuality=100
-"
-        @"+CVars=sg.ViewDistanceQuality=0
-"
-        @"+CVars=sg.AntiAliasingQuality=0
-"
-        @"+CVars=sg.ShadowQuality=0
-"
-        @"+CVars=sg.PostProcessQuality=0
-"
-        @"+CVars=sg.TextureQuality=0
-"
-        @"+CVars=sg.EffectsQuality=0
-"
-        @"+CVars=sg.FoliageQuality=0
-" : @"";
+        @"[IPhoneX DeviceProfile]\n"
+        @"+CVars=sg.ResolutionQuality=100\n"
+        @"+CVars=sg.ViewDistanceQuality=0\n"
+        @"+CVars=sg.AntiAliasingQuality=0\n"
+        @"+CVars=sg.ShadowQuality=0\n"
+        @"+CVars=sg.PostProcessQuality=0\n"
+        @"+CVars=sg.TextureQuality=0\n"
+        @"+CVars=sg.EffectsQuality=0\n"
+        @"+CVars=sg.FoliageQuality=0\n" : @"";
     for (NSString *dd in @[ dir, dir2 ]) {
         [engine writeToFile:[dd stringByAppendingPathComponent:@"Engine.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [ctl writeToFile:[dd stringByAppendingPathComponent:@"Game.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
