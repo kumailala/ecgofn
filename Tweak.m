@@ -71,8 +71,8 @@ static int gDiagBs = 0;
 static NSString *gScreenDiagA = @"";
 static NSString *gScreenDiagB = @"";
 static void updateScreenDiag(void);
+static int gDiagVis, gDiagTraces, gDiagBlocked;
 static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
-static int gDiagVis;
 static BOOL gFiring = NO;
 
 #pragma mark - runtime helper
@@ -269,7 +269,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -365,6 +365,7 @@ static void showLoadedAlert(int attempt) {
 #define OFF_SKELCOMP_BONESPACE   0x840
 #define OFF_PAWN_CURRENTWEAPON   0x7D0
 #define OFF_WEAPON_DATA          0x368
+#define A_KISMET_TRACE           0x102552e04ULL
 #define A_FIRE_START             0x10219b908ULL
 #define A_FIRE_STOP              0x1017c6e84ULL
 #define OFF_WEAPONDEF_STATHANDLE 0x508
@@ -984,20 +985,48 @@ static float wrap180(float a) {
     return a;
 }
 
-typedef struct { uintptr_t pawn; FV3 aim; CGFloat sx, sy; BOOL onCross; } AimCand;
+typedef struct {
+    uintptr_t pawn; FV3 aim; CGFloat sx, sy; BOOL onCross;
+    FV3 pts[kMaxSel + 2]; int npts; int vis;
+} AimCand;
 
 typedef struct { float x, y, z; } LosVec;
-typedef BOOL (*LosFn)(void *, void *, LosVec, BOOL);
+typedef struct { float r, g, b, a; } LosCol;
+typedef struct { uintptr_t data; int32_t num, max; } LosArr;
+typedef uint8_t (*TraceFn)(void *, LosVec, LosVec, uint8_t, uint8_t, void *, uint8_t, void *, uint8_t, LosCol, LosCol, float);
 
-static BOOL pawnVisible(uintptr_t pawn, uintptr_t pc, FV3 cam) {
-    uintptr_t vt = rd_ptr(pc);
-    if (vt < 0x100000000ULL) return YES;
-    uintptr_t fn = rd_ptr(vt + 0x650);
-    if (fn < 0x100000000ULL) return YES;
-    LosVec v = { cam.x, cam.y, cam.z };
-    BOOL r = ((LosFn)fn)((void *)pc, (void *)pawn, v, NO) & 1;
-    if (r) gDiagVis++;
-    return r;
+static int gDiagVis = 0, gDiagTraces = 0, gDiagBlocked = 0;
+
+static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 from, FV3 to) {
+    uintptr_t ign[2] = { localPawn, target };
+    LosArr arr = { (uintptr_t)ign, 2, 2 };
+    uint8_t hit[0x100];
+    memset(hit, 0, sizeof hit);
+    float one = 1.0f;
+    memcpy(hit + 8, &one, 4);
+    LosCol z = {0,0,0,0};
+    LosVec a = { from.x, from.y, from.z }, b = { to.x, to.y, to.z };
+    uint8_t r = ((TraceFn)SYM(A_KISMET_TRACE))((void *)pc, a, b, 0, 0, &arr, 0, hit, 1, z, z, 0.0f);
+    gDiagTraces++;
+    if (r & 1) { gDiagBlocked++; return NO; }
+    return YES;
+}
+
+static BOOL candVisible(AimCand *c, uintptr_t pc, uintptr_t localPawn, FV3 cam) {
+    if (!gOptVisOnly) return YES;
+    if (c->vis == 1) return YES;
+    if (c->vis == 2) return NO;
+    int limit = c->npts < 12 ? c->npts : 12;
+    for (int i = 0; i < limit; i++) {
+        if (traceClear(pc, localPawn, c->pawn, cam, c->pts[i])) {
+            c->aim = c->pts[i];
+            c->vis = 1;
+            gDiagVis++;
+            return YES;
+        }
+    }
+    c->vis = 2;
+    return NO;
 }
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
@@ -1065,7 +1094,7 @@ static void updateESP(void) {
     gDiagDrawn = 0;
     gDiagAds = NO;
     gDiagLock = NO;
-    gDiagVis = 0;
+    gDiagVis = 0; gDiagTraces = 0; gDiagBlocked = 0;
 
     CGSize sz = gLabelRoot.bounds.size;
     AimCand cands[64];
@@ -1206,12 +1235,21 @@ static void updateESP(void) {
             tg.c = CGPointMake(cx, ptop - 10);
             [frame.tags addObject:tg];
 
-            if (!ep.team && !downed && nc < 64 && (!gOptVisOnly || pawnVisible(ep.pawn, pc, cam))) {
+            if (!ep.team && !downed && nc < 64) {
                 FV3 aim = gOptAimBody ? bodyW : headW;
                 CGFloat ax, ay; float ad;
                 if (project(&view, aim, &ax, &ay, &ad)) {
                     cands[nc].pawn = ep.pawn;
                     cands[nc].aim = aim;
+                    cands[nc].vis = 0;
+                    int np = 0;
+                    FV3 other = gOptAimBody ? headW : bodyW;
+                    cands[nc].pts[np++] = aim;
+                    cands[nc].pts[np++] = other;
+                    if (haveBones) {
+                        for (int k = 0; k < ep.bones->n && np < kMaxSel + 2; k++) if (ptOk[k]) cands[nc].pts[np++] = pts[k];
+                    }
+                    cands[nc].npts = np;
                     cands[nc].sx = (ax - 0.5) * sz.width;
                     cands[nc].sy = (ay - 0.5) * sz.height;
                     cands[nc].onCross = CGRectContainsPoint(CGRectInset(boxRect, w * 0.15, h * 0.08), CGPointMake(sz.width * 0.5, sz.height * 0.5));
@@ -1221,18 +1259,27 @@ static void updateESP(void) {
         }
 
         if (gOptTrigger) {
-            for (int i = 0; i < nc; i++) if (cands[i].onCross) { wantFire = YES; break; }
+            for (int i = 0; i < nc; i++) if (cands[i].onCross && candVisible(&cands[i], pc, localPawn, cam)) { wantFire = YES; break; }
         }
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
         if (gOptAimbot && (ads || !gOptAdsOnly) && looks_like_uobject(pc) && nc > 0) {
             CGFloat R = gOptFov * sz.height;
             int pick = -1;
-            CGFloat bestD = 1.0e30;
-            for (int i = 0; i < nc; i++) {
-                CGFloat d = hypot(cands[i].sx, cands[i].sy);
-                CGFloat lim = (cands[i].pawn == gAimTarget) ? R * 1.35 : R;
-                if (d <= lim && d < bestD) { bestD = d; pick = i; }
+            BOOL used[64];
+            memset(used, 0, sizeof used);
+            for (int round = 0; round < nc && pick < 0 && round < 6; round++) {
+                int bi = -1;
+                CGFloat bestD = 1.0e30;
+                for (int i = 0; i < nc; i++) {
+                    if (used[i]) continue;
+                    CGFloat d = hypot(cands[i].sx, cands[i].sy);
+                    CGFloat lim = (cands[i].pawn == gAimTarget) ? R * 1.35 : R;
+                    if (d <= lim && d < bestD) { bestD = d; bi = i; }
+                }
+                if (bi < 0) break;
+                used[bi] = YES;
+                if (candVisible(&cands[bi], pc, localPawn, cam)) pick = bi;
             }
             if (pick >= 0) {
                 gAimTarget = cands[pick].pawn;
