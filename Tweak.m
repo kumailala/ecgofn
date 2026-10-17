@@ -267,7 +267,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n"],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -373,6 +373,8 @@ static void showLoadedAlert(int attempt) {
 #define OFF_FORTPAWN_DYING       0x824
 #define OFF_FORTPAWN_DBNO        0x8C0
 #define OFF_FORTPLAYERPAWN_ADS   0x117A
+#define OFF_PRIM_LASTRENDER      0x2D8
+#define OFF_PRIM_LASTRENDER_SCR  0x2DC
 
 static const int kCamCacheOffsets[4] = { 0x390, 0x1990, 0x900, 0x1F00 };
 
@@ -382,6 +384,9 @@ static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static BOOL  gOptHudLayout = YES;
 static BOOL  gOptLowGfx = YES;
+static BOOL  gOptVisOnly = YES;
+static float gCamTime = 0;
+static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
@@ -733,6 +738,27 @@ static uintptr_t findGObject(const char *want, int32_t hint) {
     return 0;
 }
 
+static void findHudContext(void) {
+    if (!gOptTrigger) return;
+    if (gHudCtx && looks_like_uobject(gHudCtx) && rd_ptr(gHudCtx + 0x10) == gHudCtxClass) return;
+    gHudCtx = 0;
+    if (!gHudCtxClass || !objectNamed(gHudCtxClass, "AthenaHUDContext")) {
+        gHudCtxClass = findGObject("AthenaHUDContext", 0x12004);
+        if (!gHudCtxClass) return;
+    }
+    uintptr_t arr = SYM(A_GLOBAL_GOBJECTS);
+    uintptr_t items = rd_ptr(arr + 0x10);
+    int32_t num = rd_i32(arr + 0x1C);
+    if (items < 0x100000000ULL || num <= 0 || num > 2000000) return;
+    for (int32_t i = 0; i < num; i++) {
+        uintptr_t obj = rd_ptr(items + (uintptr_t)i * 0x18);
+        if (obj < 0x100000000ULL || (obj & 7)) continue;
+        if (rd_ptr(obj + 0x10) != gHudCtxClass) continue;
+        NSString *n = fname_string(rd_i32(obj + 0x18));
+        if (n && ![n hasPrefix:@"Default__"]) { gHudCtx = obj; return; }
+    }
+}
+
 static void applyHudLayoutFlag(void) {
     if (!gRuntimeOpts || !objectNamed(gRuntimeOpts, "Default__FortRuntimeOptions")) {
         gRuntimeOpts = 0;
@@ -754,7 +780,7 @@ static void scanPawns(void) {
     gNamesObj = rd_ptr(SYM(A_GLOBAL_GNAMES));
     if (!gBoneCache) gBoneCache = [NSMutableDictionary dictionary];
     gDiagEngine = looks_like_uobject(gEngine);
-    if (gDiagEngine) applyHudLayoutFlag();
+    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); }
     gDiagWorld = NO; gDiagPC = NO; gDiagGameState = NO;
     gDiagPlayers = 0; gDiagPawns = 0; gDiagActors = 0; gDiagBones = 0;
     if (!gDiagEngine) { publishPawns(nil, 0, 0); return; }
@@ -927,6 +953,7 @@ static BOOL readCamera(uintptr_t pc, FV3 *loc, FV3 *rot, float *fov) {
     }
     if (best < 0) return NO;
     gDiagCam = best;
+    gCamTime = bestTs;
 
     uintptr_t pov = cm + (uintptr_t)kCamCacheOffsets[best] + 0x10;
     if (!safe_read(pov, loc, sizeof *loc)) return NO;
@@ -956,6 +983,14 @@ static float wrap180(float a) {
 }
 
 typedef struct { uintptr_t pawn; FV3 aim; CGFloat sx, sy; BOOL onCross; } AimCand;
+
+static BOOL pawnVisible(uintptr_t pawn) {
+    uintptr_t mesh = rd_ptr(pawn + OFF_CHAR_MESH);
+    if (mesh < 0x100000000ULL) return NO;
+    float a = rd_f32(mesh + OFF_PRIM_LASTRENDER), b = rd_f32(mesh + OFF_PRIM_LASTRENDER_SCR);
+    float t = (isfinite(a) && a > b) ? a : (isfinite(b) ? b : 0.0f);
+    return t > 0.0f && gCamTime - t < 0.30f;
+}
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
     for (NSUInteger i = 0; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
@@ -990,13 +1025,15 @@ static void applyFrame(EchoFrame *f, CGSize sz) {
 typedef void (*FireFn)(void *);
 
 static void setFire(BOOL want, uintptr_t pc) {
+    (void)pc;
+    uintptr_t ctx = gHudCtx;
     if (want == gFiring) return;
     if (want) {
-        if (!looks_like_uobject(pc)) return;
-        ((FireFn)SYM(A_FIRE_START))((void *)pc);
+        if (!looks_like_uobject(ctx)) return;
+        ((FireFn)SYM(A_FIRE_START))((void *)ctx);
         gFiring = YES;
     } else {
-        if (looks_like_uobject(pc)) ((FireFn)SYM(A_FIRE_STOP))((void *)pc);
+        if (looks_like_uobject(ctx)) ((FireFn)SYM(A_FIRE_STOP))((void *)ctx);
         gFiring = NO;
     }
 }
@@ -1160,7 +1197,7 @@ static void updateESP(void) {
             tg.c = CGPointMake(cx, ptop - 10);
             [frame.tags addObject:tg];
 
-            if (!ep.team && !downed && nc < 64) {
+            if (!ep.team && !downed && nc < 64 && (!gOptVisOnly || pawnVisible(ep.pawn))) {
                 FV3 aim = gOptAimBody ? bodyW : headW;
                 CGFloat ax, ay; float ad;
                 if (project(&view, aim, &ax, &ay, &ad)) {
@@ -1316,6 +1353,7 @@ static void saveOptions(void) {
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
+    [d setBool:gOptVisOnly forKey:@"echo.vis"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1336,6 +1374,7 @@ static void loadOptions(void) {
     gOptTrigger = [d boolForKey:@"echo.trigger"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
+    if ([d objectForKey:@"echo.vis"]) gOptVisOnly = [d boolForKey:@"echo.vis"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1360,6 +1399,7 @@ static void loadOptions(void) {
         case 9: gOptTrigger = on; break;
         case 10: gOptHudLayout = on; break;
         case 11: gOptLowGfx = on; break;
+        case 12: gOptVisOnly = on; break;
     }
     saveOptions();
 }
@@ -1484,6 +1524,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Trigger bot (auto shoot)", gOptTrigger, 9);
         addSwitch(panel, &y, @"Enable HUD layout tool", gOptHudLayout, 10);
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
+        addSwitch(panel, &y, @"Smart aim: visible targets only", gOptVisOnly, 12);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
