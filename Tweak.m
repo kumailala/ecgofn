@@ -68,6 +68,7 @@ static BOOL gDiagAds, gDiagLock;
 static int  gDiagCam = -1;
 static NSString *gBoneDiag = @"bones: not tried";
 static int gDiagBs = 0;
+static BOOL gFiring = NO;
 
 #pragma mark - runtime helper
 
@@ -262,7 +263,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n"],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 [NSString stringWithFormat:@"actors: %d  tick: %d", gDiagActors, ++tick],
             ]);
@@ -354,8 +355,8 @@ static void showLoadedAlert(int attempt) {
 #define OFF_SKELCOMP_BONESPACE   0x840
 #define OFF_PAWN_CURRENTWEAPON   0x7D0
 #define OFF_WEAPON_DATA          0x368
-#define OFF_WEAPON_AUTOFIRE      0x3E0
-#define OFF_PC_AUTOFIRE          0x764
+#define A_FIRE_START             0x10219b908ULL
+#define A_FIRE_STOP              0x1017c6e84ULL
 #define OFF_WEAPONDEF_STATHANDLE 0x508
 #define OFF_DATATABLE_ROWMAP     0x30
 #define OFF_PS_NAME              0x3B0
@@ -611,9 +612,6 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
 typedef struct { uintptr_t row; float orig[16]; BOOL has; } StatBackup;
 static StatBackup gStatBackups[64];
 static int gStatBackupCount = 0;
-static uintptr_t gTrigWeapon = 0;
-static uint8_t gTrigWeaponOrig = 0, gTrigPcOrig = 0;
-static BOOL gTrigSaved = NO;
 
 static const int kSpreadOffs[] = { 0x134, 0x138 };
 static const int kRecoilOffs[] = { 0x1A8, 0x1AC, 0x1B0, 0x1B8, 0x1BC, 0x1C0, 0x1D8, 0x1DC, 0x1E0, 0x1EC, 0x1F0, 0x1FC, 0x200 };
@@ -692,19 +690,6 @@ static void applyWeaponMods(uintptr_t pc, uintptr_t localPawn) {
         }
     }
 
-    if (looks_like_uobject(pc)) {
-        if (gOptTrigger) {
-            if (!gTrigSaved) { gTrigPcOrig = rd_u8(pc + OFF_PC_AUTOFIRE); gTrigSaved = YES; }
-            if (weapon != gTrigWeapon) { gTrigWeapon = weapon; gTrigWeaponOrig = rd_u8(weapon + OFF_WEAPON_AUTOFIRE); }
-            uint8_t one = 1;
-            wr_bytes(pc + OFF_PC_AUTOFIRE, &one, 1);
-            wr_bytes(weapon + OFF_WEAPON_AUTOFIRE, &one, 1);
-        } else if (gTrigSaved) {
-            wr_bytes(pc + OFF_PC_AUTOFIRE, &gTrigPcOrig, 1);
-            if (weapon == gTrigWeapon) wr_bytes(weapon + OFF_WEAPON_AUTOFIRE, &gTrigWeaponOrig, 1);
-            gTrigSaved = NO;
-        }
-    }
 }
 
 // Slow path, runs on a background queue a few times a second: finds the local controller, the
@@ -914,7 +899,7 @@ static float wrap180(float a) {
     return a;
 }
 
-typedef struct { uintptr_t pawn; FV3 aim; CGFloat sx, sy; } AimCand;
+typedef struct { uintptr_t pawn; FV3 aim; CGFloat sx, sy; BOOL onCross; } AimCand;
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
     for (NSUInteger i = 0; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
@@ -946,6 +931,20 @@ static void applyFrame(EchoFrame *f, CGSize sz) {
     [CATransaction commit];
 }
 
+typedef void (*FireFn)(void *);
+
+static void setFire(BOOL want, uintptr_t pc) {
+    if (want == gFiring) return;
+    if (want) {
+        if (!looks_like_uobject(pc)) return;
+        ((FireFn)SYM(A_FIRE_START))((void *)pc);
+        gFiring = YES;
+    } else {
+        if (looks_like_uobject(pc)) ((FireFn)SYM(A_FIRE_STOP))((void *)pc);
+        gFiring = NO;
+    }
+}
+
 static void updateESP(void) {
     if (!gLabelRoot) return;
     attachScene(gLabelWindow);
@@ -972,6 +971,7 @@ static void updateESP(void) {
     FV3 cam = {0,0,0}, rot = {0,0,0};
     float fov = 0;
     BOOL haveCam = (pc && pawns.count && readCamera(pc, &cam, &rot, &fov));
+    BOOL wantFire = NO;
 
     if (haveCam) {
         float pr = rot.x * (float)M_PI / 180.0f, yr = rot.y * (float)M_PI / 180.0f, rr = rot.z * (float)M_PI / 180.0f;
@@ -1077,7 +1077,8 @@ static void updateESP(void) {
             CGFloat cx = (tx + bx) * 0.5 * sz.width;
             if (cx < -w || cx > sz.width + w || pbot < 0 || ptop > sz.height) continue;
 
-            [(ep.team ? frame.tb : frame.eb) appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(cx - w * 0.5, ptop, w, h)]];
+            CGRect boxRect = CGRectMake(cx - w * 0.5, ptop, w, h);
+            [(ep.team ? frame.tb : frame.eb) appendPath:[UIBezierPath bezierPathWithRect:boxRect]];
 
             if (haveBones) {
                 UIBezierPath *bp = ep.team ? frame.tbn : frame.ebn;
@@ -1111,11 +1112,15 @@ static void updateESP(void) {
                     cands[nc].aim = aim;
                     cands[nc].sx = (ax - 0.5) * sz.width;
                     cands[nc].sy = (ay - 0.5) * sz.height;
+                    cands[nc].onCross = CGRectContainsPoint(CGRectInset(boxRect, w * 0.15, h * 0.08), CGPointMake(sz.width * 0.5, sz.height * 0.5));
                     nc++;
                 }
             }
         }
 
+        if (gOptTrigger) {
+            for (int i = 0; i < nc; i++) if (cands[i].onCross) { wantFire = YES; break; }
+        }
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
         if (gOptAimbot && (ads || !gOptAdsOnly) && looks_like_uobject(pc) && nc > 0) {
@@ -1149,6 +1154,7 @@ static void updateESP(void) {
         }
     }
 
+    setFire(wantFire && gOptTrigger, pc);
     gDiagDrawn = (int)frame.tags.count;
     if (!gHistory) gHistory = [NSMutableArray array];
     [gHistory insertObject:frame atIndex:0];
@@ -1413,7 +1419,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Show aim FOV circle", gOptShowFov, 6);
         addSwitch(panel, &y, @"No recoil", gOptNoRecoil, 7);
         addSwitch(panel, &y, @"No spread", gOptNoSpread, 8);
-        addSwitch(panel, &y, @"Trigger bot", gOptTrigger, 9);
+        addSwitch(panel, &y, @"Trigger bot (auto shoot)", gOptTrigger, 9);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
