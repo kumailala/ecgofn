@@ -392,7 +392,6 @@ static BOOL  gOptLowGfx = YES;
 static BOOL  gOptVisOnly = YES;
 static BOOL  gOptAutoSprint = YES;
 static BOOL  gOptPeek = NO;
-static BOOL  gOptDesktop = YES;
 static int32_t gPeekOrig = -2;
 static float gCamTime = 0;
 
@@ -796,23 +795,18 @@ static void applyPs4Glyphs(void) {
         uint8_t v = 1;
         wr_bytes(gInputCtx + 0xB1, &v, 1);
     }
-    if (gOptDesktop && rd_u8(gInputCtx + 0xB0) != 1) {
-        Class gc = objc_getClass("GCController");
-        NSArray *pads = gc ? [gc performSelector:@selector(controllers)] : nil;
-        if (pads.count > 0) { uint8_t t = 1; wr_bytes(gInputCtx + 0xB0, &t, 1); }
-    }
 }
 
 static void applySettingsPeek(void) {
     uintptr_t pa = SYM(A_PLATFORM_CACHE);
     int32_t cur = rd_i32(pa);
-    if (gOptPeek || gOptDesktop) {
+    if (gOptPeek) {
         if (cur != 0) {
             if (gPeekOrig == -2) gPeekOrig = cur;
             int32_t z = 0;
             wr_bytes(pa, &z, 4);
         }
-    } else if (gPeekOrig != -2 && !gOptDesktop) {
+    } else if (gPeekOrig != -2) {
         int32_t o = gPeekOrig;
         wr_bytes(pa, &o, 4);
         gPeekOrig = -2;
@@ -1477,7 +1471,6 @@ static void saveOptions(void) {
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
     [d setBool:gOptVisOnly forKey:@"echo.vis"];
     [d setBool:gOptAutoSprint forKey:@"echo.sprint"];
-    [d setBool:gOptDesktop forKey:@"echo.desktop"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1500,7 +1493,6 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
     if ([d objectForKey:@"echo.vis"]) gOptVisOnly = [d boolForKey:@"echo.vis"];
     if ([d objectForKey:@"echo.sprint"]) gOptAutoSprint = [d boolForKey:@"echo.sprint"];
-    if ([d objectForKey:@"echo.desktop"]) gOptDesktop = [d boolForKey:@"echo.desktop"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1528,7 +1520,6 @@ static void loadOptions(void) {
         case 12: gOptVisOnly = on; break;
         case 13: gOptAutoSprint = on; break;
         case 14: gOptPeek = on; break;
-        case 15: gOptDesktop = on; break;
     }
     saveOptions();
 }
@@ -1655,7 +1646,6 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
-        addSwitch(panel, &y, @"Full controller mode (PC)", gOptDesktop, 15);
         addSwitch(panel, &y, @"Peek hidden settings tabs", gOptPeek, 14);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
