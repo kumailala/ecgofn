@@ -366,6 +366,7 @@ static void showLoadedAlert(int attempt) {
 #define OFF_PAWN_CURRENTWEAPON   0x7D0
 #define OFF_WEAPON_DATA          0x368
 #define A_KISMET_TRACE           0x102552e04ULL
+#define A_SET_GAMEPAD_TYPE       0x1028fa310ULL
 #define A_FIRE_START             0x10219b908ULL
 #define A_FIRE_STOP              0x1017c6e84ULL
 #define OFF_WEAPONDEF_STATHANDLE 0x508
@@ -762,6 +763,36 @@ static void findHudContext(void) {
     }
 }
 
+static uintptr_t gInputCtx = 0, gInputCtxClass = 0;
+typedef void (*SetPadTypeFn)(void *, uint8_t);
+
+static void applyPs4Glyphs(void) {
+    if (!gInputCtxClass || !objectNamed(gInputCtxClass, "CommonInputContext")) {
+        gInputCtxClass = findGObject("CommonInputContext", 0x12004);
+        gInputCtx = 0;
+        if (!gInputCtxClass) return;
+    }
+    if (!gInputCtx || !looks_like_uobject(gInputCtx) || rd_ptr(gInputCtx + 0x10) != gInputCtxClass) {
+        gInputCtx = 0;
+        uintptr_t arr = SYM(A_GLOBAL_GOBJECTS);
+        uintptr_t items = rd_ptr(arr + 0x10);
+        int32_t num = rd_i32(arr + 0x1C);
+        if (items < 0x100000000ULL || num <= 0 || num > 2000000) return;
+        for (int32_t i = 0; i < num; i++) {
+            uintptr_t obj = rd_ptr(items + (uintptr_t)i * 0x18);
+            if (obj < 0x100000000ULL || (obj & 7)) continue;
+            if (rd_ptr(obj + 0x10) != gInputCtxClass) continue;
+            NSString *n = fname_string(rd_i32(obj + 0x18));
+            if (n && ![n hasPrefix:@"Default__"]) { gInputCtx = obj; break; }
+        }
+        if (!gInputCtx) return;
+    }
+    if (rd_u8(gInputCtx + 0xB1) != 1) {
+        ((SetPadTypeFn)SYM(A_SET_GAMEPAD_TYPE))((void *)gInputCtx, 1);
+        if (rd_u8(gInputCtx + 0xB1) != 1) { uint8_t v = 1; wr_bytes(gInputCtx + 0xB1, &v, 1); }
+    }
+}
+
 static void applyHudLayoutFlag(void) {
     if (!gRuntimeOpts || !objectNamed(gRuntimeOpts, "Default__FortRuntimeOptions")) {
         gRuntimeOpts = 0;
@@ -783,7 +814,7 @@ static void scanPawns(void) {
     gNamesObj = rd_ptr(SYM(A_GLOBAL_GNAMES));
     if (!gBoneCache) gBoneCache = [NSMutableDictionary dictionary];
     gDiagEngine = looks_like_uobject(gEngine);
-    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); }
+    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); applyPs4Glyphs(); }
     gDiagWorld = NO; gDiagPC = NO; gDiagGameState = NO;
     gDiagPlayers = 0; gDiagPawns = 0; gDiagActors = 0; gDiagBones = 0;
     if (!gDiagEngine) { publishPawns(nil, 0, 0); return; }
