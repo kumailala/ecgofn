@@ -67,6 +67,7 @@ static int  gDiagPlayers, gDiagPawns, gDiagActors, gDiagDrawn, gDiagBones;
 static BOOL gDiagAds, gDiagLock;
 static int  gDiagCam = -1;
 static NSString *gBoneDiag = @"bones: not tried";
+static int gDiagBs = 0;
 
 #pragma mark - runtime helper
 
@@ -262,7 +263,7 @@ static void installPlatformOverlay(void) {
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
                 [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n"],
-                gBoneDiag,
+                [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 [NSString stringWithFormat:@"actors: %d  tick: %d", gDiagActors, ++tick],
             ]);
         });
@@ -350,6 +351,13 @@ static void showLoadedAlert(int attempt) {
 #define OFF_CAPSULE_HALFHEIGHT   0x670
 #define OFF_SKINNED_SKELMESH     0x678
 #define OFF_SKELMESH_REFBONES    0x138
+#define OFF_SKELCOMP_BONESPACE   0x840
+#define OFF_PAWN_CURRENTWEAPON   0x7D0
+#define OFF_WEAPON_DATA          0x368
+#define OFF_WEAPON_AUTOFIRE      0x3E0
+#define OFF_PC_AUTOFIRE          0x764
+#define OFF_WEAPONDEF_STATHANDLE 0x508
+#define OFF_DATATABLE_ROWMAP     0x30
 #define OFF_PS_NAME              0x3B0
 #define OFF_FORTPS_PLATFORM      0x768
 #define OFF_ATHENA_TEAM          0xF60
@@ -362,12 +370,16 @@ static const int kCamCacheOffsets[4] = { 0x390, 0x1990, 0x900, 0x1F00 };
 static BOOL  gOptBoxes = YES, gOptSkeleton = YES, gOptTags = YES;
 static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
 static BOOL  gOptAimBody = NO;
+static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
 
 typedef struct { float x, y, z; } FV3;
 typedef struct { float q[4]; float t[3]; float tp; float s[3]; float sp; } FXform;
+typedef struct { float q[4]; float t[3]; float s[3]; } CompBone;
+static FXform gLocalBones[700];
+static CompBone gCompBones[700];
 
 #define SYM(va) ((uintptr_t)((intptr_t)(va) + gSlide))
 
@@ -466,6 +478,7 @@ static BOOL looks_like_xform(const FXform *x) {
 }
 
 #define kMaxSel 24
+#define kMaxBones 700
 
 @interface EchoBoneMap : NSObject {
 @public
@@ -476,6 +489,7 @@ static BOOL looks_like_xform(const FXform *x) {
     int neck;
     int pelvis;
     int boneCount;
+    int *parent;
 }
 @end
 @implementation EchoBoneMap
@@ -494,7 +508,6 @@ static NSArray<EchoPawn *> *gPawns = nil;
 static uintptr_t gLocalPC = 0;
 static uintptr_t gLocalPawn = 0;
 static uintptr_t gEngine = 0;
-static int gCSOff = -1;
 static NSMutableDictionary<NSNumber *, EchoBoneMap *> *gBoneCache = nil;
 static CFTimeInterval gLastDiagWrite = 0;
 static int gDiagWrites = 0;
@@ -527,60 +540,21 @@ static void writeDiagFile(NSString *text) {
            atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-static void discoverComponentSpace(uintptr_t mesh, int32_t N, NSMutableString *diag) {
-    if (gCSOff >= 0) return;
-    float bestExt = 0.0f;
-    int best = -1;
-    FXform probe[6];
-    for (int off = 0x680; off <= 0xCC0; off += 8) {
-        uintptr_t data = rd_ptr(mesh + (uintptr_t)off);
-        int32_t num = rd_i32(mesh + (uintptr_t)off + 8);
-        int32_t mx = rd_i32(mesh + (uintptr_t)off + 12);
-        if (data < 0x100000000ULL || (data & 0xF) || num < 20 || num > 700 || mx < num) continue;
-        BOOL ok = safe_read(data, probe, sizeof probe);
-        for (int i = 0; ok && i < 6; i++) if (!looks_like_xform(&probe[i])) ok = NO;
-        if (!ok) continue;
-
-        FXform *all = (FXform *)malloc((size_t)num * sizeof(FXform));
-        if (!all) continue;
-        float ext = 0.0f;
-        if (safe_read(data, all, (size_t)num * sizeof(FXform))) {
-            for (int i = 0; i < num; i++) {
-                float l = sqrtf(all[i].t[0] * all[i].t[0] + all[i].t[1] * all[i].t[1] + all[i].t[2] * all[i].t[2]);
-                if (l > ext) ext = l;
-            }
-        }
-        free(all);
-        [diag appendFormat:@"cand off=0x%X num=%d max=%d ext=%.1f\n", off, num, mx, ext];
-        if (num == N && ext > bestExt) { bestExt = ext; best = off; }
-    }
-    if (best >= 0 && bestExt > 60.0f) gCSOff = best;
-}
-
 static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
     uintptr_t skel = rd_ptr(mesh + OFF_SKINNED_SKELMESH);
     if (!looks_like_uobject(skel)) { gBoneDiag = @"bones: no skeletal mesh"; return nil; }
     NSNumber *key = @(skel);
     EchoBoneMap *cached = gBoneCache[key];
-    if (cached) {
-        if (cached->n > 0 && gCSOff < 0) {
-            NSMutableString *d = [NSMutableString stringWithFormat:@"retry csOff N=%d\n", cached->boneCount];
-            discoverComponentSpace(mesh, cached->boneCount, d);
-            [d appendFormat:@"csOff=%d\n", gCSOff];
-            gBoneDiag = [NSString stringWithFormat:@"bones: sel=%d N=%d cs=%d", cached->n, cached->boneCount, gCSOff];
-            if (gCSOff < 0) writeDiagFile(d);
-        }
-        return cached->n > 0 ? cached : nil;
-    }
+    if (cached) return cached->n > 0 ? cached : nil;
 
     uintptr_t refData = rd_ptr(skel + OFF_SKELMESH_REFBONES);
     int32_t N = rd_i32(skel + OFF_SKELMESH_REFBONES + 8);
     NSMutableString *diag = [NSMutableString stringWithFormat:@"skel=%p refData=%p N=%d\n", (void *)skel, (void *)refData, N];
 
     EchoBoneMap *m = [[EchoBoneMap alloc] init];
-    m->n = 0; m->head = -1; m->neck = -1; m->pelvis = -1; m->boneCount = N;
+    m->n = 0; m->head = -1; m->neck = -1; m->pelvis = -1; m->boneCount = N; m->parent = NULL;
 
-    if (refData > 0x100000000ULL && N >= 20 && N <= 700) {
+    if (refData > 0x100000000ULL && N >= 20 && N <= kMaxBones) {
         int32_t *info = (int32_t *)malloc((size_t)N * 16);
         if (info && safe_read(refData, info, (size_t)N * 16)) {
             int selBone[kMaxSel];
@@ -597,6 +571,8 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
                 }
             }
             [diag appendFormat:@"named=%d\n", named];
+            m->parent = (int *)malloc((size_t)N * sizeof(int));
+            for (int i = 0; i < N; i++) m->parent[i] = info[i * 4 + 2];
             int count = 0;
             for (int k = 0; k < kMaxSel; k++) {
                 if (selBone[k] < 0) continue;
@@ -608,13 +584,13 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
             }
             for (int a = 0; a < count; a++) {
                 m->link[a] = -1;
-                int p = info[m->idx[a] * 4 + 2];
+                int p = m->parent[m->idx[a]];
                 int guard = 0;
                 while (p >= 0 && p < N && guard++ < 64) {
                     int found = -1;
                     for (int b = 0; b < count; b++) if (m->idx[b] == p) { found = b; break; }
                     if (found >= 0) { m->link[a] = found; break; }
-                    p = info[p * 4 + 2];
+                    p = m->parent[p];
                 }
             }
             m->n = (count >= 8) ? count : 0;
@@ -623,12 +599,112 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
         if (info) free(info);
     }
 
-    discoverComponentSpace(mesh, N, diag);
-    [diag appendFormat:@"csOff=%d\n", gCSOff];
-    gBoneDiag = [NSString stringWithFormat:@"bones: sel=%d N=%d cs=%d", m->n, N, gCSOff];
-    if (m->n == 0 || gCSOff < 0) writeDiagFile(diag);
+    gBoneDiag = [NSString stringWithFormat:@"bones: sel=%d N=%d", m->n, N];
+    if (m->n == 0) writeDiagFile(diag);
     gBoneCache[key] = m;
     return m->n > 0 ? m : nil;
+}
+
+
+#pragma mark - 5b) weapon mods (stat table rows + autofire flags)
+
+typedef struct { uintptr_t row; float orig[16]; BOOL has; } StatBackup;
+static StatBackup gStatBackups[64];
+static int gStatBackupCount = 0;
+static uintptr_t gTrigWeapon = 0;
+static uint8_t gTrigWeaponOrig = 0, gTrigPcOrig = 0;
+static BOOL gTrigSaved = NO;
+
+static const int kSpreadOffs[] = { 0x134, 0x138 };
+static const int kRecoilOffs[] = { 0x1A8, 0x1AC, 0x1B0, 0x1B8, 0x1BC, 0x1C0, 0x1D8, 0x1DC, 0x1E0, 0x1EC, 0x1F0, 0x1FC, 0x200 };
+
+static void wr_bytes(uintptr_t addr, const void *src, size_t n) {
+    uint8_t probe[16];
+    if (n > sizeof probe || !safe_read(addr, probe, n)) return;
+    memcpy((void *)addr, src, n);
+}
+
+static uintptr_t findStatRow(uintptr_t weaponData) {
+    uintptr_t table = rd_ptr(weaponData + OFF_WEAPONDEF_STATHANDLE);
+    if (!looks_like_uobject(table)) return 0;
+    uint64_t rowName = 0;
+    if (!safe_read(weaponData + OFF_WEAPONDEF_STATHANDLE + 8, &rowName, 8) || rowName == 0) return 0;
+    uintptr_t data = rd_ptr(table + OFF_DATATABLE_ROWMAP);
+    int32_t num = rd_i32(table + OFF_DATATABLE_ROWMAP + 8);
+    if (data < 0x100000000ULL || num <= 0 || num > 20000) return 0;
+    uint8_t buf[24 * 256];
+    for (int32_t base = 0; base < num; base += 256) {
+        int32_t cnt = num - base;
+        if (cnt > 256) cnt = 256;
+        if (!safe_read(data + (uintptr_t)base * 24, buf, (size_t)cnt * 24)) continue;
+        for (int32_t i = 0; i < cnt; i++) {
+            uint64_t key; uintptr_t val;
+            memcpy(&key, buf + i * 24, 8);
+            memcpy(&val, buf + i * 24 + 8, 8);
+            if (key == rowName && val > 0x100000000ULL) return val;
+        }
+    }
+    return 0;
+}
+
+static StatBackup *backupFor(uintptr_t row) {
+    for (int i = 0; i < gStatBackupCount; i++) if (gStatBackups[i].row == row) return &gStatBackups[i];
+    if (gStatBackupCount >= 64) return NULL;
+    StatBackup *b = &gStatBackups[gStatBackupCount++];
+    b->row = row; b->has = NO;
+    return b;
+}
+
+static void applyOffs(uintptr_t row, StatBackup *bk, const int *offs, int count, int slot0, BOOL zero) {
+    for (int i = 0; i < count; i++) {
+        float cur = 0;
+        if (!safe_read(row + (uintptr_t)offs[i], &cur, 4) || !isfinite(cur)) continue;
+        if (zero) {
+            if (cur != 0.0f) { bk->orig[slot0 + i] = cur; bk->has = YES; float z = 0.0f; wr_bytes(row + (uintptr_t)offs[i], &z, 4); }
+        } else if (bk->has && cur == 0.0f && bk->orig[slot0 + i] != 0.0f) {
+            float o = bk->orig[slot0 + i];
+            wr_bytes(row + (uintptr_t)offs[i], &o, 4);
+        }
+    }
+}
+
+static void applyWeaponMods(uintptr_t pc, uintptr_t localPawn) {
+    uintptr_t weapon = looks_like_uobject(localPawn) ? rd_ptr(localPawn + OFF_PAWN_CURRENTWEAPON) : 0;
+    if (!looks_like_uobject(weapon)) return;
+    uintptr_t wdata = rd_ptr(weapon + OFF_WEAPON_DATA);
+
+    if (looks_like_uobject(wdata)) {
+        static uintptr_t lastW = 0, lastRow = 0;
+        uintptr_t row = (wdata == lastW && lastRow) ? lastRow : findStatRow(wdata);
+        lastW = wdata; lastRow = row;
+        if (row) {
+            float clip = 0;
+            safe_read(row + 0x104, &clip, 4);
+            int32_t clipInt = rd_i32(row + 0x104);
+            if (clipInt >= 0 && clipInt < 2000) {
+                StatBackup *bk = backupFor(row);
+                if (bk) {
+                    applyOffs(row, bk, kSpreadOffs, 2, 0, gOptNoSpread);
+                    applyOffs(row, bk, kRecoilOffs, 13, 2, gOptNoRecoil);
+                }
+            }
+            (void)clip;
+        }
+    }
+
+    if (looks_like_uobject(pc)) {
+        if (gOptTrigger) {
+            if (!gTrigSaved) { gTrigPcOrig = rd_u8(pc + OFF_PC_AUTOFIRE); gTrigSaved = YES; }
+            if (weapon != gTrigWeapon) { gTrigWeapon = weapon; gTrigWeaponOrig = rd_u8(weapon + OFF_WEAPON_AUTOFIRE); }
+            uint8_t one = 1;
+            wr_bytes(pc + OFF_PC_AUTOFIRE, &one, 1);
+            wr_bytes(weapon + OFF_WEAPON_AUTOFIRE, &one, 1);
+        } else if (gTrigSaved) {
+            wr_bytes(pc + OFF_PC_AUTOFIRE, &gTrigPcOrig, 1);
+            if (weapon == gTrigWeapon) wr_bytes(weapon + OFF_WEAPON_AUTOFIRE, &gTrigWeaponOrig, 1);
+            gTrigSaved = NO;
+        }
+    }
 }
 
 // Slow path, runs on a background queue a few times a second: finds the local controller, the
@@ -732,7 +808,7 @@ static void scanPawns(void) {
                 uintptr_t mesh = rd_ptr(a + OFF_CHAR_MESH);
                 if (looks_like_uobject(mesh)) {
                     ep.bones = buildBoneMap(mesh, ep);
-                    if (ep.bones && gCSOff >= 0) gDiagBones++;
+                    if (ep.bones) gDiagBones++;
                 }
                 [out addObject:ep];
             }
@@ -742,6 +818,7 @@ static void scanPawns(void) {
     gDiagActors = actorsSeen;
     gDiagPawns = (int)out.count;
     publishPawns(out, pc, localPawn);
+    applyWeaponMods(pc, localPawn);
 }
 
 #pragma mark - 6) ESP drawing + aimbot
@@ -936,31 +1013,52 @@ static void updateESP(void) {
             memset(ptOk, 0, sizeof ptOk);
             BOOL haveBones = NO;
 
-            if (gOptSkeleton || gOptAimbot) {
-                if (ep.bones && gCSOff >= 0) {
-                    uintptr_t mesh = rd_ptr(ep.pawn + OFF_CHAR_MESH);
-                    FXform c2w;
-                    if (mesh >= 0x100000000ULL && safe_read(mesh + OFF_SCENE_C2W, &c2w, sizeof c2w) && looks_like_xform(&c2w)) {
-                        uintptr_t arr = rd_ptr(mesh + (uintptr_t)gCSOff);
-                        int32_t bn = rd_i32(mesh + (uintptr_t)gCSOff + 8);
-                        if (arr && bn == ep.bones->boneCount) {
-                            FXform *bt = (FXform *)malloc((size_t)bn * sizeof(FXform));
-                            if (bt && safe_read(arr, bt, (size_t)bn * sizeof(FXform))) {
-                                for (int k = 0; k < ep.bones->n; k++) {
-                                    const FXform *b = &bt[ep.bones->idx[k]];
-                                    FV3 lp = { b->t[0] * c2w.s[0], b->t[1] * c2w.s[1], b->t[2] * c2w.s[2] };
-                                    FV3 r = qrot(c2w.q, lp);
-                                    pts[k] = (FV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
-                                    ptOk[k] = sane_vec(pts[k]);
-                                }
-                                haveBones = YES;
-                                int hi = ep.bones->head, ni = ep.bones->neck, pi = ep.bones->pelvis;
-                                if (hi >= 0 && ptOk[hi]) headW = pts[hi];
-                                if (ni >= 0 && pi >= 0 && ptOk[ni] && ptOk[pi]) {
-                                    bodyW = (FV3){ (pts[ni].x + pts[pi].x) * 0.5f, (pts[ni].y + pts[pi].y) * 0.5f, (pts[ni].z + pts[pi].z) * 0.5f };
-                                }
+            if ((gOptSkeleton || gOptAimbot) && ep.bones && ep.bones->parent) {
+                uintptr_t mesh = rd_ptr(ep.pawn + OFF_CHAR_MESH);
+                FXform c2w;
+                if (mesh >= 0x100000000ULL && safe_read(mesh + OFF_SCENE_C2W, &c2w, sizeof c2w) && looks_like_xform(&c2w)) {
+                    uintptr_t arr = rd_ptr(mesh + OFF_SKELCOMP_BONESPACE);
+                    int32_t bn = rd_i32(mesh + OFF_SKELCOMP_BONESPACE + 8);
+                    gDiagBs = bn;
+                    if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
+                    if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
+                        safe_read(arr, gLocalBones, (size_t)bn * sizeof(FXform)) && looks_like_xform(&gLocalBones[0])) {
+                        for (int i = 0; i < bn; i++) {
+                            const FXform *l = &gLocalBones[i];
+                            int pi = ep.bones->parent[i];
+                            CompBone *c = &gCompBones[i];
+                            if (pi < 0 || pi >= i) {
+                                memcpy(c->q, l->q, sizeof c->q);
+                                memcpy(c->t, l->t, sizeof c->t);
+                                memcpy(c->s, l->s, sizeof c->s);
+                            } else {
+                                const CompBone *pc2 = &gCompBones[pi];
+                                FV3 lt = { l->t[0] * pc2->s[0], l->t[1] * pc2->s[1], l->t[2] * pc2->s[2] };
+                                FV3 rt = qrot(pc2->q, lt);
+                                c->t[0] = pc2->t[0] + rt.x; c->t[1] = pc2->t[1] + rt.y; c->t[2] = pc2->t[2] + rt.z;
+                                float ax = pc2->q[0], ay = pc2->q[1], az = pc2->q[2], aw = pc2->q[3];
+                                float bx = l->q[0], by2 = l->q[1], bz = l->q[2], bw = l->q[3];
+                                c->q[0] = aw * bx + ax * bw + ay * bz - az * by2;
+                                c->q[1] = aw * by2 - ax * bz + ay * bw + az * bx;
+                                c->q[2] = aw * bz + ax * by2 - ay * bx + az * bw;
+                                c->q[3] = aw * bw - ax * bx - ay * by2 - az * bz;
+                                c->s[0] = pc2->s[0] * l->s[0]; c->s[1] = pc2->s[1] * l->s[1]; c->s[2] = pc2->s[2] * l->s[2];
                             }
-                            if (bt) free(bt);
+                        }
+                        for (int k = 0; k < ep.bones->n; k++) {
+                            int bi = ep.bones->idx[k];
+                            if (bi >= bn) continue;
+                            const CompBone *c = &gCompBones[bi];
+                            FV3 lp = { c->t[0] * c2w.s[0], c->t[1] * c2w.s[1], c->t[2] * c2w.s[2] };
+                            FV3 r = qrot(c2w.q, lp);
+                            pts[k] = (FV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
+                            ptOk[k] = sane_vec(pts[k]);
+                        }
+                        haveBones = YES;
+                        int hi = ep.bones->head, ni = ep.bones->neck, pi2 = ep.bones->pelvis;
+                        if (hi >= 0 && ptOk[hi]) headW = pts[hi];
+                        if (ni >= 0 && pi2 >= 0 && ptOk[ni] && ptOk[pi2]) {
+                            bodyW = (FV3){ (pts[ni].x + pts[pi2].x) * 0.5f, (pts[ni].y + pts[pi2].y) * 0.5f, (pts[ni].z + pts[pi2].z) * 0.5f };
                         }
                     }
                 }
@@ -1151,6 +1249,9 @@ static void saveOptions(void) {
     [d setBool:gOptAdsOnly forKey:@"echo.ads"];
     [d setBool:gOptShowFov forKey:@"echo.fovring"];
     [d setBool:gOptAimBody forKey:@"echo.body"];
+    [d setBool:gOptNoRecoil forKey:@"echo.norecoil"];
+    [d setBool:gOptNoSpread forKey:@"echo.nospread"];
+    [d setBool:gOptTrigger forKey:@"echo.trigger"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1166,6 +1267,9 @@ static void loadOptions(void) {
     gOptAdsOnly = [d boolForKey:@"echo.ads"];
     gOptShowFov = [d boolForKey:@"echo.fovring"];
     gOptAimBody = [d boolForKey:@"echo.body"];
+    gOptNoRecoil = [d boolForKey:@"echo.norecoil"];
+    gOptNoSpread = [d boolForKey:@"echo.nospread"];
+    gOptTrigger = [d boolForKey:@"echo.trigger"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1185,6 +1289,9 @@ static void loadOptions(void) {
         case 4: gOptAimbot = on; break;
         case 5: gOptAdsOnly = on; break;
         case 6: gOptShowFov = on; break;
+        case 7: gOptNoRecoil = on; break;
+        case 8: gOptNoSpread = on; break;
+        case 9: gOptTrigger = on; break;
     }
     saveOptions();
 }
@@ -1304,6 +1411,9 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Aimbot", gOptAimbot, 4);
         addSwitch(panel, &y, @"Only while aiming (ADS)", gOptAdsOnly, 5);
         addSwitch(panel, &y, @"Show aim FOV circle", gOptShowFov, 6);
+        addSwitch(panel, &y, @"No recoil", gOptNoRecoil, 7);
+        addSwitch(panel, &y, @"No spread", gOptNoSpread, 8);
+        addSwitch(panel, &y, @"Trigger bot", gOptTrigger, 9);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
