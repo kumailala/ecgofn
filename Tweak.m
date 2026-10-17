@@ -57,21 +57,14 @@ static const CGFloat gPlatWidth = 300.0;
 static dispatch_source_t gFpsTimer  = nil;
 static dispatch_source_t gPlatTimer = nil;
 
-// overhead "platform" labels (test scaffold; implemented in section 5, counted by the HUD panel)
-@interface EchoOverheadLabel : NSObject
-@property (nonatomic, strong) UILabel *view;
-@property (nonatomic, copy)   NSString *text;
-@property (nonatomic, assign) CGFloat nx;   // 0..1 across the screen
-@property (nonatomic, assign) CGFloat ny;   // 0..1 down the screen
-@end
-static NSMutableArray<EchoOverheadLabel *> *gLabels = nil;
-
-// engine address probe result (filled in by probeEngine() in section 6, shown in the HUD panel)
+// engine-data diagnostics (filled by the scanner, shown in the HUD panel)
+static uintptr_t gImgBase = 0;
+static uintptr_t gImgEnd  = 0;
+static intptr_t  gSlide   = 0;
 static BOOL gProbeInRange = NO;
-
-// engine-data diagnostics (filled in section 7, shown in the HUD panel)
-static BOOL gDiagEngine, gDiagPC, gDiagGameState;
-static int  gDiagPlayers, gDiagDrawn;
+static BOOL gDiagEngine, gDiagWorld, gDiagPC, gDiagGameState;
+static int  gDiagPlayers, gDiagPawns, gDiagActors, gDiagDrawn;
+static int  gDiagCam = -1;
 
 #pragma mark - runtime helper
 
@@ -261,17 +254,12 @@ static void installPlatformOverlay(void) {
         dispatch_source_set_event_handler(timer, ^{
             static int tick = 0;
             attachScene(gPlatOverlay); // self-heal if the scene connected after install
-            int onscreen = 0;
-            for (EchoOverheadLabel *L in gLabels) {
-                if (L.nx >= 0.0 && L.nx <= 1.0 && L.ny >= 0.0 && L.ny <= 1.0) onscreen++;
-            }
-            NSString *eng = gProbeInRange ? @"ok" : @"NO";
+            NSString *eng = gDiagEngine ? @"ok" : (gProbeInRange ? @"no-obj" : @"NO");
             setPlatLines(@[
-                @"[EchoMod] overhead labels",
-                [NSString stringWithFormat:@"engine: %@  pc: %@", eng, gDiagPC ? @"Y" : @"n"],
-                [NSString stringWithFormat:@"gs: %@  players: %d  drawn: %d",
-                    gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagDrawn],
-                [NSString stringWithFormat:@"onscreen: %d  tick: %d", onscreen, ++tick],
+                @"[EchoMod] ESP",
+                [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
+                [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns],
+                [NSString stringWithFormat:@"drawn: %d  actors: %d  cam: %d  tick: %d", gDiagDrawn, gDiagActors, gDiagCam, ++tick],
             ]);
         });
         gPlatTimer = timer;         // keep alive (see note at top)
@@ -325,181 +313,51 @@ static void showLoadedAlert(int attempt) {
     });
 }
 
-#pragma mark - 5) overhead "platform" labels (test scaffold)
+#pragma mark - 5) engine walk (memory only, no engine calls)
 
-// A floating label. In the real build, (nx, ny) is the *projected* head position of a player
-// (world -> screen); here it's driven by synthetic motion so the render path can be proven.
-// (Interface lives up top because the HUD panel counts the labels.)
-@implementation EchoOverheadLabel
-@end
-
-static void updateOverheadLabels(void);   // fwd
-static void fillPlayerLabels(void);       // fwd (real player data, defined in section 7)
-
-@interface EchoLabelTicker : NSObject
-@end
-
-@implementation EchoLabelTicker
-- (void)tick:(CADisplayLink *)link { updateOverheadLabels(); }
-@end
-
-static UIWindow        *gLabelWindow = nil;
-static UIView          *gLabelRoot   = nil;
-static CADisplayLink   *gLabelLink   = nil;
-static EchoLabelTicker *gLabelTicker = nil;
-static CFTimeInterval   gLabelT0     = 0;
-
-static BOOL pointOnScreen(CGFloat nx, CGFloat ny) {
-    return nx >= 0.0 && nx <= 1.0 && ny >= 0.0 && ny <= 1.0;
-}
-
-// ---- player data source --------------------------------------------------------------
-// Real labels come from section 7 (fillPlayerLabels): each player's pawn world position,
-// projected to screen with the engine's own ProjectWorldLocationToScreen. If the engine
-// pointers can't be resolved yet, no labels are shown (rather than fake ones).
-// ---------------------------------------------------------------------------------------
-
-static void updateOverheadLabels(void) {
-    if (!gLabelRoot) return;
-    attachScene(gLabelWindow);
-
-    fillPlayerLabels();
-
-    CGSize sz = gLabelRoot.bounds.size;
-    for (EchoOverheadLabel *L in gLabels) {
-        UILabel *v = L.view;
-        [v sizeToFit];
-        CGSize ts = v.bounds.size;
-        v.frame = CGRectMake(0, 0, ts.width + 14.0, ts.height + 4.0);
-
-        // "only when visible": drop the label the moment its point leaves the screen.
-        BOOL onScreen = pointOnScreen(L.nx, L.ny);
-        v.hidden = !onScreen;
-        if (!onScreen) continue;
-
-        v.center = CGPointMake(L.nx * sz.width, L.ny * sz.height);
-    }
-}
-
-static void installLabelLayer(void) {
-    if (gLabelWindow) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gLabelWindow) return;
-
-        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        w.windowLevel            = UIWindowLevelAlert + 1;
-        w.backgroundColor        = [UIColor clearColor];
-        w.userInteractionEnabled = NO;   // never eat touches meant for the game
-
-        UIViewController *vc = [[UIViewController alloc] init];
-        vc.view.backgroundColor        = [UIColor clearColor];
-        vc.view.userInteractionEnabled = NO;
-        w.rootViewController = vc;
-
-        w.hidden = NO;                   // NOT makeKeyAndVisible
-        attachScene(w);
-        gLabelWindow = w;
-        gLabelRoot   = vc.view;
-        gLabels      = [NSMutableArray array];
-        gLabelT0     = CACurrentMediaTime();
-
-        // per-frame update so labels track the world instead of stuttering at 1 Hz
-        gLabelTicker = [[EchoLabelTicker alloc] init];
-        gLabelLink = [CADisplayLink displayLinkWithTarget:gLabelTicker
-                                                 selector:@selector(tick:)];
-        [gLabelLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-    });
-}
-
-#pragma mark - 6) engine address probe (SAFE: no hooking, no deref of game code)
-
-// Preferred (unslid) VM addresses recovered offline from the decrypted binary by scanning the
-// UE reflection registration tables in __DATA for { name_string_ptr, code_ptr } pairs.
-// See research/NOTES.md (kept outside the public repo). Nothing is hooked here — we only
-// resolve the runtime address and prove it lands inside the main image's mapped range.
-static const uintptr_t kSym_ProjectWorldLocationToScreen = 0x100e7b304;
-static const uintptr_t kSym_GetPlayerPlatform            = 0x101acf364;
-static const uintptr_t kSym_OnRep_Platform               = 0x1012b7fd8;
-
-static uintptr_t gImgBase     = 0;
-static uintptr_t gImgEnd      = 0;
-static intptr_t  gSlide       = 0;
-static uintptr_t gProbeProj   = 0;
-static uintptr_t gProbePlat   = 0;
-// (gProbeInRange is declared up top, next to gLabels, because the HUD panel reads it)
-
-// Upper bound of the main image by walking its Mach-O load commands. The header is always
-// mapped, so this is safe to read; we never touch the resolved function addresses.
-static void imageBounds(const struct mach_header_64 *h, uintptr_t *lo, uintptr_t *hi) {
-    uintptr_t a = (uintptr_t)h, end = (uintptr_t)h;
-    const struct load_command *lc = (const struct load_command *)(h + 1);
-    for (uint32_t i = 0; i < h->ncmds; i++) {
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *s = (const struct segment_command_64 *)lc;
-            if (s->vmsize && s->vmaddr + s->vmsize > end) end = s->vmaddr + s->vmsize;
-        }
-        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
-    }
-    *lo = a; *hi = end;
-}
-
-static void probeEngine(void) {
-    const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!h) return;
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    gSlide = slide;
-
-    imageBounds(h, &gImgBase, &gImgEnd);
-    gProbeProj = (uintptr_t)((intptr_t)kSym_ProjectWorldLocationToScreen + slide);
-    gProbePlat = (uintptr_t)((intptr_t)kSym_GetPlayerPlatform + slide);
-    gProbeInRange = (gProbeProj >= gImgBase && gProbeProj < gImgEnd &&
-                     gProbePlat >= gImgBase && gProbePlat < gImgEnd);
-
-    NSLog(@"[EchoMod] engine probe: base=%p end=%p slide=%ld",
-          (void *)gImgBase, (void *)gImgEnd, (long)slide);
-    NSLog(@"[EchoMod]   ProjectWorldLocationToScreen=%p  GetPlayerPlatform=%p  inRange=%d",
-          (void *)gProbeProj, (void *)gProbePlat, (int)gProbeInRange);
-}
-
-#pragma mark - 7) real player data -> 3D overhead labels (no hooks)
-
-// Everything here is a *direct call* to an engine function plus *safe* memory reads
-// (mach_vm_read_overwrite never faults on a bad address). No inline hooking, because iOS
-// code-signing blocks patching __TEXT on a non-jailbroken app.
+// Offsets come from the MobileDumper-7 SDK dump of this exact build; the one global is the
+// GEngine pointer recovered from the binary. Everything is read with mach_vm_read_overwrite,
+// which never faults, so a wrong value shows up in the panel instead of crashing.
 //
-// Addresses/offsets recovered offline from the decrypted binary (see research/NOTES.md):
-//
-//   global 0x105817be8        GEngine/GWorld (UObject; vtable slot 0x148 == UObject::GetWorld)
-//   native 0x101b3f8a8        GetGameState(WorldContext) -> AGameStateBase*
-//   native 0x1016d9c60        GetPlayerController(WorldContext, index) -> APlayerController*
-//   native 0x101d94a08        ProjectWorldLocationToScreen(this, FVector, FVector2D*, bool)
-//   native 0x102d35e60        K2_GetActorLocation(this) -> FVector (3 floats)
-//
-//   UWorld::GameState             +0x148
-//   AGameStateBase::PlayerArray   +0x330 (Data) / +0x338 (Num)   [TArray<APlayerState*>]
-//   AController::Pawn             +0x348
-//   AActor location (3 floats)    +0x190
+//   GEngine (0x105817be8) -> GameViewport +0x728 -> World +0x80
+//   UWorld: PersistentLevel +0x30, GameState +0x148, Levels +0x160, OwningGameInstance +0x190
+//   UGameInstance::LocalPlayers +0x38 -> ULocalPlayer -> UPlayer::PlayerController +0x30
+//   AGameStateBase::PlayerArray +0x330 / Num +0x338
+//   ULevel::Actors +0xA0 / Num +0xA8
+//   APawn::PlayerState +0x338, AActor::RootComponent +0x158, scene location +0x190
+//   APlayerController::PlayerCameraManager +0x398, camera cache POV at +0x10 inside the entry
 
-#define A_GLOBAL_ENGINE        0x105817be8ULL
-#define A_NATIVE_GETGAMESTATE  0x101b3f8a8ULL
-#define A_NATIVE_GETPC         0x1016d9c60ULL
-#define A_NATIVE_PWLS          0x101d94a08ULL
+#define A_GLOBAL_ENGINE          0x105817be8ULL
 
-#define OFF_WORLD_GAMESTATE    0x148
-#define OFF_GS_PLAYERARRAY     0x330
-#define OFF_GS_PLAYERARRAY_NUM 0x338
-#define OFF_CTRL_PAWN          0x348
-#define OFF_ACTOR_LOCATION     0x190
+#define OFF_ENGINE_GAMEVIEWPORT  0x728
+#define OFF_VIEWPORT_WORLD       0x80
+#define OFF_WORLD_PERSISTENT     0x30
+#define OFF_WORLD_GAMESTATE      0x148
+#define OFF_WORLD_LEVELS         0x160
+#define OFF_WORLD_GAMEINSTANCE   0x190
+#define OFF_GI_LOCALPLAYERS      0x38
+#define OFF_PLAYER_PC            0x30
+#define OFF_GS_PLAYERARRAY       0x330
+#define OFF_LEVEL_ACTORS         0xA0
+#define OFF_PAWN_PLAYERSTATE     0x338
+#define OFF_ACTOR_ROOT           0x158
+#define OFF_SCENE_LOCATION       0x190
+#define OFF_CTRL_PLAYERSTATE     0x320
+#define OFF_CTRL_PAWN            0x348
+#define OFF_PC_ACKPAWN           0x380
+#define OFF_PC_CAMMGR            0x398
+#define OFF_PS_NAME              0x3B0
+#define OFF_FORTPS_PLATFORM      0x768
+#define OFF_ATHENA_TEAM          0xF60
+#define OFF_FORTPAWN_DYING       0x824
+#define OFF_FORTPAWN_DBNO        0x8C0
+
+static const int kCamCacheOffsets[4] = { 0x390, 0x1990, 0x900, 0x1F00 };
 
 typedef struct { float x, y, z; } FV3;
-typedef struct { float x, y; }   FV2;
 
 #define SYM(va) ((uintptr_t)((intptr_t)(va) + gSlide))
 
-// --- safe memory access ----------------------------------------------------------------
-
-// <mach/mach_vm.h> is marked "unsupported" in the iOS SDK, so resolve the (present-in-
-// libSystem) function at runtime instead of relying on the header.
 typedef kern_return_t (*MvReadFn)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
                                   mach_vm_address_t, mach_vm_size_t *);
 static MvReadFn gMvRead = NULL;
@@ -526,7 +384,16 @@ static int32_t rd_i32(uintptr_t addr) {
     return safe_read(addr, &v, sizeof v) ? v : 0;
 }
 
-// A UE UObject's first word is its vtable, which lives inside the main image.
+static uint8_t rd_u8(uintptr_t addr) {
+    uint8_t v = 0;
+    return safe_read(addr, &v, sizeof v) ? v : 0;
+}
+
+static float rd_f32(uintptr_t addr) {
+    float v = 0;
+    return safe_read(addr, &v, sizeof v) ? v : 0;
+}
+
 static BOOL looks_like_uobject(uintptr_t p) {
     if (p < 0x100000000ULL || (p & 0x7)) return NO;
     uintptr_t vt = rd_ptr(p);
@@ -535,132 +402,365 @@ static BOOL looks_like_uobject(uintptr_t p) {
 
 static BOOL sane_vec(FV3 v) {
     return isfinite(v.x) && isfinite(v.y) && isfinite(v.z) &&
-           fabsf(v.x) < 1.0e6f && fabsf(v.y) < 1.0e6f && fabsf(v.z) < 1.0e6f;
+           fabsf(v.x) < 2.0e6f && fabsf(v.y) < 2.0e6f && fabsf(v.z) < 2.0e6f;
 }
 
-// --- resolved engine entry points ------------------------------------------------------
+static NSString *read_fstring(uintptr_t addr) {
+    uintptr_t data = rd_ptr(addr);
+    int32_t num = rd_i32(addr + 8);
+    if (!data || num <= 1 || num > 48) return nil;
+    unichar buf[48];
+    if (!safe_read(data, buf, (size_t)(num - 1) * sizeof(unichar))) return nil;
+    return [NSString stringWithCharacters:buf length:(NSUInteger)(num - 1)];
+}
 
-static void *(*gfn_GetGameState)(void *)            = NULL;   // (WorldContext)
-static void *(*gfn_GetPlayerController)(void *, int32_t) = NULL; // (WorldContext, index)
-static BOOL  (*gfn_PWLS)(void *, FV3, FV2 *, BOOL)  = NULL;   // (this, world, out, rel)
+@interface EchoPawn : NSObject
+@property (nonatomic, assign) uintptr_t pawn;
+@property (nonatomic, assign) BOOL team;
+@property (nonatomic, copy)   NSString *tag;
+@end
+@implementation EchoPawn
+@end
 
-// --- diagnostics (shown in the top-right panel) ----------------------------------------
-// (the globals are declared up top, next to gProbeInRange, because the panel reads them)
+static NSArray<EchoPawn *> *gPawns = nil;
+static uintptr_t gLocalPC = 0;
+static uintptr_t gLocalPawn = 0;
+static uintptr_t gEngine = 0;
 
-static void *gEngine   = NULL;
-static void *gLocalPC  = NULL;
-static void *gGameState = NULL;
-
-// Resolve the entry points once. Safe: only computes addresses + one validated global read.
-static void resolveEngine(void) {
-    if (!gSlide) return;
-    if (!gfn_GetGameState)       gfn_GetGameState       = (void *)SYM(A_NATIVE_GETGAMESTATE);
-    if (!gfn_GetPlayerController) gfn_GetPlayerController = (void *)SYM(A_NATIVE_GETPC);
-    if (!gfn_PWLS)               gfn_PWLS               = (void *)SYM(A_NATIVE_PWLS);
-
-    uintptr_t eng = rd_ptr(SYM(A_GLOBAL_ENGINE));
-    if (looks_like_uobject(eng)) {
-        gEngine = (void *)eng;
-        gDiagEngine = YES;
+static void publishPawns(NSArray<EchoPawn *> *list, uintptr_t pc, uintptr_t localPawn) {
+    @synchronized ([NSProcessInfo processInfo]) {
+        gPawns = list;
+        gLocalPC = pc;
+        gLocalPawn = localPawn;
     }
 }
 
-// --- the real label source -------------------------------------------------------------
+// Slow path, runs on a background queue a few times a second: finds the local controller, the
+// player list, and every pawn in the world (an actor whose PlayerState is one of the players).
+static void scanPawns(void) {
+    gEngine = rd_ptr(SYM(A_GLOBAL_ENGINE));
+    gDiagEngine = looks_like_uobject(gEngine);
+    gDiagWorld = NO; gDiagPC = NO; gDiagGameState = NO;
+    gDiagPlayers = 0; gDiagPawns = 0; gDiagActors = 0;
+    if (!gDiagEngine) { publishPawns(nil, 0, 0); return; }
 
-static EchoOverheadLabel *labelAtIndex(NSUInteger i) {
-    if (!gLabels) return nil;
-    while (gLabels.count <= i) {
-        EchoOverheadLabel *L = [[EchoOverheadLabel alloc] init];
-        UILabel *v = [[UILabel alloc] init];
-        v.text            = @"platform";
-        v.font            = [UIFont boldSystemFontOfSize:13.0];
-        v.textColor       = [UIColor whiteColor];
-        v.textAlignment   = NSTextAlignmentCenter;
-        v.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
-        v.layer.cornerRadius = 4.0;
-        v.clipsToBounds   = YES;
-        L.view = v;
-        L.text = @"platform";
-        if (gLabelRoot) [gLabelRoot addSubview:v];
-        [gLabels addObject:L];
+    uintptr_t vp = rd_ptr(gEngine + OFF_ENGINE_GAMEVIEWPORT);
+    uintptr_t world = looks_like_uobject(vp) ? rd_ptr(vp + OFF_VIEWPORT_WORLD) : 0;
+    if (!looks_like_uobject(world)) { publishPawns(nil, 0, 0); return; }
+    gDiagWorld = YES;
+
+    uintptr_t pc = 0;
+    uintptr_t gi = rd_ptr(world + OFF_WORLD_GAMEINSTANCE);
+    if (looks_like_uobject(gi)) {
+        uintptr_t lpData = rd_ptr(gi + OFF_GI_LOCALPLAYERS);
+        uintptr_t lp = lpData ? rd_ptr(lpData) : 0;
+        if (looks_like_uobject(lp)) pc = rd_ptr(lp + OFF_PLAYER_PC);
     }
-    return gLabels[i];
-}
-
-static void fillPlayerLabels(void) {
-    if (!gLabels) return;
-    resolveEngine();
-
-    gDiagPC = NO; gDiagGameState = NO; gDiagPlayers = 0; gDiagDrawn = 0;
-
-    if (!gEngine || !gfn_GetPlayerController || !gfn_GetGameState || !gfn_PWLS) {
-        for (EchoOverheadLabel *L in gLabels) L.nx = -1.0;   // hide everything
-        return;
-    }
-
-    // local player controller (drives the projection)
-    if (!looks_like_uobject((uintptr_t)gLocalPC)) {
-        void *pc = gfn_GetPlayerController(gEngine, 0);
-        if (looks_like_uobject((uintptr_t)pc)) gLocalPC = pc;
-    }
-    if (!looks_like_uobject((uintptr_t)gLocalPC)) {
-        for (EchoOverheadLabel *L in gLabels) L.nx = -1.0;
-        return;
-    }
+    if (!looks_like_uobject(pc)) { publishPawns(nil, 0, 0); return; }
     gDiagPC = YES;
 
-    // game state -> PlayerArray (TArray<APlayerState*>)
-    void *gs = gfn_GetGameState(gEngine);
-    if (!looks_like_uobject((uintptr_t)gs)) gs = NULL;
-    gGameState = gs;
+    uintptr_t localPawn = rd_ptr(pc + OFF_PC_ACKPAWN);
+    if (!localPawn) localPawn = rd_ptr(pc + OFF_CTRL_PAWN);
+    uintptr_t localPS = rd_ptr(pc + OFF_CTRL_PLAYERSTATE);
+    int localTeam = looks_like_uobject(localPS) ? rd_u8(localPS + OFF_ATHENA_TEAM) : -1;
 
-    uintptr_t psData = 0;
-    int32_t   psNum  = 0;
-    if (gs) {
-        gDiagGameState = YES;
-        psData = rd_ptr((uintptr_t)gs + OFF_GS_PLAYERARRAY);
-        psNum  = rd_i32((uintptr_t)gs + OFF_GS_PLAYERARRAY_NUM);
-    }
+    uintptr_t gs = rd_ptr(world + OFF_WORLD_GAMESTATE);
+    if (!looks_like_uobject(gs)) { publishPawns(nil, pc, localPawn); return; }
+    gDiagGameState = YES;
+
+    uintptr_t psData = rd_ptr(gs + OFF_GS_PLAYERARRAY);
+    int32_t psNum = rd_i32(gs + OFF_GS_PLAYERARRAY + 8);
     if (psNum < 0) psNum = 0;
-    if (psNum > 64) psNum = 64;
+    if (psNum > 128) psNum = 128;
     gDiagPlayers = psNum;
+    if (!psData || psNum == 0) { publishPawns(@[], pc, localPawn); return; }
 
-    CGSize sz = gLabelRoot ? gLabelRoot.bounds.size : CGSizeMake(0, 0);
-    CGFloat scale = [UIScreen mainScreen].scale;
-    if (scale <= 0.0) scale = 1.0;
-
-    NSUInteger used = 0;
-    for (int32_t i = 0; i < psNum; i++) {
+    uintptr_t players[128];
+    int nPlayers = 0;
+    for (int i = 0; i < psNum; i++) {
         uintptr_t ps = rd_ptr(psData + (uintptr_t)i * 8);
-        if (!looks_like_uobject(ps)) continue;
-
-        uintptr_t pawn = rd_ptr(ps + OFF_CTRL_PAWN);
-        if (!looks_like_uobject(pawn)) continue;
-
-        FV3 loc = {0, 0, 0};
-        if (!safe_read(pawn + OFF_ACTOR_LOCATION, &loc, sizeof loc)) continue;
-        if (!sane_vec(loc)) continue;
-
-        loc.z += 92.0f;   // aim just above the head
-
-        FV2 out = {0, 0};
-        BOOL ok = gfn_PWLS(gLocalPC, loc, &out, NO);
-        if (!ok) continue;
-
-        CGFloat nx = (out.x / scale) / (sz.width  > 0 ? sz.width  : 1.0);
-        CGFloat ny = (out.y / scale) / (sz.height > 0 ? sz.height : 1.0);
-        if (!pointOnScreen(nx, ny)) continue;
-
-        EchoOverheadLabel *L = labelAtIndex(used);
-        if (!L) break;
-        L.text = @"platform";
-        L.nx = nx;
-        L.ny = ny;
-        used++;
+        if (ps) players[nPlayers++] = ps;
     }
 
+    uintptr_t levels[64];
+    int nLevels = 0;
+    uintptr_t persistent = rd_ptr(world + OFF_WORLD_PERSISTENT);
+    if (persistent) levels[nLevels++] = persistent;
+    uintptr_t lvData = rd_ptr(world + OFF_WORLD_LEVELS);
+    int32_t lvNum = rd_i32(world + OFF_WORLD_LEVELS + 8);
+    if (lvNum > 60) lvNum = 60;
+    for (int i = 0; lvData && i < lvNum; i++) {
+        uintptr_t l = rd_ptr(lvData + (uintptr_t)i * 8);
+        BOOL dup = NO;
+        for (int j = 0; j < nLevels; j++) if (levels[j] == l) dup = YES;
+        if (l && !dup && nLevels < 64) levels[nLevels++] = l;
+    }
+
+    NSMutableArray<EchoPawn *> *out = [NSMutableArray array];
+    uintptr_t chunk[2048];
+    int actorsSeen = 0;
+
+    for (int li = 0; li < nLevels; li++) {
+        uintptr_t aData = rd_ptr(levels[li] + OFF_LEVEL_ACTORS);
+        int32_t aNum = rd_i32(levels[li] + OFF_LEVEL_ACTORS + 8);
+        if (!aData || aNum <= 0 || aNum > 400000) continue;
+
+        for (int32_t base = 0; base < aNum; base += 2048) {
+            int32_t cnt = aNum - base;
+            if (cnt > 2048) cnt = 2048;
+            if (!safe_read(aData + (uintptr_t)base * 8, chunk, (size_t)cnt * 8)) continue;
+            actorsSeen += cnt;
+
+            for (int32_t k = 0; k < cnt; k++) {
+                uintptr_t a = chunk[k];
+                if (a < 0x100000000ULL || (a & 7)) continue;
+                uintptr_t ps = rd_ptr(a + OFF_PAWN_PLAYERSTATE);
+                if (!ps) continue;
+                BOOL isPlayer = NO;
+                for (int p = 0; p < nPlayers; p++) if (players[p] == ps) { isPlayer = YES; break; }
+                if (!isPlayer || a == localPawn) continue;
+
+                EchoPawn *ep = [[EchoPawn alloc] init];
+                ep.pawn = a;
+                int team = rd_u8(ps + OFF_ATHENA_TEAM);
+                ep.team = (localTeam > 0 && team == localTeam);
+                NSString *name = read_fstring(ps + OFF_PS_NAME);
+                NSString *plat = read_fstring(ps + OFF_FORTPS_PLATFORM);
+                if (name.length && plat.length) ep.tag = [NSString stringWithFormat:@"%@ [%@]", name, plat];
+                else if (name.length) ep.tag = name;
+                else if (plat.length) ep.tag = [NSString stringWithFormat:@"[%@]", plat];
+                else ep.tag = @"player";
+                [out addObject:ep];
+            }
+        }
+    }
+
+    gDiagActors = actorsSeen;
+    gDiagPawns = (int)out.count;
+    publishPawns(out, pc, localPawn);
+}
+
+#pragma mark - 6) ESP drawing
+
+static UIWindow        *gLabelWindow = nil;
+static UIView          *gLabelRoot   = nil;
+static CADisplayLink   *gLabelLink   = nil;
+static CAShapeLayer    *gBoxEnemy    = nil;
+static CAShapeLayer    *gBoxTeam     = nil;
+static NSMutableArray<UILabel *> *gTagPool = nil;
+static dispatch_source_t gScanTimer  = nil;
+
+static UILabel *tagAtIndex(NSUInteger i) {
+    while (gTagPool.count <= i) {
+        UILabel *v = [[UILabel alloc] init];
+        v.font            = [UIFont boldSystemFontOfSize:11.0];
+        v.textColor       = [UIColor whiteColor];
+        v.textAlignment   = NSTextAlignmentCenter;
+        v.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
+        v.layer.cornerRadius = 3.0;
+        v.clipsToBounds   = YES;
+        v.hidden          = YES;
+        [gLabelRoot addSubview:v];
+        [gTagPool addObject:v];
+    }
+    return gTagPool[i];
+}
+
+static BOOL readCamera(uintptr_t pc, FV3 *loc, FV3 *rot, float *fov) {
+    uintptr_t cm = rd_ptr(pc + OFF_PC_CAMMGR);
+    if (cm < 0x100000000ULL) return NO;
+
+    float bestTs = -1.0f;
+    int best = -1;
+    for (int i = 0; i < 4; i++) {
+        uintptr_t e = cm + (uintptr_t)kCamCacheOffsets[i];
+        float ts = rd_f32(e);
+        float f = rd_f32(e + 0x10 + 0x18);
+        if (!isfinite(ts) || ts < 0.0f || f < 20.0f || f > 170.0f) continue;
+        if (ts > bestTs) { bestTs = ts; best = i; }
+    }
+    if (best < 0) return NO;
+    gDiagCam = best;
+
+    uintptr_t pov = cm + (uintptr_t)kCamCacheOffsets[best] + 0x10;
+    if (!safe_read(pov, loc, sizeof *loc)) return NO;
+    if (!safe_read(pov + 0xC, rot, sizeof *rot)) return NO;
+    *fov = rd_f32(pov + 0x18);
+    return sane_vec(*loc);
+}
+
+static BOOL project(FV3 w, FV3 cam, FV3 fwd, FV3 right, FV3 up, float tanHalf, float aspect,
+                    CGFloat *nx, CGFloat *ny, float *depth) {
+    float dx = w.x - cam.x, dy = w.y - cam.y, dz = w.z - cam.z;
+    float x = dx * fwd.x + dy * fwd.y + dz * fwd.z;
+    if (x < 10.0f) return NO;
+    float y = dx * right.x + dy * right.y + dz * right.z;
+    float z = dx * up.x + dy * up.y + dz * up.z;
+    *nx = 0.5 + 0.5 * (y / (x * tanHalf));
+    *ny = 0.5 - 0.5 * ((z / (x * tanHalf)) * aspect);
+    *depth = x;
+    return YES;
+}
+
+static void updateESP(void) {
+    if (!gLabelRoot) return;
+    attachScene(gLabelWindow);
+
+    NSArray<EchoPawn *> *pawns;
+    uintptr_t pc, localPawn;
+    @synchronized ([NSProcessInfo processInfo]) {
+        pawns = gPawns; pc = gLocalPC; localPawn = gLocalPawn;
+    }
+    (void)localPawn;
+
+    UIBezierPath *enemyPath = [UIBezierPath bezierPath];
+    UIBezierPath *teamPath  = [UIBezierPath bezierPath];
+    NSUInteger used = 0;
+    gDiagDrawn = 0;
+
+    FV3 cam = {0,0,0}, rot = {0,0,0};
+    float fov = 0;
+    if (pc && pawns.count && readCamera(pc, &cam, &rot, &fov)) {
+        float pr = rot.x * (float)M_PI / 180.0f, yr = rot.y * (float)M_PI / 180.0f, rr = rot.z * (float)M_PI / 180.0f;
+        float sp = sinf(pr), cp = cosf(pr), sy = sinf(yr), cy = cosf(yr), sr = sinf(rr), cr = cosf(rr);
+        FV3 fwd   = { cp * cy, cp * sy, sp };
+        FV3 right = { sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp };
+        FV3 up    = { -(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp };
+        float tanHalf = tanf(fov * (float)M_PI / 360.0f);
+        CGSize sz = gLabelRoot.bounds.size;
+        float aspect = sz.height > 0 ? (float)(sz.width / sz.height) : 1.0f;
+
+        for (EchoPawn *ep in pawns) {
+            if (rd_u8(ep.pawn + OFF_FORTPAWN_DYING)) continue;
+            uintptr_t root = rd_ptr(ep.pawn + OFF_ACTOR_ROOT);
+            if (root < 0x100000000ULL) continue;
+            FV3 loc;
+            if (!safe_read(root + OFF_SCENE_LOCATION, &loc, sizeof loc) || !sane_vec(loc)) continue;
+
+            FV3 top = loc, bot = loc;
+            top.z += 92.0f; bot.z -= 92.0f;
+            CGFloat tx, ty, bx, by; float d1, d2;
+            if (!project(top, cam, fwd, right, up, tanHalf, aspect, &tx, &ty, &d1)) continue;
+            if (!project(bot, cam, fwd, right, up, tanHalf, aspect, &bx, &by, &d2)) continue;
+
+            CGFloat px = tx * sz.width, ptop = ty * sz.height, pbot = by * sz.height;
+            CGFloat h = pbot - ptop;
+            if (h < 4.0 || h > sz.height * 3.0) continue;
+            CGFloat w = h * 0.5;
+            CGFloat cx = (tx + bx) * 0.5 * sz.width;
+            if (cx < -w || cx > sz.width + w || pbot < 0 || ptop > sz.height) continue;
+            (void)px;
+
+            CGRect r = CGRectMake(cx - w * 0.5, ptop, w, h);
+            if (ep.team) [teamPath appendPath:[UIBezierPath bezierPathWithRect:r]];
+            else         [enemyPath appendPath:[UIBezierPath bezierPathWithRect:r]];
+
+            float dist = sqrtf((loc.x - cam.x) * (loc.x - cam.x) + (loc.y - cam.y) * (loc.y - cam.y) +
+                               (loc.z - cam.z) * (loc.z - cam.z)) / 100.0f;
+            UILabel *tag = tagAtIndex(used);
+            tag.text = [NSString stringWithFormat:@"%@  %.0fm", ep.tag, dist];
+            [tag sizeToFit];
+            tag.frame = CGRectMake(cx - (tag.bounds.size.width + 8) * 0.5, ptop - tag.bounds.size.height - 3,
+                                   tag.bounds.size.width + 8, tag.bounds.size.height + 2);
+            tag.hidden = NO;
+            used++;
+        }
+    }
+
+    for (NSUInteger i = used; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
     gDiagDrawn = (int)used;
-    for (NSUInteger i = used; i < gLabels.count; i++) gLabels[i].nx = -1.0;  // hide the rest
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    gBoxEnemy.path = enemyPath.CGPath;
+    gBoxTeam.path  = teamPath.CGPath;
+    [CATransaction commit];
+}
+
+@interface EchoEspTicker : NSObject
+@end
+@implementation EchoEspTicker
+- (void)tick:(CADisplayLink *)link { updateESP(); }
+@end
+static EchoEspTicker *gEspTicker = nil;
+
+static CAShapeLayer *makeBoxLayer(UIColor *c) {
+    CAShapeLayer *l = [CAShapeLayer layer];
+    l.fillColor   = [UIColor clearColor].CGColor;
+    l.strokeColor = c.CGColor;
+    l.lineWidth   = 1.5;
+    return l;
+}
+
+static void installLabelLayer(void) {
+    if (gLabelWindow) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gLabelWindow) return;
+
+        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel            = UIWindowLevelAlert + 1;
+        w.backgroundColor        = [UIColor clearColor];
+        w.userInteractionEnabled = NO;
+
+        UIViewController *vc = [[UIViewController alloc] init];
+        vc.view.backgroundColor        = [UIColor clearColor];
+        vc.view.userInteractionEnabled = NO;
+        w.rootViewController = vc;
+
+        w.hidden = NO;
+        attachScene(w);
+        gLabelWindow = w;
+        gLabelRoot   = vc.view;
+        gTagPool     = [NSMutableArray array];
+
+        gBoxEnemy = makeBoxLayer([UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0]);
+        gBoxTeam  = makeBoxLayer([UIColor colorWithRed:0.2 green:1.0 blue:0.4 alpha:1.0]);
+        [gLabelRoot.layer addSublayer:gBoxEnemy];
+        [gLabelRoot.layer addSublayer:gBoxTeam];
+
+        gEspTicker = [[EchoEspTicker alloc] init];
+        gLabelLink = [CADisplayLink displayLinkWithTarget:gEspTicker selector:@selector(tick:)];
+        [gLabelLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+        dispatch_queue_t q = dispatch_queue_create("echomod.scan", DISPATCH_QUEUE_SERIAL);
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                                  300ull * NSEC_PER_MSEC, 50ull * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(t, ^{ scanPawns(); });
+        gScanTimer = t;
+        dispatch_resume(t);
+    });
+}
+
+#pragma mark - 7) image bounds / slide
+
+static void probeEngine(void) {
+    const struct mach_header_64 *h = NULL;
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header_64 *c = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (c && c->filetype == MH_EXECUTE) { h = c; slide = _dyld_get_image_vmaddr_slide(i); break; }
+    }
+    if (!h) return;
+    gSlide = slide;
+
+    uintptr_t hi = (uintptr_t)h;
+    const struct load_command *lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const struct segment_command_64 *)lc;
+            if (s->vmsize && strcmp(s->segname, "__PAGEZERO") != 0) {
+                uintptr_t end = (uintptr_t)((intptr_t)(s->vmaddr + s->vmsize) + slide);
+                if (end > hi) hi = end;
+            }
+        }
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    gImgBase = (uintptr_t)h;
+    gImgEnd  = hi;
+    gProbeInRange = (gImgEnd > gImgBase);
+
+    NSLog(@"[EchoMod] image base=%p end=%p slide=%ld", (void *)gImgBase, (void *)gImgEnd, (long)slide);
 }
 
 #pragma mark - init
@@ -701,10 +801,10 @@ __attribute__((constructor)) static void EchoModInit(void) {
                 postNotificationName:NSProcessInfoThermalStateDidChangeNotification object:p];
             [[NSNotificationCenter defaultCenter]
                 postNotificationName:NSProcessInfoPowerStateDidChangeNotification object:p];
+            probeEngine();
             installOverlay();
             installPlatformOverlay();
             installLabelLayer();
-            probeEngine();
             showLoadedAlert(0);
         });
     }];
