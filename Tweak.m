@@ -375,6 +375,7 @@ static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
 static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static BOOL  gOptHudLayout = YES;
+static BOOL  gOptLowGfx = YES;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
@@ -1308,6 +1309,7 @@ static void saveOptions(void) {
     [d setBool:gOptNoSpread forKey:@"echo.nospread"];
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
+    [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1327,6 +1329,7 @@ static void loadOptions(void) {
     gOptNoSpread = [d boolForKey:@"echo.nospread"];
     gOptTrigger = [d boolForKey:@"echo.trigger"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
+    if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1350,6 +1353,7 @@ static void loadOptions(void) {
         case 8: gOptNoSpread = on; break;
         case 9: gOptTrigger = on; break;
         case 10: gOptHudLayout = on; break;
+        case 11: gOptLowGfx = on; break;
     }
     saveOptions();
 }
@@ -1473,6 +1477,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"No spread", gOptNoSpread, 8);
         addSwitch(panel, &y, @"Trigger bot (auto shoot)", gOptTrigger, 9);
         addSwitch(panel, &y, @"Enable HUD layout tool", gOptHudLayout, 10);
+        addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
@@ -1519,10 +1524,53 @@ static void probeEngine(void) {
     NSLog(@"[EchoMod] image base=%p end=%p slide=%ld", (void *)gImgBase, (void *)gImgEnd, (long)slide);
 }
 
+
+#pragma mark - 9) force low graphics (config files, applied before the engine reads them)
+
+static void forceLowGraphics(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:@"echo.lowgfx"] && ![d boolForKey:@"echo.lowgfx"]) return;
+
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!docs) return;
+    NSString *dir = [docs stringByAppendingPathComponent:@"FortniteGame/Saved/Config/IOS"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *engine =
+        @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]\n"
+        @"FrameRateLock=PUFRL_60\n\n"
+        @"[/Script/Engine.Engine]\n"
+        @"bSmoothFrameRate=False\n"
+        @"bUseFixedFrameRate=False\n\n"
+        @"[SystemSettings]\n"
+        @"t.MaxFPS=120\n"
+        @"sg.ResolutionQuality=100\n"
+        @"sg.ViewDistanceQuality=0\n"
+        @"sg.AntiAliasingQuality=0\n"
+        @"sg.ShadowQuality=0\n"
+        @"sg.PostProcessQuality=0\n"
+        @"sg.TextureQuality=0\n"
+        @"sg.EffectsQuality=0\n"
+        @"sg.FoliageQuality=0\n";
+    NSString *profiles =
+        @"[IPhoneX DeviceProfile]\n"
+        @"+CVars=sg.ResolutionQuality=100\n"
+        @"+CVars=sg.ViewDistanceQuality=0\n"
+        @"+CVars=sg.AntiAliasingQuality=0\n"
+        @"+CVars=sg.ShadowQuality=0\n"
+        @"+CVars=sg.PostProcessQuality=0\n"
+        @"+CVars=sg.TextureQuality=0\n"
+        @"+CVars=sg.EffectsQuality=0\n"
+        @"+CVars=sg.FoliageQuality=0\n";
+    [engine writeToFile:[dir stringByAppendingPathComponent:@"Engine.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [profiles writeToFile:[dir stringByAppendingPathComponent:@"DeviceProfiles.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 #pragma mark - init
 
 __attribute__((constructor)) static void EchoModInit(void) {
     NSLog(@"[EchoMod] dylib loaded — constructor ran");
+    forceLowGraphics();
 
     Class pi = objc_getClass("NSProcessInfo");
     if (pi) {
