@@ -1678,41 +1678,85 @@ static void updateScreenDiag(void) {
 
 static void forceLowGraphics(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:@"echo.lowgfx"] && ![d boolForKey:@"echo.lowgfx"]) return;
+    BOOL low = !([d objectForKey:@"echo.lowgfx"] && ![d boolForKey:@"echo.lowgfx"]);
 
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (!docs) return;
     NSString *dir = [docs stringByAppendingPathComponent:@"FortniteGame/Saved/Config/IOS"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dir2 = [docs stringByAppendingPathComponent:@"Saved/Config/IOS"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir2 withIntermediateDirectories:YES attributes:nil error:nil];
 
-    NSString *engine =
-        @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]\n"
-        @"FrameRateLock=PUFRL_60\n\n"
-        @"[/Script/Engine.Engine]\n"
-        @"bSmoothFrameRate=False\n"
-        @"bUseFixedFrameRate=False\n\n"
-        @"[SystemSettings]\n"
-        @"t.MaxFPS=120\n"
-        @"sg.ResolutionQuality=100\n"
-        @"sg.ViewDistanceQuality=0\n"
-        @"sg.AntiAliasingQuality=0\n"
-        @"sg.ShadowQuality=0\n"
-        @"sg.PostProcessQuality=0\n"
-        @"sg.TextureQuality=0\n"
-        @"sg.EffectsQuality=0\n"
-        @"sg.FoliageQuality=0\n";
-    NSString *profiles =
-        @"[IPhoneX DeviceProfile]\n"
-        @"+CVars=sg.ResolutionQuality=100\n"
-        @"+CVars=sg.ViewDistanceQuality=0\n"
-        @"+CVars=sg.AntiAliasingQuality=0\n"
-        @"+CVars=sg.ShadowQuality=0\n"
-        @"+CVars=sg.PostProcessQuality=0\n"
-        @"+CVars=sg.TextureQuality=0\n"
-        @"+CVars=sg.EffectsQuality=0\n"
-        @"+CVars=sg.FoliageQuality=0\n";
-    [engine writeToFile:[dir stringByAppendingPathComponent:@"Engine.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [profiles writeToFile:[dir stringByAppendingPathComponent:@"DeviceProfiles.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *ctl =
+        @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]
+"
+        @"bAllowControllers=True
+"
+        @"bGameSupportsMultipleActiveControllers=True
+
+";
+
+    NSString *engine = ctl;
+    if (low) {
+        engine = [ctl stringByAppendingString:
+            @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]
+"
+            @"FrameRateLock=PUFRL_60
+
+"
+            @"[/Script/Engine.Engine]
+"
+            @"bSmoothFrameRate=False
+"
+            @"bUseFixedFrameRate=False
+
+"
+            @"[SystemSettings]
+"
+            @"t.MaxFPS=120
+"
+            @"sg.ResolutionQuality=100
+"
+            @"sg.ViewDistanceQuality=0
+"
+            @"sg.AntiAliasingQuality=0
+"
+            @"sg.ShadowQuality=0
+"
+            @"sg.PostProcessQuality=0
+"
+            @"sg.TextureQuality=0
+"
+            @"sg.EffectsQuality=0
+"
+            @"sg.FoliageQuality=0
+"];
+    }
+    NSString *profiles = low ?
+        @"[IPhoneX DeviceProfile]
+"
+        @"+CVars=sg.ResolutionQuality=100
+"
+        @"+CVars=sg.ViewDistanceQuality=0
+"
+        @"+CVars=sg.AntiAliasingQuality=0
+"
+        @"+CVars=sg.ShadowQuality=0
+"
+        @"+CVars=sg.PostProcessQuality=0
+"
+        @"+CVars=sg.TextureQuality=0
+"
+        @"+CVars=sg.EffectsQuality=0
+"
+        @"+CVars=sg.FoliageQuality=0
+" : @"";
+    for (NSString *dd in @[ dir, dir2 ]) {
+        [engine writeToFile:[dd stringByAppendingPathComponent:@"Engine.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [ctl writeToFile:[dd stringByAppendingPathComponent:@"Game.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [ctl writeToFile:[dd stringByAppendingPathComponent:@"Input.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [profiles writeToFile:[dd stringByAppendingPathComponent:@"DeviceProfiles.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 }
 
 #pragma mark - init
