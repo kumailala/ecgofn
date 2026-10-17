@@ -327,6 +327,8 @@ static void showLoadedAlert(int attempt) {
 
 #define A_GLOBAL_ENGINE          0x105817be8ULL
 #define A_GLOBAL_GNAMES          0x10550E5C0ULL
+#define A_GLOBAL_GOBJECTS        0x1058213B8ULL
+#define OFF_RUNTIMEOPT_HUDLAYOUT 0x2B8
 
 #define OFF_ENGINE_GAMEVIEWPORT  0x728
 #define OFF_VIEWPORT_WORLD       0x80
@@ -372,6 +374,7 @@ static BOOL  gOptBoxes = YES, gOptSkeleton = YES, gOptTags = YES;
 static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
 static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
+static BOOL  gOptHudLayout = YES;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
@@ -692,6 +695,51 @@ static void applyWeaponMods(uintptr_t pc, uintptr_t localPawn) {
 
 }
 
+
+#pragma mark - 5c) HUD layout tool flag
+
+static uintptr_t gRuntimeOpts = 0;
+static uint8_t gHudFlagOrig = 0;
+static BOOL gHudFlagSaved = NO;
+
+static BOOL objectNamed(uintptr_t obj, const char *want) {
+    if (obj < 0x100000000ULL || (obj & 7)) return NO;
+    NSString *n = fname_string(rd_i32(obj + 0x18));
+    return n && strcmp(n.UTF8String, want) == 0;
+}
+
+static uintptr_t findGObject(const char *want, int32_t hint) {
+    uintptr_t arr = SYM(A_GLOBAL_GOBJECTS);
+    uintptr_t items = rd_ptr(arr + 0x10);
+    int32_t num = rd_i32(arr + 0x1C);
+    if (items < 0x100000000ULL || num <= 0 || num > 2000000) return 0;
+    int32_t lo = hint - 4000, hi = hint + 4000;
+    if (lo < 0) lo = 0;
+    if (hi > num) hi = num;
+    for (int pass = 0; pass < 2; pass++) {
+        int32_t a = pass == 0 ? lo : 0, b = pass == 0 ? hi : num;
+        for (int32_t i = a; i < b; i++) {
+            uintptr_t obj = rd_ptr(items + (uintptr_t)i * 0x18);
+            if (objectNamed(obj, want)) return obj;
+        }
+    }
+    return 0;
+}
+
+static void applyHudLayoutFlag(void) {
+    if (!gRuntimeOpts || !objectNamed(gRuntimeOpts, "Default__FortRuntimeOptions")) {
+        gRuntimeOpts = 0;
+        if (!gOptHudLayout) return;
+        gRuntimeOpts = findGObject("Default__FortRuntimeOptions", 0x12004);
+        if (!gRuntimeOpts) return;
+        gHudFlagSaved = NO;
+    }
+    uintptr_t flag = gRuntimeOpts + OFF_RUNTIMEOPT_HUDLAYOUT;
+    if (!gHudFlagSaved) { gHudFlagOrig = rd_u8(flag); gHudFlagSaved = YES; }
+    uint8_t v = gOptHudLayout ? 1 : gHudFlagOrig;
+    if (rd_u8(flag) != v) wr_bytes(flag, &v, 1);
+}
+
 // Slow path, runs on a background queue a few times a second: finds the local controller, the
 // player list, and every pawn in the world (an actor whose PlayerState is one of the players).
 static void scanPawns(void) {
@@ -699,6 +747,7 @@ static void scanPawns(void) {
     gNamesObj = rd_ptr(SYM(A_GLOBAL_GNAMES));
     if (!gBoneCache) gBoneCache = [NSMutableDictionary dictionary];
     gDiagEngine = looks_like_uobject(gEngine);
+    if (gDiagEngine) applyHudLayoutFlag();
     gDiagWorld = NO; gDiagPC = NO; gDiagGameState = NO;
     gDiagPlayers = 0; gDiagPawns = 0; gDiagActors = 0; gDiagBones = 0;
     if (!gDiagEngine) { publishPawns(nil, 0, 0); return; }
@@ -1258,6 +1307,7 @@ static void saveOptions(void) {
     [d setBool:gOptNoRecoil forKey:@"echo.norecoil"];
     [d setBool:gOptNoSpread forKey:@"echo.nospread"];
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
+    [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1276,6 +1326,7 @@ static void loadOptions(void) {
     gOptNoRecoil = [d boolForKey:@"echo.norecoil"];
     gOptNoSpread = [d boolForKey:@"echo.nospread"];
     gOptTrigger = [d boolForKey:@"echo.trigger"];
+    if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1298,6 +1349,7 @@ static void loadOptions(void) {
         case 7: gOptNoRecoil = on; break;
         case 8: gOptNoSpread = on; break;
         case 9: gOptTrigger = on; break;
+        case 10: gOptHudLayout = on; break;
     }
     saveOptions();
 }
@@ -1420,6 +1472,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"No recoil", gOptNoRecoil, 7);
         addSwitch(panel, &y, @"No spread", gOptNoSpread, 8);
         addSwitch(panel, &y, @"Trigger bot (auto shoot)", gOptTrigger, 9);
+        addSwitch(panel, &y, @"Enable HUD layout tool", gOptHudLayout, 10);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
