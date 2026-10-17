@@ -71,6 +71,7 @@ static int gDiagBs = 0;
 static NSString *gScreenDiagA = @"";
 static NSString *gScreenDiagB = @"";
 static void updateScreenDiag(void);
+static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
 static BOOL gFiring = NO;
 
 #pragma mark - runtime helper
@@ -386,7 +387,7 @@ static BOOL  gOptHudLayout = YES;
 static BOOL  gOptLowGfx = YES;
 static BOOL  gOptVisOnly = YES;
 static float gCamTime = 0;
-static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
+
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
