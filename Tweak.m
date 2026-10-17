@@ -390,6 +390,7 @@ static BOOL  gOptHudLayout = YES;
 static BOOL  gOptLowGfx = YES;
 static BOOL  gOptVisOnly = YES;
 static BOOL  gOptAutoSprint = YES;
+static BOOL  gOptUnhide = YES;
 static float gCamTime = 0;
 
 static float gOptSmooth = 0.35f;
@@ -794,6 +795,100 @@ static void applyPs4Glyphs(void) {
     }
 }
 
+#pragma mark - 5d) Unhide settings widgets
+
+#define kMaxUiClasses 96
+static uintptr_t gUiClasses[kMaxUiClasses];
+static int gNumUiClasses = 0;
+static CFAbsoluteTime gUiLastBuild = 0, gUiLastApply = 0;
+static NSMutableString *gUiLog = nil;
+static int gUiLogLines = 0;
+
+static BOOL uiNameWanted(NSString *n) {
+    if (!n.length || [n hasPrefix:@"Default__"]) return NO;
+    static NSSet *exact = nil;
+    if (!exact) exact = [NSSet setWithObjects:@"FortOptionsTab", @"FortVideoOptions", @"FortInputOptions",
+                         @"FortGamepadInputOptions", @"FortGameOptions", @"FortOptionsMenuSetting", nil];
+    if ([exact containsObject:n]) return YES;
+    if (![n hasSuffix:@"_C"]) return NO;
+    return [n containsString:@"Option"] || [n containsString:@"VideoSetting"] || [n containsString:@"Brightness"];
+}
+
+static void buildUiClasses(void) {
+    uintptr_t arr = SYM(A_GLOBAL_GOBJECTS);
+    uintptr_t items = rd_ptr(arr + 0x10);
+    int32_t num = rd_i32(arr + 0x1C);
+    if (items < 0x100000000ULL || num <= 0 || num > 2000000) return;
+    int n = 0;
+    uintptr_t *buf = malloc(2048 * 0x18);
+    if (!buf) return;
+    for (int32_t base = 0; base < num && n < kMaxUiClasses; base += 2048) {
+        int32_t cnt = num - base;
+        if (cnt > 2048) cnt = 2048;
+        if (!safe_read(items + (uintptr_t)base * 0x18, buf, (size_t)cnt * 0x18)) continue;
+        for (int32_t k = 0; k < cnt && n < kMaxUiClasses; k++) {
+            uintptr_t obj = buf[k * 3];
+            if (obj < 0x100000000ULL || (obj & 7)) continue;
+            NSString *nm = fname_string(rd_i32(obj + 0x18));
+            if (uiNameWanted(nm)) gUiClasses[n++] = obj;
+        }
+    }
+    free(buf);
+    gNumUiClasses = n;
+}
+
+static void logUi(NSString *line) {
+    if (!gUiLog) gUiLog = [NSMutableString string];
+    if (gUiLogLines > 300) return;
+    [gUiLog appendFormat:@"%@\n", line];
+    gUiLogLines++;
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (docs) [gUiLog writeToFile:[docs stringByAppendingPathComponent:@"EchoMod_ui.txt"] atomically:NO encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void unhideSettings(void) {
+    if (!gOptUnhide) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gUiLastApply < 1.5) return;
+    gUiLastApply = now;
+    if (gNumUiClasses == 0 ? (now - gUiLastBuild > 8.0) : (now - gUiLastBuild > 25.0)) {
+        gUiLastBuild = now;
+        buildUiClasses();
+    }
+    if (gNumUiClasses == 0) return;
+
+    uintptr_t arr = SYM(A_GLOBAL_GOBJECTS);
+    uintptr_t items = rd_ptr(arr + 0x10);
+    int32_t num = rd_i32(arr + 0x1C);
+    if (items < 0x100000000ULL || num <= 0 || num > 2000000) return;
+    uintptr_t *buf = malloc(2048 * 0x18);
+    if (!buf) return;
+    for (int32_t base = 0; base < num; base += 2048) {
+        int32_t cnt = num - base;
+        if (cnt > 2048) cnt = 2048;
+        if (!safe_read(items + (uintptr_t)base * 0x18, buf, (size_t)cnt * 0x18)) continue;
+        for (int32_t k = 0; k < cnt; k++) {
+            uintptr_t obj = buf[k * 3];
+            if (obj < 0x100000000ULL || (obj & 7)) continue;
+            uintptr_t cls = rd_ptr(obj + 0x10);
+            BOOL hit = NO;
+            for (int c = 0; c < gNumUiClasses; c++) if (gUiClasses[c] == cls) { hit = YES; break; }
+            if (!hit) continue;
+            uint8_t vis = rd_u8(obj + 0xB7);
+            if (vis != 1 && vis != 2) continue;
+            NSString *nm = fname_string(rd_i32(obj + 0x18));
+            if ([nm hasPrefix:@"Default__"]) continue;
+            uintptr_t vt = rd_ptr(obj);
+            uintptr_t fn = vt >= 0x100000000ULL ? rd_ptr(vt + 0x250) : 0;
+            if (fn < 0x100000000ULL) continue;
+            ((void (*)(void *, uint8_t))fn)((void *)obj, 0);
+            NSString *cn = fname_string(rd_i32(cls + 0x18));
+            logUi([NSString stringWithFormat:@"unhid %@ (%@) was %d", nm, cn, vis]);
+        }
+    }
+    free(buf);
+}
+
 static void applyHudLayoutFlag(void) {
     if (!gRuntimeOpts || !objectNamed(gRuntimeOpts, "Default__FortRuntimeOptions")) {
         gRuntimeOpts = 0;
@@ -815,7 +910,7 @@ static void scanPawns(void) {
     gNamesObj = rd_ptr(SYM(A_GLOBAL_GNAMES));
     if (!gBoneCache) gBoneCache = [NSMutableDictionary dictionary];
     gDiagEngine = looks_like_uobject(gEngine);
-    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); applyPs4Glyphs(); }
+    if (gDiagEngine) { applyHudLayoutFlag(); findHudContext(); applyPs4Glyphs(); unhideSettings(); }
     gDiagWorld = NO; gDiagPC = NO; gDiagGameState = NO;
     gDiagPlayers = 0; gDiagPawns = 0; gDiagActors = 0; gDiagBones = 0;
     if (!gDiagEngine) { publishPawns(nil, 0, 0); return; }
@@ -1452,6 +1547,7 @@ static void saveOptions(void) {
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
     [d setBool:gOptVisOnly forKey:@"echo.vis"];
     [d setBool:gOptAutoSprint forKey:@"echo.sprint"];
+    [d setBool:gOptUnhide forKey:@"echo.unhide"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1474,6 +1570,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
     if ([d objectForKey:@"echo.vis"]) gOptVisOnly = [d boolForKey:@"echo.vis"];
     if ([d objectForKey:@"echo.sprint"]) gOptAutoSprint = [d boolForKey:@"echo.sprint"];
+    if ([d objectForKey:@"echo.unhide"]) gOptUnhide = [d boolForKey:@"echo.unhide"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1500,6 +1597,7 @@ static void loadOptions(void) {
         case 11: gOptLowGfx = on; break;
         case 12: gOptVisOnly = on; break;
         case 13: gOptAutoSprint = on; break;
+        case 14: gOptUnhide = on; break;
     }
     saveOptions();
 }
@@ -1626,6 +1724,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
+        addSwitch(panel, &y, @"Show all settings tabs", gOptUnhide, 14);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
