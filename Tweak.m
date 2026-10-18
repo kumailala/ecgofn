@@ -75,6 +75,11 @@ static int gDiagVis, gDiagTraces, gDiagBlocked;
 static float gDiagLastT;
 static int gDiagRet;
 static BOOL gRetAlive;
+static BOOL gOptSilent = NO, gOptSilentFlick = NO, gOptBulletTp = NO;
+static BOOL gSilHave = NO;
+static float gSilPos[3];
+static CFTimeInterval gSilTime = 0;
+static int gSilState = 0, gSilCalls = 0, gSilApplied = 0;
 static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
 static BOOL gFiring = NO;
 
@@ -272,7 +277,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f  ret: %d%@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT, gDiagRet, gRetAlive ? @"*" : @""],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f  ret: %d%@  sil: %d c%d a%d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT, gDiagRet, gRetAlive ? @"*" : @"", gSilState, gSilCalls, gSilApplied],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -832,6 +837,69 @@ static void applyHudLayoutFlag(void) {
 
 // Slow path, runs on a background queue a few times a second: finds the local controller, the
 // player list, and every pawn in the world (an actor whose PlayerState is one of the players).
+typedef struct { float q[4]; float t[3]; float s[3]; float pad[2]; } SilXf;
+typedef SilXf (*SilFn)(void *, uint8_t, void *);
+static SilFn gSilOrig = NULL;
+static uintptr_t gSilPawn = 0;
+
+static BOOL silInImage(uintptr_t p) {
+    return p >= SYM(0x100000000ULL) && p < SYM(0x106000000ULL);
+}
+
+static SilXf silHook(void *self, uint8_t src, void *ability) {
+    SilXf r = gSilOrig(self, src, ability);
+    gSilCalls++;
+    if (gOptSilent && gSilHave && CACurrentMediaTime() - gSilTime < 0.12) {
+        if (gOptBulletTp) {
+            r.t[0] = gSilPos[0]; r.t[1] = gSilPos[1]; r.t[2] = gSilPos[2];
+        } else {
+            float dx = gSilPos[0] - r.t[0], dy = gSilPos[1] - r.t[1], dz = gSilPos[2] - r.t[2];
+            float yaw = atan2f(dy, dx), pitch = atan2f(dz, sqrtf(dx * dx + dy * dy));
+            float sp = sinf(pitch * 0.5f), cp = cosf(pitch * 0.5f), sy = sinf(yaw * 0.5f), cy = cosf(yaw * 0.5f);
+            r.q[0] = sp * sy; r.q[1] = -sp * cy; r.q[2] = cp * sy; r.q[3] = cp * cy;
+        }
+        gSilApplied++;
+    }
+    return r;
+}
+
+static void installSilentHook(uintptr_t pawn) {
+    if (pawn == gSilPawn) return;
+    gSilPawn = pawn;
+    gSilState = 1;
+    uintptr_t cls = rd_ptr(pawn + 0x10);
+    long poff = -1;
+    for (int depth = 0; depth < 10 && looks_like_uobject(cls) && poff < 0; depth++) {
+        for (uintptr_t off = 0x88; off < 0x1C0 && poff < 0; off += 8) {
+            uintptr_t arr = rd_ptr(cls + off);
+            int32_t num = rd_i32(cls + off + 8), mx = rd_i32(cls + off + 12);
+            if (arr < 0x100000000ULL || num <= 0 || num > 40 || mx < num || mx > 256) continue;
+            for (int j = 0; j < num; j++) {
+                uintptr_t ic = rd_ptr(arr + (uintptr_t)j * 16);
+                if (!looks_like_uobject(ic)) continue;
+                NSString *n = fname_string(rd_i32(ic + 0x18));
+                if (n && [n isEqualToString:@"FortTargetSelectionInterface"]) { poff = rd_i32(arr + (uintptr_t)j * 16 + 8); break; }
+            }
+        }
+        cls = rd_ptr(cls + 0x30);
+    }
+    if (poff <= 0 || poff > 0x2000 || (poff & 7)) return;
+    uintptr_t vt = rd_ptr(pawn + (uintptr_t)poff);
+    if (!silInImage(vt)) { gSilState = 2; return; }
+    uintptr_t slot = rd_ptr(vt + 0x18);
+    if (!silInImage(slot)) { gSilState = 2; return; }
+    uintptr_t tmp[40];
+    if (!safe_read(vt - 16, tmp, sizeof tmp)) { gSilState = 2; return; }
+    void **fake = (void **)calloc(40, sizeof(void *));
+    if (!fake) return;
+    memcpy(fake, tmp, sizeof tmp);
+    gSilOrig = (SilFn)slot;
+    fake[5] = (void *)silHook;
+    void *nv = &fake[2];
+    memcpy((void *)(pawn + (uintptr_t)poff), &nv, sizeof nv);
+    gSilState = 3;
+}
+
 static void scanPawns(void) {
     gEngine = rd_ptr(SYM(A_GLOBAL_ENGINE));
     gNamesObj = rd_ptr(SYM(A_GLOBAL_GNAMES));
@@ -859,6 +927,7 @@ static void scanPawns(void) {
 
     uintptr_t localPawn = rd_ptr(pc + OFF_PC_ACKPAWN);
     if (!localPawn) localPawn = rd_ptr(pc + OFF_CTRL_PAWN);
+    if (gOptSilent && looks_like_uobject(localPawn)) installSilentHook(localPawn);
     uintptr_t localPS = rd_ptr(pc + OFF_CTRL_PLAYERSTATE);
     int localTeam = looks_like_uobject(localPS) ? rd_u8(localPS + OFF_ATHENA_TEAM) : -1;
 
@@ -1054,7 +1123,6 @@ static float gDiagLastT = 1.0f;
 static int gSilentPhase = 0;
 static FV3 gSilentSaved, gSilentTarget;
 static CFTimeInterval gSilentNext = 0;
-static BOOL gOptSilent = NO;
 
 static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 from, FV3 to) {
     {
@@ -1372,6 +1440,7 @@ static void updateESP(void) {
         }
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
+        BOOL silThisTick = NO;
         if (gSilentPhase > 0) {
             if (++gSilentPhase > 4 || !looks_like_uobject(pc)) {
                 if (looks_like_uobject(pc)) memcpy((void *)(pc + OFF_CTRL_ROTATION), &gSilentSaved, sizeof gSilentSaved);
@@ -1409,7 +1478,13 @@ static void updateESP(void) {
                 float pitch = atan2f(dz, sqrtf(dx * dx + dy * dy)) * 180.0f / (float)M_PI;
                 FV3 cur;
                 if (safe_read(pc + OFF_CTRL_ROTATION, &cur, sizeof cur) && sane_vec(cur)) {
-                    if (gOptSilent) {
+                    if (gOptSilent && !gOptSilentFlick) {
+                        gSilPos[0] = aim.x; gSilPos[1] = aim.y; gSilPos[2] = aim.z;
+                        gSilTime = CACurrentMediaTime();
+                        gSilHave = YES;
+                        silThisTick = YES;
+                        gDiagLock = YES;
+                    } else if (gOptSilent) {
                         if (CACurrentMediaTime() >= gSilentNext && !gFiring) {
                             gSilentSaved = cur;
                             FV3 tr = { pitch, yaw, cur.z };
@@ -1593,6 +1668,8 @@ static void loadOptions(void) {
         case 13: gOptAutoSprint = on; break;
         case 14: gOptPeek = on; break;
         case 15: gOptSilent = on; break;
+        case 16: gOptSilentFlick = on; break;
+        case 17: gOptBulletTp = on; break;
     }
     saveOptions();
 }
@@ -1720,7 +1797,9 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
         addSwitch(panel, &y, @"Peek hidden settings tabs", gOptPeek, 14);
-        addSwitch(panel, &y, @"Silent aim (auto flick-shot)", gOptSilent, 15);
+        addSwitch(panel, &y, @"Silent aim", gOptSilent, 15);
+        addSwitch(panel, &y, @"Silent: flick fallback", gOptSilentFlick, 16);
+        addSwitch(panel, &y, @"Bullet teleport (visible only)", gOptBulletTp, 17);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
