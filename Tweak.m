@@ -78,6 +78,8 @@ static BOOL gRetAlive;
 static BOOL gOptSilent = NO, gOptSilentFlick = NO, gOptBulletTp = YES;
 static BOOL gOptDmg = NO, gOptAutoWeapons = NO;
 static float gOptDmgMul = 0.1f;
+static BOOL gOptLoot = YES, gOptWeaponEsp = YES;
+static int gOptLootMin = 2;
 static BOOL gSilHave = NO;
 static float gSilPos[3];
 static CFTimeInterval gSilTime = 0;
@@ -534,9 +536,46 @@ static BOOL looks_like_xform(const FXform *x) {
 @property (nonatomic, assign) BOOL team;
 @property (nonatomic, copy)   NSString *tag;
 @property (nonatomic, strong) EchoBoneMap *bones;
+@property (nonatomic, copy)   NSString *weapon;
+@property (nonatomic, assign) int wTier;
 @end
 @implementation EchoPawn
 @end
+
+@interface EchoLoot : NSObject
+@property (nonatomic, assign) float x, y, z;
+@property (nonatomic, copy)   NSString *text;
+@property (nonatomic, assign) int tier;
+@end
+@implementation EchoLoot
+@end
+
+static NSArray<EchoLoot *> *gLoot = nil;
+
+static UIColor *tierColor(int t) {
+    switch (t) {
+        case 1: return [UIColor colorWithWhite:0.75 alpha:1];
+        case 2: return [UIColor colorWithRed:0.3 green:0.9 blue:0.3 alpha:1];
+        case 3: return [UIColor colorWithRed:0.35 green:0.6 blue:1.0 alpha:1];
+        case 4: return [UIColor colorWithRed:0.75 green:0.4 blue:1.0 alpha:1];
+        case 5: return [UIColor colorWithRed:1.0 green:0.6 blue:0.1 alpha:1];
+        case 6: return [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:1];
+        default: return [UIColor whiteColor];
+    }
+}
+
+static NSString *cleanItemName(NSString *raw) {
+    if (!raw.length) return @"";
+    static NSSet *drop = nil;
+    if (!drop) drop = [NSSet setWithArray:@[ @"WID", @"Athena", @"Ore", @"C", @"UC", @"R", @"VR", @"SR", @"UR", @"Harvest", @"Standard", @"Default", @"Consumable", @"AGID", @"Ammo" ]];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *t in [raw componentsSeparatedByString:@"_"]) {
+        if (!t.length || [drop containsObject:t]) continue;
+        if (t.length == 3 && [t hasPrefix:@"T"] && isdigit([t characterAtIndex:1])) continue;
+        [out addObject:t];
+    }
+    return out.count ? [out componentsJoinedByString:@" "] : raw;
+}
 
 static NSArray<EchoPawn *> *gPawns = nil;
 static uintptr_t gLocalPC = 0;
@@ -991,6 +1030,10 @@ static void scanPawns(void) {
     }
 
     NSMutableArray<EchoPawn *> *out = [NSMutableArray array];
+    NSMutableArray<EchoLoot *> *lootOut = [NSMutableArray array];
+    static NSMutableDictionary<NSNumber *, NSNumber *> *lootClassCache = nil;
+    if (!lootClassCache) lootClassCache = [NSMutableDictionary dictionary];
+    int nLoot = 0;
     uintptr_t chunk[2048];
     int actorsSeen = 0;
 
@@ -1008,6 +1051,36 @@ static void scanPawns(void) {
             for (int32_t k = 0; k < cnt; k++) {
                 uintptr_t a = chunk[k];
                 if (a < 0x100000000ULL || (a & 7)) continue;
+                if (gOptLoot) {
+                    uintptr_t cls = rd_ptr(a + 0x10);
+                    if (cls >= 0x100000000ULL) {
+                        NSNumber *ck = @(cls);
+                        NSNumber *cv = lootClassCache[ck];
+                        if (!cv) {
+                            NSString *cn = fname_string(rd_i32(cls + 0x18));
+                            cv = @([cn hasPrefix:@"FortPickup"]);
+                            lootClassCache[ck] = cv;
+                        }
+                        if (cv.boolValue) {
+                            uintptr_t def = rd_ptr(a + 0x368);
+                            if (looks_like_uobject(def)) {
+                                int tier = rd_u8(def + 0x14D);
+                                if (tier >= gOptLootMin + 3 && tier <= 8) {
+                                    uintptr_t root = rd_ptr(a + OFF_ACTOR_ROOT);
+                                    FV3 lp;
+                                    if (root >= 0x100000000ULL && safe_read(root + OFF_SCENE_LOCATION, &lp, sizeof lp) && sane_vec(lp) && nLoot < 400) {
+                                        EchoLoot *lo = [[EchoLoot alloc] init];
+                                        lo.x = lp.x; lo.y = lp.y; lo.z = lp.z; lo.tier = tier;
+                                        lo.text = cleanItemName(fname_string(rd_i32(def + 0x18)));
+                                        [lootOut addObject:lo];
+                                        nLoot++;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
                 uintptr_t ps = rd_ptr(a + OFF_PAWN_PLAYERSTATE);
                 if (!ps) continue;
                 BOOL isPlayer = NO;
@@ -1025,6 +1098,14 @@ static void scanPawns(void) {
                 else if (plat.length) ep.tag = [NSString stringWithFormat:@"[%@]", plat];
                 else ep.tag = @"player";
 
+                uintptr_t pw = rd_ptr(a + OFF_PAWN_CURRENTWEAPON);
+                if (looks_like_uobject(pw)) {
+                    uintptr_t wd = rd_ptr(pw + OFF_WEAPON_DATA);
+                    if (looks_like_uobject(wd)) {
+                        ep.weapon = cleanItemName(fname_string(rd_i32(wd + 0x18)));
+                        ep.wTier = rd_u8(wd + 0x14D);
+                    }
+                }
                 uintptr_t mesh = rd_ptr(a + OFF_CHAR_MESH);
                 if (looks_like_uobject(mesh)) {
                     ep.bones = buildBoneMap(mesh, ep);
@@ -1037,6 +1118,7 @@ static void scanPawns(void) {
 
     gDiagActors = actorsSeen;
     gDiagPawns = (int)out.count;
+    gLoot = lootOut;
     publishPawns(out, pc, localPawn);
     applyWeaponMods(pc, localPawn);
 }
@@ -1046,6 +1128,7 @@ static void scanPawns(void) {
 @interface EchoTag : NSObject
 @property (nonatomic, copy)   NSString *text;
 @property (nonatomic, assign) CGPoint c;
+@property (nonatomic, strong) UIColor *color;
 @end
 @implementation EchoTag
 @end
@@ -1206,7 +1289,7 @@ static BOOL candVisible(AimCand *c, uintptr_t pc, uintptr_t localPawn, FV3 cam) 
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
     for (NSUInteger i = 0; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
-    if (gOptTags) {
+    {
         NSUInteger i = 0;
         for (EchoTag *t in f.tags) {
             UILabel *tag = tagAtIndex(i);
@@ -1217,6 +1300,7 @@ static void applyFrame(EchoFrame *f, CGSize sz) {
                 CGSize ts = tag.bounds.size;
                 tag.bounds = CGRectMake(0, 0, ts.width + 8, ts.height + 2);
             }
+            tag.textColor = t.color ?: [UIColor whiteColor];
             tag.center = CGPointMake(t.c.x, t.c.y - tag.bounds.size.height * 0.5);
             tag.hidden = NO;
             i++;
@@ -1349,11 +1433,11 @@ static void updateESP(void) {
                     uintptr_t arr = 0;
                     int32_t bn = 0;
                     BOOL direct = NO;
-                    static const struct { uintptr_t off; BOOL direct; } cand[3] = { { OFF_SKELCOMP_BONESPACE, NO }, { 0x888, NO }, { 0x898, YES } };
-                    for (int ci = 0; ci < 3; ci++) {
+                    static const struct { uintptr_t off; BOOL direct; } cand[5] = { { 0x688, YES }, { 0x698, YES }, { OFF_SKELCOMP_BONESPACE, NO }, { 0x888, NO }, { 0x898, YES } };
+                    for (int ci = 0; ci < 5; ci++) {
                         uintptr_t ar = rd_ptr(mesh + cand[ci].off);
                         int32_t n = rd_i32(mesh + cand[ci].off + 8);
-                        if (ar >= 0x100000000ULL && n > 20 && n <= kMaxBones) { arr = ar; bn = n; direct = cand[ci].direct; gDiagBs = direct ? -n : (ci == 0 ? n : n + 10000); break; }
+                        if (ar >= 0x100000000ULL && n > 20 && n <= kMaxBones) { arr = ar; bn = n; direct = cand[ci].direct; gDiagBs = direct ? -n : (ci == 2 ? n : n + 10000); break; }
                     }
                     if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
                     if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
@@ -1437,7 +1521,14 @@ static void updateESP(void) {
             EchoTag *tg = [[EchoTag alloc] init];
             tg.text = [NSString stringWithFormat:@"%@  %.0fm", ep.tag, dist];
             tg.c = CGPointMake(cx, ptop - 10);
-            [frame.tags addObject:tg];
+            if (gOptTags) [frame.tags addObject:tg];
+            if (gOptWeaponEsp && ep.weapon.length) {
+                EchoTag *wt = [[EchoTag alloc] init];
+                wt.text = ep.weapon;
+                wt.color = tierColor(ep.wTier);
+                wt.c = CGPointMake(cx, pbot + 18);
+                [frame.tags addObject:wt];
+            }
 
             if (!ep.team && !downed && nc < 64) {
                 FV3 aim = gOptAimBody ? bodyW : headW;
@@ -1462,6 +1553,21 @@ static void updateESP(void) {
             }
         }
 
+        if (gOptLoot) {
+            for (EchoLoot *lo in gLoot) {
+                FV3 lp = { lo.x, lo.y, lo.z };
+                CGFloat lx, ly; float ld;
+                if (!project(&view, lp, &lx, &ly, &ld)) continue;
+                float ddx = lp.x - cam.x, ddy = lp.y - cam.y, ddz = lp.z - cam.z;
+                float dm = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0f;
+                if (dm > 250.0f) continue;
+                EchoTag *lt = [[EchoTag alloc] init];
+                lt.text = [NSString stringWithFormat:@"%@  %.0fm", lo.text, dm];
+                lt.color = tierColor(lo.tier);
+                lt.c = CGPointMake(lx * sz.width, ly * sz.height);
+                [frame.tags addObject:lt];
+            }
+        }
         if (gOptTrigger) {
             for (int i = 0; i < nc; i++) if ((cands[i].onCross || hypot(cands[i].sx, cands[i].sy) <= sz.height * 0.03) && candVisible(&cands[i], pc, localPawn, cam)) { wantFire = YES; break; }
         }
@@ -1706,6 +1812,8 @@ static void loadOptions(void) {
         case 17: gOptBulletTp = on; break;
         case 18: gOptDmg = on; break;
         case 19: gOptAutoWeapons = on; break;
+        case 23: gOptLoot = on; break;
+        case 24: gOptWeaponEsp = on; break;
     }
     saveOptions();
 }
@@ -1717,6 +1825,7 @@ static void loadOptions(void) {
 }
 - (void)picked:(UISegmentedControl *)s {
     if (s.tag == 30) gOptAimBody = (s.selectedSegmentIndex == 1);
+    if (s.tag == 32) gOptLootMin = (int)s.selectedSegmentIndex;
     if (s.tag == 31) gOptDelay = (int)s.selectedSegmentIndex;
     saveOptions();
 }
@@ -1841,6 +1950,9 @@ static void installMenu(void) {
         gMenuHandler.dmgLabel = addSlider(panel, &y, @"Damage", gOptDmgMul, 22);
         gMenuHandler.dmgLabel.text = [NSString stringWithFormat:@"Damage x%d", 1 + (int)(gOptDmgMul * 49.0f)];
         addSwitch(panel, &y, @"Force automatic weapons", gOptAutoWeapons, 19);
+        addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
+        addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
+        addSegment(panel, &y, @"Loot min rarity", @[ @"Rare+", @"Epic+", @"Legendary+" ], gOptLootMin, 32);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
