@@ -83,7 +83,7 @@ static int gOptLootMin = 2;
 static BOOL gSilHave = NO;
 static float gSilPos[3];
 static CFTimeInterval gSilTime = 0;
-static int gSilState = 0, gSilCalls = 0, gSilApplied = 0;
+static int gSilState = 0, gSilCalls = 0, gSilApplied = 0, gSilIfs = 0, gSilArrs = 0;
 static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
 static BOOL gFiring = NO;
 
@@ -281,7 +281,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f  ret: %d%@  sil: %d c%d a%d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT, gDiagRet, gRetAlive ? @"*" : @"", gSilState, gSilCalls, gSilApplied],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f  ret: %d%@  sil: %d c%d a%d if%d ar%d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT, gDiagRet, gRetAlive ? @"*" : @"", gSilState, gSilCalls, gSilApplied, gSilIfs, gSilArrs],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -933,6 +933,7 @@ static void installSilentHook(uintptr_t pawn) {
     if (pawn == gSilPawn) return;
     gSilPawn = pawn;
     gSilState = 1;
+    gSilIfs = 0; gSilArrs = 0;
     uintptr_t cls = rd_ptr(pawn + 0x10);
     long poff = -1;
     for (int depth = 0; depth < 16 && looks_like_uobject(cls) && poff < 0; depth++) {
@@ -940,9 +941,11 @@ static void installSilentHook(uintptr_t pawn) {
             uintptr_t arr = rd_ptr(cls + off);
             int32_t num = rd_i32(cls + off + 8), mx = rd_i32(cls + off + 12);
             if (arr < 0x100000000ULL || num <= 0 || num > 40 || mx < num || mx > 256) continue;
+            gSilArrs++;
             for (int j = 0; j < num; j++) {
                 uintptr_t ic = rd_ptr(arr + (uintptr_t)j * 16);
                 if (!looks_like_uobject(ic)) continue;
+                gSilIfs++;
                 NSString *n = fname_string(rd_i32(ic + 0x18));
                 if (n && [n isEqualToString:@"FortTargetSelectionInterface"]) { poff = rd_i32(arr + (uintptr_t)j * 16 + 8); break; }
             }
@@ -1318,6 +1321,50 @@ static void applyFrame(EchoFrame *f, CGSize sz) {
     [CATransaction commit];
 }
 
+static int gSkelOff = -1;
+static BOOL gSkelDirect = NO;
+static int gSkelCands = 0;
+
+static BOOL skelArrayAt(uintptr_t mesh, int off, int boneCount, uintptr_t *arr, int32_t *n) {
+    uintptr_t a = rd_ptr(mesh + (uintptr_t)off);
+    int32_t c = rd_i32(mesh + (uintptr_t)off + 8), m = rd_i32(mesh + (uintptr_t)off + 12);
+    if (a < 0x100000000ULL || (a & 7) || c < 20 || c > kMaxBones || m < c || m > c * 4 + 64) return NO;
+    if (c != boneCount && !(c > boneCount - 8 && c < boneCount)) return NO;
+    FXform x0;
+    if (!safe_read(a, &x0, sizeof x0) || !looks_like_xform(&x0)) return NO;
+    *arr = a; *n = c;
+    return YES;
+}
+
+static BOOL findSkelArray(uintptr_t mesh, EchoBoneMap *bm, uintptr_t *arr, int32_t *n, BOOL *direct) {
+    int bc = bm->boneCount;
+    if (gSkelOff >= 0 && skelArrayAt(mesh, gSkelOff, bc, arr, n)) { *direct = gSkelDirect; return YES; }
+    if (gSkelOff >= 0 && gSkelOff + 16 < 0xB00 && skelArrayAt(mesh, gSkelOff + 16, bc, arr, n)) { *direct = gSkelDirect; return YES; }
+    static CFTimeInterval lastScan = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastScan < 0.5) return NO;
+    lastScan = now;
+    int bestOff = -1;
+    BOOL bestDirect = NO;
+    int found = 0;
+    for (int off = 0x600; off < 0xB00; off += 8) {
+        uintptr_t a; int32_t c;
+        if (!skelArrayAt(mesh, off, bc, &a, &c)) continue;
+        found++;
+        BOOL dir = NO;
+        int hi = bm->head;
+        if (hi >= 0 && hi < c) {
+            FXform hx;
+            if (safe_read(a + (uintptr_t)hi * sizeof(FXform), &hx, sizeof hx)) dir = fabsf(hx.t[2]) > 60.0f;
+        }
+        if (bestOff < 0 || (dir && !bestDirect)) { bestOff = off; bestDirect = dir; }
+    }
+    gSkelCands = found;
+    if (bestOff < 0) return NO;
+    gSkelOff = bestOff; gSkelDirect = bestDirect;
+    return skelArrayAt(mesh, bestOff, bc, arr, n) ? (*direct = bestDirect, YES) : NO;
+}
+
 typedef void (*FireFn)(void *);
 
 static void setFire(BOOL want, uintptr_t pc) {
@@ -1433,12 +1480,8 @@ static void updateESP(void) {
                     uintptr_t arr = 0;
                     int32_t bn = 0;
                     BOOL direct = NO;
-                    static const struct { uintptr_t off; BOOL direct; } cand[5] = { { 0x688, YES }, { 0x698, YES }, { OFF_SKELCOMP_BONESPACE, NO }, { 0x888, NO }, { 0x898, YES } };
-                    for (int ci = 0; ci < 5; ci++) {
-                        uintptr_t ar = rd_ptr(mesh + cand[ci].off);
-                        int32_t n = rd_i32(mesh + cand[ci].off + 8);
-                        if (ar >= 0x100000000ULL && n > 20 && n <= kMaxBones) { arr = ar; bn = n; direct = cand[ci].direct; gDiagBs = direct ? -n : (ci == 2 ? n : n + 10000); break; }
-                    }
+                    if (findSkelArray(mesh, ep.bones, &arr, &bn, &direct)) gDiagBs = direct ? -(gSkelOff) : gSkelOff;
+                    else gDiagBs = -gSkelCands * 100000;
                     if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
                     if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
                         safe_read(arr, gLocalBones, (size_t)bn * sizeof(FXform)) && looks_like_xform(&gLocalBones[0])) {
