@@ -1143,7 +1143,7 @@ static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 
     for (int attempt = 0; attempt < 5; attempt++) {
         memset(hit, 0, sizeof hit);
         memcpy(hit + 8, &one, 4);
-        uint8_t r = ((TraceFn)SYM(A_KISMET_TRACE))((void *)pc, a, b, 0, 0, &arr, 0, hit, 1, z, z, 0.0f);
+        uint8_t r = ((TraceFn)SYM(A_KISMET_TRACE))((void *)pc, a, b, 21, 1, &arr, 0, hit, 1, z, z, 0.0f);
         gDiagTraces++;
         tm = 1.0f;
         memcpy(&tm, hit + 8, 4);
