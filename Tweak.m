@@ -1251,14 +1251,14 @@ static void updateESP(void) {
                 uintptr_t mesh = rd_ptr(ep.pawn + OFF_CHAR_MESH);
                 FXform c2w;
                 if (mesh >= 0x100000000ULL && safe_read(mesh + OFF_SCENE_C2W, &c2w, sizeof c2w) && looks_like_xform(&c2w)) {
-                    uintptr_t arr = rd_ptr(mesh + OFF_SKELCOMP_BONESPACE);
-                    int32_t bn = rd_i32(mesh + OFF_SKELCOMP_BONESPACE + 8);
-                    gDiagBs = bn;
+                    uintptr_t arr = 0;
+                    int32_t bn = 0;
                     BOOL direct = NO;
-                    if (arr < 0x100000000ULL || bn <= 20) {
-                        uintptr_t arr2 = rd_ptr(mesh + 0x898);
-                        int32_t bn2 = rd_i32(mesh + 0x898 + 8);
-                        if (arr2 >= 0x100000000ULL && bn2 > 20 && bn2 <= kMaxBones) { arr = arr2; bn = bn2; direct = YES; gDiagBs = -bn2; }
+                    static const struct { uintptr_t off; BOOL direct; } cand[3] = { { OFF_SKELCOMP_BONESPACE, NO }, { 0x888, NO }, { 0x898, YES } };
+                    for (int ci = 0; ci < 3; ci++) {
+                        uintptr_t ar = rd_ptr(mesh + cand[ci].off);
+                        int32_t n = rd_i32(mesh + cand[ci].off + 8);
+                        if (ar >= 0x100000000ULL && n > 20 && n <= kMaxBones) { arr = ar; bn = n; direct = cand[ci].direct; gDiagBs = direct ? -n : (ci == 0 ? n : n + 10000); break; }
                     }
                     if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
                     if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
