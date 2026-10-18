@@ -75,7 +75,9 @@ static int gDiagVis, gDiagTraces, gDiagBlocked;
 static float gDiagLastT;
 static int gDiagRet;
 static BOOL gRetAlive;
-static BOOL gOptSilent = NO, gOptSilentFlick = NO, gOptBulletTp = NO;
+static BOOL gOptSilent = NO, gOptSilentFlick = NO, gOptBulletTp = YES;
+static BOOL gOptDmg = NO, gOptAutoWeapons = NO;
+static float gOptDmgMul = 0.1f;
 static BOOL gSilHave = NO;
 static float gSilPos[3];
 static CFTimeInterval gSilTime = 0;
@@ -640,11 +642,11 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh, EchoPawn *ep) {
 
 #pragma mark - 5b) weapon mods (stat table rows + autofire flags)
 
-typedef struct { uintptr_t row; float orig[16]; BOOL has; } StatBackup;
+typedef struct { uintptr_t row; float orig[32]; BOOL has; int32_t bullets; BOOL hasBullets; } StatBackup;
 static StatBackup gStatBackups[64];
 static int gStatBackupCount = 0;
 
-static const int kSpreadOffs[] = { 0x134, 0x138 };
+static const int kSpreadOffs[] = { 0x134, 0x138, 0x13C, 0x140, 0x144, 0x148 };
 static const int kRecoilOffs[] = { 0x1A8, 0x1AC, 0x1B0, 0x1B8, 0x1BC, 0x1C0, 0x1D8, 0x1DC, 0x1E0, 0x1EC, 0x1F0, 0x1FC, 0x200 };
 
 static void wr_bytes(uintptr_t addr, const void *src, size_t n) {
@@ -680,7 +682,7 @@ static StatBackup *backupFor(uintptr_t row) {
     for (int i = 0; i < gStatBackupCount; i++) if (gStatBackups[i].row == row) return &gStatBackups[i];
     if (gStatBackupCount >= 64) return NULL;
     StatBackup *b = &gStatBackups[gStatBackupCount++];
-    b->row = row; b->has = NO;
+    b->row = row; b->has = NO; b->hasBullets = NO; b->bullets = 0;
     return b;
 }
 
@@ -713,11 +715,36 @@ static void applyWeaponMods(uintptr_t pc, uintptr_t localPawn) {
             if (clipInt >= 0 && clipInt < 2000) {
                 StatBackup *bk = backupFor(row);
                 if (bk) {
-                    applyOffs(row, bk, kSpreadOffs, 2, 0, gOptNoSpread);
-                    applyOffs(row, bk, kRecoilOffs, 13, 2, gOptNoRecoil);
+                    applyOffs(row, bk, kSpreadOffs, 6, 0, gOptNoSpread);
+                    applyOffs(row, bk, kRecoilOffs, 13, 6, gOptNoRecoil);
+                    int32_t cb = rd_i32(row + 0x198);
+                    if (gOptDmg) {
+                        if (!bk->hasBullets && cb >= 1 && cb <= 20) { bk->bullets = cb; bk->hasBullets = YES; }
+                        if (bk->hasBullets) {
+                            int32_t want = bk->bullets * (1 + (int32_t)(gOptDmgMul * 49.0f));
+                            if (cb != want) wr_bytes(row + 0x198, &want, 4);
+                        }
+                    } else if (bk->hasBullets && cb != bk->bullets) {
+                        int32_t o = bk->bullets;
+                        wr_bytes(row + 0x198, &o, 4);
+                    }
                 }
             }
             (void)clip;
+        }
+        static uintptr_t trigW[16];
+        static uint8_t trigOrig[16];
+        static int trigN = 0;
+        uint8_t curT = rd_u8(wdata + 0x670);
+        int ti = -1;
+        for (int i = 0; i < trigN; i++) if (trigW[i] == wdata) ti = i;
+        if (gOptAutoWeapons) {
+            if (ti < 0 && trigN < 16 && curT <= 3) { trigW[trigN] = wdata; trigOrig[trigN] = curT; ti = trigN++; }
+            uint8_t one = 1;
+            if (curT != 1) wr_bytes(wdata + 0x670, &one, 1);
+        } else if (ti >= 0 && curT != trigOrig[ti]) {
+            uint8_t o = trigOrig[ti];
+            wr_bytes(wdata + 0x670, &o, 1);
         }
     }
 
@@ -851,7 +878,7 @@ static SilXf silHook(void *self, uint8_t src, void *ability) {
     gSilCalls++;
     if (gOptSilent && gSilHave && CACurrentMediaTime() - gSilTime < 0.12) {
         if (gOptBulletTp) {
-            r.t[0] = gSilPos[0]; r.t[1] = gSilPos[1]; r.t[2] = gSilPos[2];
+            r.t[0] = gSilPos[0]; r.t[1] = gSilPos[1]; r.t[2] = gSilPos[2] + 50.0f;
         } else {
             float dx = gSilPos[0] - r.t[0], dy = gSilPos[1] - r.t[1], dz = gSilPos[2] - r.t[2];
             float yaw = atan2f(dy, dx), pitch = atan2f(dz, sqrtf(dx * dx + dy * dy));
@@ -869,8 +896,8 @@ static void installSilentHook(uintptr_t pawn) {
     gSilState = 1;
     uintptr_t cls = rd_ptr(pawn + 0x10);
     long poff = -1;
-    for (int depth = 0; depth < 10 && looks_like_uobject(cls) && poff < 0; depth++) {
-        for (uintptr_t off = 0x88; off < 0x1C0 && poff < 0; off += 8) {
+    for (int depth = 0; depth < 16 && looks_like_uobject(cls) && poff < 0; depth++) {
+        for (uintptr_t off = 0x88; off < 0x210 && poff < 0; off += 8) {
             uintptr_t arr = rd_ptr(cls + off);
             int32_t num = rd_i32(cls + off + 8), mx = rd_i32(cls + off + 12);
             if (arr < 0x100000000ULL || num <= 0 || num > 40 || mx < num || mx > 256) continue;
@@ -1436,7 +1463,7 @@ static void updateESP(void) {
         }
 
         if (gOptTrigger) {
-            for (int i = 0; i < nc; i++) if (cands[i].onCross && (gRetAlive ? retEnemy : candVisible(&cands[i], pc, localPawn, cam))) { wantFire = YES; break; }
+            for (int i = 0; i < nc; i++) if ((cands[i].onCross || hypot(cands[i].sx, cands[i].sy) <= sz.height * 0.03) && candVisible(&cands[i], pc, localPawn, cam)) { wantFire = YES; break; }
         }
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
@@ -1618,6 +1645,9 @@ static void saveOptions(void) {
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
     [d setBool:gOptVisOnly forKey:@"echo.vis"];
     [d setBool:gOptAutoSprint forKey:@"echo.sprint"];
+    [d setBool:gOptDmg forKey:@"echo.dmg"];
+    [d setBool:gOptAutoWeapons forKey:@"echo.autow"];
+    [d setFloat:gOptDmgMul forKey:@"echo.dmgmul"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
     [d setInteger:gOptDelay forKey:@"echo.delay"];
@@ -1640,6 +1670,9 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
     if ([d objectForKey:@"echo.vis"]) gOptVisOnly = [d boolForKey:@"echo.vis"];
     if ([d objectForKey:@"echo.sprint"]) gOptAutoSprint = [d boolForKey:@"echo.sprint"];
+    if ([d objectForKey:@"echo.dmg"]) gOptDmg = [d boolForKey:@"echo.dmg"];
+    if ([d objectForKey:@"echo.autow"]) gOptAutoWeapons = [d boolForKey:@"echo.autow"];
+    if ([d objectForKey:@"echo.dmgmul"]) gOptDmgMul = [d floatForKey:@"echo.dmgmul"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
     gOptDelay = (int)[d integerForKey:@"echo.delay"];
@@ -1648,6 +1681,7 @@ static void loadOptions(void) {
 @interface EchoMenuHandler : NSObject
 @property (nonatomic, strong) UILabel *smoothLabel;
 @property (nonatomic, strong) UILabel *fovLabel;
+@property (nonatomic, strong) UILabel *dmgLabel;
 @end
 @implementation EchoMenuHandler
 - (void)toggled:(UISwitch *)s {
@@ -1670,11 +1704,14 @@ static void loadOptions(void) {
         case 15: gOptSilent = on; break;
         case 16: gOptSilentFlick = on; break;
         case 17: gOptBulletTp = on; break;
+        case 18: gOptDmg = on; break;
+        case 19: gOptAutoWeapons = on; break;
     }
     saveOptions();
 }
 - (void)slid:(UISlider *)s {
     if (s.tag == 20) { gOptSmooth = s.value; self.smoothLabel.text = [NSString stringWithFormat:@"Smoothness  %.0f%%", s.value * 100]; }
+    if (s.tag == 22) { gOptDmgMul = s.value; self.dmgLabel.text = [NSString stringWithFormat:@"Damage x%d", 1 + (int)(s.value * 49.0f)]; }
     if (s.tag == 21) { gOptFov = s.value; self.fovLabel.text = [NSString stringWithFormat:@"Aim FOV  %.0f%%", s.value * 100]; }
     saveOptions();
 }
@@ -1800,6 +1837,10 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Silent aim", gOptSilent, 15);
         addSwitch(panel, &y, @"Silent: flick fallback", gOptSilentFlick, 16);
         addSwitch(panel, &y, @"Bullet teleport (visible only)", gOptBulletTp, 17);
+        addSwitch(panel, &y, @"Damage multiplier", gOptDmg, 18);
+        gMenuHandler.dmgLabel = addSlider(panel, &y, @"Damage", gOptDmgMul, 22);
+        gMenuHandler.dmgLabel.text = [NSString stringWithFormat:@"Damage x%d", 1 + (int)(gOptDmgMul * 49.0f)];
+        addSwitch(panel, &y, @"Force automatic weapons", gOptAutoWeapons, 19);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
