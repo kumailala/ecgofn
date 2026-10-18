@@ -72,6 +72,7 @@ static NSString *gScreenDiagA = @"";
 static NSString *gScreenDiagB = @"";
 static void updateScreenDiag(void);
 static int gDiagVis, gDiagTraces, gDiagBlocked;
+static float gDiagLastT;
 static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
 static BOOL gFiring = NO;
 
@@ -269,7 +270,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -1047,6 +1048,11 @@ typedef struct { uintptr_t data; int32_t num, max; } LosArr;
 typedef uint8_t (*TraceFn)(void *, LosVec, LosVec, uint8_t, uint8_t, void *, uint8_t, void *, uint8_t, LosCol, LosCol, float);
 
 static int gDiagVis = 0, gDiagTraces = 0, gDiagBlocked = 0;
+static float gDiagLastT = 1.0f;
+static int gSilentPhase = 0;
+static FV3 gSilentSaved, gSilentTarget;
+static CFTimeInterval gSilentNext = 0;
+static BOOL gOptSilent = NO;
 
 static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 from, FV3 to) {
     uintptr_t ign[2] = { localPawn, target };
@@ -1059,7 +1065,11 @@ static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 
     LosVec a = { from.x, from.y, from.z }, b = { to.x, to.y, to.z };
     uint8_t r = ((TraceFn)SYM(A_KISMET_TRACE))((void *)pc, a, b, 0, 0, &arr, 0, hit, 1, z, z, 0.0f);
     gDiagTraces++;
-    if (r & 1) { gDiagBlocked++; return NO; }
+    float tm = 1.0f;
+    memcpy(&tm, hit + 8, 4);
+    BOOL blocked = (r & 1) || (hit[0] & 1);
+    if (blocked && tm >= 0.985f) blocked = NO;
+    if (blocked) { gDiagBlocked++; gDiagLastT = tm; return NO; }
     return YES;
 }
 
@@ -1323,7 +1333,18 @@ static void updateESP(void) {
         }
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
-        if (gOptAimbot && (ads || !gOptAdsOnly) && looks_like_uobject(pc) && nc > 0) {
+        if (gSilentPhase > 0) {
+            if (++gSilentPhase > 4 || !looks_like_uobject(pc)) {
+                if (looks_like_uobject(pc)) memcpy((void *)(pc + OFF_CTRL_ROTATION), &gSilentSaved, sizeof gSilentSaved);
+                setFire(NO, pc);
+                gSilentPhase = 0;
+                gSilentNext = CACurrentMediaTime() + 0.18;
+            } else {
+                memcpy((void *)(pc + OFF_CTRL_ROTATION), &gSilentTarget, sizeof gSilentTarget);
+                gDiagLock = YES;
+            }
+        }
+        if ((gOptSilent || (gOptAimbot && (ads || !gOptAdsOnly))) && looks_like_uobject(pc) && nc > 0 && gSilentPhase == 0) {
             CGFloat R = gOptFov * sz.height;
             int pick = -1;
             BOOL used[64];
@@ -1349,11 +1370,23 @@ static void updateESP(void) {
                 float pitch = atan2f(dz, sqrtf(dx * dx + dy * dy)) * 180.0f / (float)M_PI;
                 FV3 cur;
                 if (safe_read(pc + OFF_CTRL_ROTATION, &cur, sizeof cur) && sane_vec(cur)) {
-                    float f = 1.0f - 0.97f * gOptSmooth;
-                    float cp0 = wrap180(cur.x), cy0 = wrap180(cur.y);
-                    FV3 nr = { cp0 + wrap180(pitch - cp0) * f, cy0 + wrap180(yaw - cy0) * f, cur.z };
-                    memcpy((void *)(pc + OFF_CTRL_ROTATION), &nr, sizeof nr);
-                    gDiagLock = YES;
+                    if (gOptSilent) {
+                        if (CACurrentMediaTime() >= gSilentNext && !gFiring) {
+                            gSilentSaved = cur;
+                            FV3 tr = { pitch, yaw, cur.z };
+                            gSilentTarget = tr;
+                            memcpy((void *)(pc + OFF_CTRL_ROTATION), &tr, sizeof tr);
+                            setFire(YES, pc);
+                            gSilentPhase = 1;
+                            gDiagLock = YES;
+                        }
+                    } else {
+                        float f = 1.0f - 0.97f * gOptSmooth;
+                        float cp0 = wrap180(cur.x), cy0 = wrap180(cur.y);
+                        FV3 nr = { cp0 + wrap180(pitch - cp0) * f, cy0 + wrap180(yaw - cy0) * f, cur.z };
+                        memcpy((void *)(pc + OFF_CTRL_ROTATION), &nr, sizeof nr);
+                        gDiagLock = YES;
+                    }
                 }
             } else {
                 gAimTarget = 0;
@@ -1363,7 +1396,7 @@ static void updateESP(void) {
         }
     }
 
-    setFire(wantFire && gOptTrigger, pc);
+    if (gSilentPhase == 0) setFire(wantFire && gOptTrigger, pc);
     gDiagDrawn = (int)frame.tags.count;
     if (!gHistory) gHistory = [NSMutableArray array];
     [gHistory insertObject:frame atIndex:0];
@@ -1520,6 +1553,7 @@ static void loadOptions(void) {
         case 12: gOptVisOnly = on; break;
         case 13: gOptAutoSprint = on; break;
         case 14: gOptPeek = on; break;
+        case 15: gOptSilent = on; break;
     }
     saveOptions();
 }
@@ -1647,6 +1681,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Smart aim: line-of-sight only", gOptVisOnly, 12);
         addSwitch(panel, &y, @"Auto sprint (controller)", gOptAutoSprint, 13);
         addSwitch(panel, &y, @"Peek hidden settings tabs", gOptPeek, 14);
+        addSwitch(panel, &y, @"Silent aim (auto flick-shot)", gOptSilent, 15);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
