@@ -1070,12 +1070,24 @@ static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 
     memcpy(hit + 8, &one, 4);
     LosCol z = {0,0,0,0};
     LosVec a = { from.x, from.y, from.z }, b = { to.x, to.y, to.z };
-    uint8_t r = ((TraceFn)SYM(A_KISMET_TRACE))((void *)pc, a, b, 0, 0, &arr, 0, hit, 1, z, z, 0.0f);
-    gDiagTraces++;
     float tm = 1.0f;
-    memcpy(&tm, hit + 8, 4);
-    BOOL blocked = (r & 1) || (hit[0] & 1);
-    if (blocked && tm >= 0.985f) blocked = NO;
+    BOOL blocked = NO;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        memset(hit, 0, sizeof hit);
+        memcpy(hit + 8, &one, 4);
+        uint8_t r = ((TraceFn)SYM(A_KISMET_TRACE))((void *)pc, a, b, 0, 0, &arr, 0, hit, 1, z, z, 0.0f);
+        gDiagTraces++;
+        tm = 1.0f;
+        memcpy(&tm, hit + 8, 4);
+        blocked = (r & 1) || (hit[0] & 1);
+        if (blocked && tm >= 0.985f) blocked = NO;
+        if (!blocked) break;
+        float sx = b.x - a.x, sy = b.y - a.y, sz2 = b.z - a.z;
+        float sl = sqrtf(sx * sx + sy * sy + sz2 * sz2);
+        if (sl < 1.0f || tm * sl > 250.0f) break;
+        float adv = (tm * sl + 40.0f) / sl;
+        a.x += sx * adv; a.y += sy * adv; a.z += sz2 * adv;
+    }
     if (blocked) { gDiagBlocked++; gDiagLastT = tm; return NO; }
     return YES;
 }
@@ -1242,6 +1254,12 @@ static void updateESP(void) {
                     uintptr_t arr = rd_ptr(mesh + OFF_SKELCOMP_BONESPACE);
                     int32_t bn = rd_i32(mesh + OFF_SKELCOMP_BONESPACE + 8);
                     gDiagBs = bn;
+                    BOOL direct = NO;
+                    if (arr < 0x100000000ULL || bn <= 20) {
+                        uintptr_t arr2 = rd_ptr(mesh + 0x898);
+                        int32_t bn2 = rd_i32(mesh + 0x898 + 8);
+                        if (arr2 >= 0x100000000ULL && bn2 > 20 && bn2 <= kMaxBones) { arr = arr2; bn = bn2; direct = YES; gDiagBs = -bn2; }
+                    }
                     if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
                     if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
                         safe_read(arr, gLocalBones, (size_t)bn * sizeof(FXform)) && looks_like_xform(&gLocalBones[0])) {
@@ -1249,7 +1267,7 @@ static void updateESP(void) {
                             const FXform *l = &gLocalBones[i];
                             int pi = ep.bones->parent[i];
                             CompBone *c = &gCompBones[i];
-                            if (pi < 0 || pi >= i) {
+                            if (direct || pi < 0 || pi >= i) {
                                 memcpy(c->q, l->q, sizeof c->q);
                                 memcpy(c->t, l->t, sizeof c->t);
                                 memcpy(c->s, l->s, sizeof c->s);
