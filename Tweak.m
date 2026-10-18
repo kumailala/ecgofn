@@ -73,6 +73,8 @@ static NSString *gScreenDiagB = @"";
 static void updateScreenDiag(void);
 static int gDiagVis, gDiagTraces, gDiagBlocked;
 static float gDiagLastT;
+static int gDiagRet;
+static BOOL gRetAlive;
 static uintptr_t gHudCtx = 0, gHudCtxClass = 0;
 static BOOL gFiring = NO;
 
@@ -270,7 +272,7 @@ static void installPlatformOverlay(void) {
                 @"[EchoMod] tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
-                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT],
+                [NSString stringWithFormat:@"drawn: %d  cam: %d  ads: %@  lock: %@  fire: %@  hud: %@  vis: %d  tr: %d/%d  t: %.2f  ret: %d%@", gDiagDrawn, gDiagCam, gDiagAds ? @"Y" : @"n", gDiagLock ? @"Y" : @"n", gFiring ? @"Y" : @"n", gHudCtx ? @"Y" : @"n", gDiagVis, gDiagBlocked, gDiagTraces, gDiagLastT, gDiagRet, gRetAlive ? @"*" : @""],
                 [NSString stringWithFormat:@"%@  bs: %d", gBoneDiag, gDiagBs],
                 gScreenDiagA,
                 gScreenDiagB,
@@ -1055,6 +1057,11 @@ static CFTimeInterval gSilentNext = 0;
 static BOOL gOptSilent = NO;
 
 static BOOL traceClear(uintptr_t pc, uintptr_t localPawn, uintptr_t target, FV3 from, FV3 to) {
+    {
+        float ex = to.x - from.x, ey = to.y - from.y, ez = to.z - from.z;
+        float len = sqrtf(ex * ex + ey * ey + ez * ez);
+        if (len > 500.0f) { float k = 150.0f / len; from.x += ex * k; from.y += ey * k; from.z += ez * k; }
+    }
     uintptr_t ign[2] = { localPawn, target };
     LosArr arr = { (uintptr_t)ign, 2, 2 };
     uint8_t hit[0x100];
@@ -1152,6 +1159,20 @@ static void updateESP(void) {
             uint8_t one = 1;
             if (rd_u8(pc + 0xFE5) != 1) wr_bytes(pc + 0xFE5, &one, 1);
             if (rd_u8(pc + 0xFE6) != 1) wr_bytes(pc + 0xFE6, &one, 1);
+        }
+    }
+
+    BOOL retEnemy = NO;
+    gDiagRet = 0;
+    if (looks_like_uobject(localPawn)) {
+        uintptr_t wp = rd_ptr(localPawn + OFF_PAWN_CURRENTWEAPON);
+        if (looks_like_uobject(wp)) {
+            uint32_t cur = 0, def = 0, en = 0, bl = 0;
+            safe_read(wp + 0x904, &cur, 4); safe_read(wp + 0x3A0, &def, 4);
+            safe_read(wp + 0x3A4, &en, 4); safe_read(wp + 0x3A8, &bl, 4);
+            if (en != def && cur == en) { retEnemy = YES; gRetAlive = YES; gDiagRet = 2; }
+            else if (en != def && cur == bl) { gRetAlive = YES; gDiagRet = 3; }
+            else gDiagRet = 1;
         }
     }
 
@@ -1329,7 +1350,7 @@ static void updateESP(void) {
         }
 
         if (gOptTrigger) {
-            for (int i = 0; i < nc; i++) if (cands[i].onCross && candVisible(&cands[i], pc, localPawn, cam)) { wantFire = YES; break; }
+            for (int i = 0; i < nc; i++) if (cands[i].onCross && (gRetAlive ? retEnemy : candVisible(&cands[i], pc, localPawn, cam))) { wantFire = YES; break; }
         }
         BOOL ads = localPawn && rd_u8(localPawn + OFF_FORTPLAYERPAWN_ADS) != 0;
         gDiagAds = ads;
