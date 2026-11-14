@@ -273,7 +273,7 @@ static void installPlatformOverlay(void) {
         gPlatLabel    = l;
 
         // draw something immediately so the panel is visible even before the first tick
-        setPlatLines(@[ @"[EchoMod] platform HUD — TEST", @"starting…" ]);
+        setPlatLines(@[ @"sniga — made by kumailala", @"starting…" ]);
 
         // heartbeat: if "tick" keeps climbing, the overlay is live and updating.
         dispatch_source_t timer =
@@ -286,7 +286,7 @@ static void installPlatformOverlay(void) {
             updateScreenDiag();
             NSString *eng = gDiagEngine ? @"ok" : (gProbeInRange ? @"no-obj" : @"NO");
             setPlatLines(@[
-                @"[EchoMod] tap E for menu",
+                @"sniga — made by kumailala · tap E for menu",
                 [NSString stringWithFormat:@"engine: %@  world: %@  pc: %@", eng, gDiagWorld ? @"Y" : @"n", gDiagPC ? @"Y" : @"n"],
                 [NSString stringWithFormat:@"gs: %@  players: %d  pawns: %d  bones: %d", gDiagGameState ? @"Y" : @"n", gDiagPlayers, gDiagPawns, gDiagBones],
                 gResolveLine,
@@ -336,8 +336,8 @@ static void showLoadedAlert(int attempt) {
         }
 
         UIAlertController *a =
-            [UIAlertController alertControllerWithTitle:@"EchoMod"
-                                                message:@"dylib loaded OK ✅\n(injection test)"
+            [UIAlertController alertControllerWithTitle:@"sniga"
+                                                message:@"made by kumailala"
                                          preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK"
                                              style:UIAlertActionStyleDefault
@@ -1340,6 +1340,7 @@ static const char *kBoneNames[24] = {
 @public
     int n; int idx[kMaxSel]; int link[kMaxSel];
     int head, neck, pelvis, boneCount; int *parent;
+    int rIdx[16];
 }
 @end
 @implementation EchoBoneMap
@@ -1434,10 +1435,12 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
     }
     EchoBoneMap *m = [[EchoBoneMap alloc] init];
     m->n = 0; m->head = -1; m->neck = -1; m->pelvis = -1; m->boneCount = N; m->parent = NULL;
+    for (int k = 0; k < 16; k++) m->rIdx[k] = -1;
     if (ok) {
         int32_t *info = (int32_t *)malloc((size_t)N * 16);
         if (info && safe_read(refData, info, (size_t)N * 16)) {
             int selBone[kMaxSel];
+            int rFallL = -1, rFallR = -1;
             for (int k = 0; k < kMaxSel; k++) selBone[k] = -1;
             for (int i = 0; i < N; i++) {
                 NSString *nm = fname_string(info[i * 4]);
@@ -1445,7 +1448,14 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
                 const char *lower = nm.lowercaseString.UTF8String;
                 for (int k = 0; k < kMaxSel; k++)
                     if (kBoneNames[k] && selBone[k] < 0 && strcmp(lower, kBoneNames[k]) == 0) { selBone[k] = i; break; }
+                static const char *kRaax[15] = { "head", "neck_01", "pelvis", "upperarm_l", "lowerarm_l", "hand_l", "upperarm_r", "lowerarm_r", "hand_r", "thigh_l", "calf_l", "ik_foot_l", "thigh_r", "calf_r", "ik_foot_r" };
+                for (int k = 0; k < 15; k++)
+                    if (m->rIdx[k] < 0 && strcmp(lower, kRaax[k]) == 0) { m->rIdx[k] = i; break; }
+                if (strcmp(lower, "foot_l") == 0) rFallL = i;
+                if (strcmp(lower, "foot_r") == 0) rFallR = i;
             }
+            if (m->rIdx[11] < 0) m->rIdx[11] = rFallL;
+            if (m->rIdx[14] < 0) m->rIdx[14] = rFallR;
             m->parent = (int *)malloc((size_t)N * sizeof(int));
             for (int i = 0; i < N; i++) m->parent[i] = info[i * 4 + 2];
             int count = 0;
@@ -1735,9 +1745,21 @@ static BOOL readCamera(uintptr_t pc, DV3 *loc, DV3 *rot, float *fov) {
     return camEntryAt(cm + (uintptr_t)bestOff, loc, rot, fov, &ts);
 }
 
-typedef struct { DV3 cam, fwd, right, up; double tanHalf, aspect; } EchoView;
+typedef struct { DV3 cam, fwd, right, up; double tanHalf, aspect; const double *vp; } EchoView;
+static __thread const double *tVP = NULL;
 
 static BOOL project(const EchoView *v, DV3 w, CGFloat *nx, CGFloat *ny, float *depth) {
+    if (v->vp) {
+        const double *m = v->vp;
+        double X = w.x * m[0] + w.y * m[4] + w.z * m[8] + m[12];
+        double Y = w.x * m[1] + w.y * m[5] + w.z * m[9] + m[13];
+        double W = w.x * m[3] + w.y * m[7] + w.z * m[11] + m[15];
+        if (!(W > 1.0)) return NO;
+        *nx = 0.5 + 0.5 * (X / W);
+        *ny = 0.5 - 0.5 * (Y / W);
+        *depth = (float)W;
+        return YES;
+    }
     double dx = w.x - v->cam.x, dy = w.y - v->cam.y, dz = w.z - v->cam.z;
     double x = dx * v->fwd.x + dy * v->fwd.y + dz * v->fwd.z;
     if (x < 10.0) return NO;
@@ -1869,6 +1891,7 @@ static EchoView makeView(DV3 cam, DV3 rot, float fov, CGSize sz) {
     view.up    = (DV3){ -(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp };
     view.tanHalf = tan(fov * M_PI / 360.0);
     view.aspect = sz.height > 0 ? sz.width / sz.height : 1.0;
+    view.vp = tVP;
     return view;
 }
 
@@ -3016,47 +3039,333 @@ static void engPath(void *cv, UIBezierPath *bp, double th, float r, float g, flo
     CGPathApply(bp.CGPath, &p, engPathApplier);
 }
 
+static int gVPOff = -1;
+static BOOL gVPDbl = NO;
+static int gVPTries = 0;
+static double gVPm[16];
+
+static BOOL vpRead(void *cv, int off, BOOL dbl, double *o) {
+    if (dbl) return safe_read((uintptr_t)cv + (uintptr_t)off, o, 128);
+    float f[16];
+    if (!safe_read((uintptr_t)cv + (uintptr_t)off, f, 64)) return NO;
+    for (int i = 0; i < 16; i++) o[i] = f[i];
+    return YES;
+}
+
+static inline BOOL vpEval(const double *m, DV3 p, double *x, double *y, double *w) {
+    *x = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
+    *y = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
+    *w = p.x * m[3] + p.y * m[7] + p.z * m[11] + m[15];
+    return isfinite(*x) && isfinite(*y) && isfinite(*w);
+}
+
+static void vpProbe(void *cv, DV3 cam, DV3 rot, float fov) {
+    EchoView bv = makeView(cam, rot, fov, CGSizeMake(16, 9));
+    DV3 P0 = { cam.x + bv.fwd.x * 1000.0, cam.y + bv.fwd.y * 1000.0, cam.z + bv.fwd.z * 1000.0 };
+    DV3 P1 = { P0.x + bv.right.x * 100.0, P0.y + bv.right.y * 100.0, P0.z + bv.right.z * 100.0 };
+    DV3 P2 = { P0.x + bv.up.x * 100.0, P0.y + bv.up.y * 100.0, P0.z + bv.up.z * 100.0 };
+    for (int pass = 0; pass < 2; pass++) {
+        BOOL dbl = pass == 1;
+        for (int off = 0x48; off < 0x900; off += 8) {
+            double m[16];
+            if (!vpRead(cv, off, dbl, m)) continue;
+            double x0, y0, w0, x1, y1, w1, x2, y2, w2;
+            if (!vpEval(m, P0, &x0, &y0, &w0) || !vpEval(m, P1, &x1, &y1, &w1) || !vpEval(m, P2, &x2, &y2, &w2)) continue;
+            if (w0 < 200.0 || w0 > 5000.0 || w1 < 200.0 || w2 < 200.0) continue;
+            double a0 = x0 / w0, b0 = y0 / w0, a1 = x1 / w1, b2 = y2 / w2;
+            if (fabs(a0) > 0.03 || fabs(b0) > 0.03) continue;
+            if (!(a1 - a0 > 0.01 && a1 - a0 < 1.5)) continue;
+            double dy = b2 - b0;
+            if (!(fabs(dy) > 0.01 && fabs(dy) < 2.5)) continue;
+            gVPOff = off; gVPDbl = dbl;
+            metalNote([NSString stringWithFormat:@"engine VP matrix found at canvas+0x%x (%s) w0 %.0f", off, dbl ? "double" : "float", w0]);
+            return;
+        }
+    }
+}
+
+typedef struct { DV3 w[16]; } RaaxBones;
+
+static BOOL raaxBones(EchoPawn *ep, RaaxBones *out) {
+    if (!ep.bones || !ep.bones->parent || O_CHAR_MESH < 0) return NO;
+    uintptr_t mesh = rd_ptr(ep.pawn + (uintptr_t)O_CHAR_MESH);
+    if (mesh < 0x100000000ULL) return NO;
+    DV3 center;
+    if (!actorLocation(ep.pawn, &center)) return NO;
+    DXf c2w;
+    if (!readC2W(mesh, center, &c2w)) return NO;
+    uintptr_t arr = 0;
+    int32_t bn = 0;
+    BOOL direct = NO;
+    findSkelArray(mesh, ep.bones, &arr, &bn, &direct);
+    if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
+    if (arr < 0x100000000ULL || bn <= 20 || bn > kMaxBones) return NO;
+    if (!safe_read(arr, gLocalBones, (size_t)bn * sizeof(DXf)) || !looks_like_xform(&gLocalBones[0])) return NO;
+    static DXf comp[kMaxBones];
+    for (int i = 0; i < bn; i++) {
+        const DXf *l = &gLocalBones[i];
+        int pi = ep.bones->parent[i];
+        DXf *c = &comp[i];
+        if (direct || pi < 0 || pi >= i) {
+            *c = *l;
+        } else {
+            const DXf *pc2 = &comp[pi];
+            DV3 lt = { l->t[0] * pc2->s[0], l->t[1] * pc2->s[1], l->t[2] * pc2->s[2] };
+            DV3 rt = qrot(pc2->q, lt);
+            c->t[0] = pc2->t[0] + rt.x; c->t[1] = pc2->t[1] + rt.y; c->t[2] = pc2->t[2] + rt.z;
+            double ax = pc2->q[0], ay = pc2->q[1], az = pc2->q[2], aw = pc2->q[3];
+            double bx = l->q[0], by2 = l->q[1], bz = l->q[2], bw = l->q[3];
+            c->q[0] = aw * bx + ax * bw + ay * bz - az * by2;
+            c->q[1] = aw * by2 - ax * bz + ay * bw + az * bx;
+            c->q[2] = aw * bz + ax * by2 - ay * bx + az * bw;
+            c->q[3] = aw * bw - ax * bx - ay * by2 - az * bz;
+            c->s[0] = pc2->s[0] * l->s[0]; c->s[1] = pc2->s[1] * l->s[1]; c->s[2] = pc2->s[2] * l->s[2];
+        }
+    }
+    for (int k = 0; k < 15; k++) {
+        int bi = ep.bones->rIdx[k];
+        if (bi < 0 || bi >= bn) return NO;
+        const DXf *c = &comp[bi];
+        DV3 lp = { c->t[0] * c2w.s[0], c->t[1] * c2w.s[1], c->t[2] * c2w.s[2] };
+        DV3 r = qrot(c2w.q, lp);
+        out->w[k] = (DV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
+        if (!sane_dv(out->w[k])) return NO;
+    }
+    out->w[15] = (DV3){ (out->w[3].x + out->w[6].x) * 0.5, (out->w[3].y + out->w[6].y) * 0.5, (out->w[3].z + out->w[6].z) * 0.5 };
+    return YES;
+}
+
+static const int kRaaxPairs[15][2] = {
+    {0, 1}, {1, 15}, {15, 2}, {15, 3}, {3, 4}, {4, 5}, {15, 6}, {6, 7}, {7, 8}, {2, 9}, {9, 10}, {10, 11}, {2, 12}, {12, 13}, {13, 14}
+};
+
+static void engFillBox(void *cv, double x0, double y0, double x1, double y1, float a) {
+    float col[4] = { 0, 0, 0, a };
+    double w = x1 - x0;
+    if (w < 1.0) return;
+    engLine(cv, (x0 + x1) * 0.5, y0, (x0 + x1) * 0.5, y1, (float)w, col);
+}
+
+static void engCornerBox(void *cv, double x0, double y0, double x1, double y1, double th, const float *col) {
+    double lw = (x1 - x0) / 4.0, lh = (y1 - y0) / 4.0;
+    engLine(cv, x0, y0, x0 + lw, y0, (float)th, col); engLine(cv, x0, y0, x0, y0 + lh, (float)th, col);
+    engLine(cv, x1, y0, x1 - lw, y0, (float)th, col); engLine(cv, x1, y0, x1, y0 + lh, (float)th, col);
+    engLine(cv, x1, y1, x1 - lw, y1, (float)th, col); engLine(cv, x1, y1, x1, y1 - lh, (float)th, col);
+    engLine(cv, x0, y1, x0 + lw, y1, (float)th, col); engLine(cv, x0, y1, x0, y1 - lh, (float)th, col);
+}
+
+static void engCircle(void *cv, double cx, double cy, double r, int seg, double th, const float *col) {
+    for (int i = 0; i < seg; i++) {
+        double a0 = i * 2.0 * M_PI / seg, a1 = (i + 1) * 2.0 * M_PI / seg;
+        engLine(cv, cx + cos(a0) * r, cy + sin(a0) * r, cx + cos(a1) * r, cy + sin(a1) * r, (float)th, col);
+    }
+}
+
+static uintptr_t gAimPawn = 0;
+static double gAimScreenX = 0, gAimScreenY = 0;
+
 static void engineEspFrame(void *cv) {
     int sx = rd_i32((uintptr_t)cv + 0x40), sy = rd_i32((uintptr_t)cv + 0x44);
     if (sx < 200 || sy < 200 || sx > 8000 || sy > 8000) return;
     NSArray<EchoPawn *> *pawns; uintptr_t pc, lp;
     @synchronized ([NSProcessInfo processInfo]) { pawns = gPawns; pc = gLocalPC; lp = gLocalPawn; }
-    if (!pc || !pawns.count) return;
+    if (!pc || !pawns.count) { gAimPawn = 0; return; }
     CGSize sz = CGSizeMake(sx, sy);
     gScreenSz = sz;
     DV3 cam, rot; float fov, ts;
     if (!readCameraStable(pc, &cam, &rot, &fov, &ts)) return;
     CFTimeInterval now = CACurrentMediaTime();
-    EchoSnap *s = captureSnap(pawns, cam, rot, fov, now);
-    aimStep(s, pc, lp);
-    EchoFrame *f = emptyFrame();
-    renderSnap(f, s, s, 1.0, sz);
+
+    if (gVPOff < 0 && gVPTries < 400) { gVPTries++; vpProbe(cv, cam, rot, fov); }
+    const double *vpm = NULL;
+    if (gVPOff >= 0 && vpRead(cv, gVPOff, gVPDbl, gVPm)) vpm = gVPm;
+    tVP = vpm;
+    EchoView view = makeView(cam, rot, fov, sz);
+    tVP = NULL;
+
     double sc = sx / 1000.0;
     if (sc < 1.0) sc = 1.0;
-    if (gOptBoxes) {
-        engPath(cv, f.tb, 1.5 * sc, 0.2f, 1.0f, 0.4f, 1.0f);
-        engPath(cv, f.eb, 1.5 * sc, 1.0f, 0.2f, 0.2f, 1.0f);
-    }
-    if (gOptSkeleton) {
-        engPath(cv, f.tbn, 1.2 * sc, 0.4f, 1.0f, 1.0f, 1.0f);
-        engPath(cv, f.ebn, 1.2 * sc, 1.0f, 0.9f, 0.2f, 1.0f);
-    }
-    if (gOptAimbot && gOptShowFov) {
-        double r = gOptFov * sz.height, ccx = sz.width * 0.5, ccy = sz.height * 0.5;
-        float col[4] = { 1, 1, 1, 0.5f };
-        for (int i = 0; i < 48; i++) {
-            double a0 = i * 2.0 * M_PI / 48.0, a1 = (i + 1) * 2.0 * M_PI / 48.0;
-            engLine(cv, ccx + cos(a0) * r, ccy + sin(a0) * r, ccx + cos(a1) * r, ccy + sin(a1) * r, 1.0f * (float)sc, col);
+    const float cPrimary[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    const float cSecondary[4] = { 0.0f, 0.47f, 1.0f, 1.0f };
+    double fovRad = fov * M_PI / 180.0;
+    double ppd = sx / ((2.0 * tan(0.5 * fovRad)) * 180.0 / M_PI);
+    double fovDeg = gOptFov * 33.0;
+    double dzDeg = fovDeg * 0.2;
+    double smoothS = 1.0 + gOptSmooth * 14.0;
+    static CFTimeInterval lastT = 0;
+    double elapsed = lastT > 0 ? now - lastT : 1.0 / 60.0;
+    lastT = now;
+    if (elapsed < 0.002) elapsed = 0.002;
+    if (elapsed > 0.1) elapsed = 0.1;
+    double effSmooth = smoothS <= 1.0 ? smoothS : fmax(1.0, smoothS * ((1.0 / 120.0) / elapsed));
+
+    BOOL ads = (O_ADS < 0) ? YES : (lp && pawnFlag(lp, O_ADS, M_ADS));
+    BOOL targeting = gOptAimbot && (ads || !gOptAdsOnly);
+    int aimSlot = gOptAimBody ? 15 : 0;
+
+    uintptr_t bestPawn = 0;
+    double bestMetric = 1e30, bestPix = 0, bestDeg = 0, bestDist = 0, bestSX = 0, bestSY = 0;
+    DV3 bestPos = {0, 0, 0};
+    BOOL bestDead = NO, curStillValid = NO;
+    uintptr_t curPawn = gAimPawn;
+    double curMetric = 0, curPix = 0, curDeg = 0, curSX = 0, curSY = 0;
+    DV3 curPos = {0, 0, 0};
+
+    CGFloat cx0 = sx * 0.5, cy0 = sy * 0.5;
+
+    for (EchoPawn *ep in pawns) {
+        if (pawnFlag(ep.pawn, O_DYING, M_DYING)) continue;
+        if (ep.team) continue;
+        BOOL downed = pawnFlag(ep.pawn, O_DBNO, M_DBNO);
+        DV3 root;
+        if (!actorLocation(ep.pawn, &root)) continue;
+        double ddx = root.x - cam.x, ddy = root.y - cam.y, ddz = root.z - cam.z;
+        double distM = sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0;
+        if (distM >= 300.0) continue;
+
+        RaaxBones rb;
+        BOOL haveB = raaxBones(ep, &rb);
+        DV3 corners[8];
+        if (haveB) {
+            double minX = 1e30, maxX = -1e30, minY = 1e30, maxY = -1e30, minZ = 1e30, maxZ = -1e30;
+            for (int i = 0; i < 16; i++) {
+                DV3 b = rb.w[i];
+                if (b.x < minX) minX = b.x; if (b.x > maxX) maxX = b.x;
+                if (b.y < minY) minY = b.y; if (b.y > maxY) maxY = b.y;
+                if (b.z < minZ) minZ = b.z; if (b.z > maxZ) maxZ = b.z;
+            }
+            double hm = (maxX - minX) * 0.2, vm = (maxY - minY) * 0.2, dm = (maxZ - minZ) * 0.125;
+            corners[0] = (DV3){ minX - hm, minY - vm, maxZ + dm };
+            corners[1] = (DV3){ maxX + hm, minY - vm, maxZ + dm };
+            corners[2] = (DV3){ minX - hm, maxY + vm, maxZ + dm };
+            corners[3] = (DV3){ maxX + hm, maxY + vm, maxZ + dm };
+            corners[4] = (DV3){ minX - hm, minY - vm, minZ - dm };
+            corners[5] = (DV3){ maxX + hm, minY - vm, minZ - dm };
+            corners[6] = (DV3){ minX - hm, maxY + vm, minZ - dm };
+            corners[7] = (DV3){ maxX + hm, maxY + vm, minZ - dm };
+        } else {
+            for (int i = 0; i < 8; i++)
+                corners[i] = (DV3){ root.x + ((i & 1) ? 40.0 : -40.0), root.y + ((i & 2) ? 40.0 : -40.0), root.z + ((i & 4) ? 100.0 : -100.0) };
         }
+        double bx0 = 1e30, by0 = 1e30, bx1 = -1e30, by1 = -1e30;
+        BOOL cornersOk = YES;
+        for (int i = 0; i < 8; i++) {
+            CGFloat nx, ny; float dp;
+            if (!project(&view, corners[i], &nx, &ny, &dp)) { cornersOk = NO; break; }
+            double px = nx * sx, py = ny * sy;
+            if (px < bx0) bx0 = px; if (px > bx1) bx1 = px;
+            if (py < by0) by0 = py; if (py > by1) by1 = py;
+        }
+        if (!cornersOk) continue;
+        BOOL onScreen = !(bx1 < 0 || bx0 > sx || by1 < 0 || by0 > sy);
+        double bw = bx1 - bx0, bh = by1 - by0;
+        if (onScreen && bw > 2.0 && bh > 2.0 && bw < sx * 4.0 && bh < sy * 4.0) {
+            if (gOptBoxes) {
+                engFillBox(cv, bx0, by0, bx1, by1, 0.25f);
+                engCornerBox(cv, bx0, by0, bx1, by1, 2.0 * sc, cPrimary);
+            }
+            if (gOptSkeleton && haveB) {
+                CGPoint scr[16]; BOOL sok[16];
+                for (int i = 0; i < 16; i++) {
+                    CGFloat nx, ny; float dp;
+                    sok[i] = project(&view, rb.w[i], &nx, &ny, &dp);
+                    if (sok[i]) scr[i] = CGPointMake(nx * sx, ny * sy);
+                }
+                for (int i = 0; i < 15; i++) {
+                    int a = kRaaxPairs[i][0], b = kRaaxPairs[i][1];
+                    if (sok[a] && sok[b]) engLine(cv, scr[a].x, scr[a].y, scr[b].x, scr[b].y, (float)(1.0 * sc), cSecondary);
+                }
+            }
+            double midX = (bx0 + bx1) * 0.5;
+            double fh = 16.0 * sc;
+            if (gOptTags && ep.tag.length) {
+                engText(cv, ep.tag, midX, by0 - 2.0, 2.6 * sc, 1.1 * sc, cPrimary);
+            }
+            double bottomY = by1 + 2.0 + fh;
+            if (gOptWeaponEsp && ep.weapon.length) {
+                CGFloat r = 1, g = 1, b = 1, a = 1;
+                [tierColor(ep.wTier) getRed:&r green:&g blue:&b alpha:&a];
+                float wc[4] = { (float)r, (float)g, (float)b, 1.0f };
+                engText(cv, ep.weapon, midX, bottomY, 2.6 * sc, 1.1 * sc, wc);
+                bottomY += 2.0 + fh;
+            }
+            if (gOptTags) {
+                NSString *d = [NSString stringWithFormat:@"%d m", (int)distM];
+                engText(cv, d, midX, bottomY, 2.6 * sc, 1.1 * sc, cPrimary);
+            }
+        }
+
+        if (targeting && haveB && !downed) {
+            DV3 tp = rb.w[aimSlot];
+            CGFloat nx, ny; float dp;
+            BOOL pOk = project(&view, tp, &nx, &ny, &dp);
+            double scx = pOk ? nx * sx : -1.0, scy = pOk ? ny * sy : -1.0;
+            double dx = tp.x - cam.x, dy = tp.y - cam.y, dz = tp.z - cam.z;
+            double aimYaw = atan2(dy, dx) * 180.0 / M_PI;
+            double aimPitch = atan2(dz, sqrt(dx * dx + dy * dy)) * 180.0 / M_PI;
+            double dl = sqrt(dx * dx + dy * dy + dz * dz);
+            double dotv = dl > 1e-6 ? (dx * view.fwd.x + dy * view.fwd.y + dz * view.fwd.z) / dl : 1.0;
+            if (dotv > 1.0) dotv = 1.0; if (dotv < -1.0) dotv = -1.0;
+            double degDist = acos(dotv) * 180.0 / M_PI;
+            double pixDist = hypot(scx - cx0, scy - cy0);
+            double metric = degDist + distM * 0.25;
+            BOOL onS = pOk && scx >= 0 && scx <= sx && scy >= 0 && scy <= sy;
+            BOOL inFov = onS ? (pixDist <= fovDeg * ppd) : (degDist <= fovDeg);
+            if (inFov) {
+                if (ep.pawn == curPawn) { curStillValid = YES; curMetric = metric; curPix = onS ? pixDist : 1e9; curDeg = degDist; curSX = scx; curSY = scy; curPos = (DV3){ aimYaw, aimPitch, onS ? 1.0 : 0.0 }; }
+                if (metric < bestMetric) {
+                    bestMetric = metric; bestPawn = ep.pawn; bestPix = onS ? pixDist : 1e9; bestDeg = degDist; bestSX = scx; bestSY = scy;
+                    bestPos = (DV3){ aimYaw, aimPitch, onS ? 1.0 : 0.0 };
+                }
+            }
+        }
+        (void)bestDead; (void)bestDist;
     }
-    for (EchoTag *t in f.tags) {
-        CGFloat r = 1, g = 1, b = 1, a = 1;
-        if (t.color) [t.color getRed:&r green:&g blue:&b alpha:&a];
-        float col[4] = { (float)r, (float)g, (float)b, 1.0f };
-        engText(cv, t.text, t.c.x, t.c.y, 2.6 * sc, 1.1 * sc, col);
+
+    if (gOptAimbot && gOptShowFov) {
+        float white[4] = { 1, 1, 1, 1 }, red[4] = { 1, 0, 0, 1 };
+        engCircle(cv, cx0, cy0, fovDeg * ppd, 64, 1.0 * sc, white);
+        engCircle(cv, cx0, cy0, dzDeg * ppd, 32, 1.0 * sc, red);
     }
+
+    uintptr_t useTarget = 0;
+    double aY = 0, aP = 0, tPix = 0, tSX = 0, tSY = 0;
+    if (curStillValid && curPawn) {
+        useTarget = curPawn; aY = curPos.x; aP = curPos.y; tPix = curPix; tSX = curSX; tSY = curSY;
+    }
+    if (!useTarget || !(targeting && true)) {
+        if (bestPawn) { useTarget = bestPawn; aY = bestPos.x; aP = bestPos.y; tPix = bestPix; tSX = bestSX; tSY = bestSY; }
+    }
+    if (curStillValid && bestPawn && bestPawn != curPawn && bestMetric < curMetric - 1e-9 && !targeting) {
+        useTarget = bestPawn; aY = bestPos.x; aP = bestPos.y; tPix = bestPix; tSX = bestSX; tSY = bestSY;
+    }
+    gAimPawn = targeting ? useTarget : (bestPawn ? bestPawn : 0);
+    (void)bestDeg; (void)curDeg;
+
+    if (useTarget && gOptAimbot && gOptShowFov && tSX >= 0 && tSY >= 0) {
+        float lc[4] = { 1, 0, 0, 1 };
+        engLine(cv, cx0, cy0, tSX, tSY, (float)(1.0 * sc), lc);
+    }
+
+    if (useTarget && targeting && O_CTRL_ROT >= 0 && looks_like_uobject(pc)) {
+        BOOL inDead = (tPix <= dzDeg * ppd);
+        if (!inDead) {
+            DV3 cur;
+            if (safe_read(pc + (uintptr_t)O_CTRL_ROT, &cur, sizeof cur) && sane_dv(cur)) {
+                double dP = wrap180(aP - wrap180(rot.x)), dY = wrap180(aY - wrap180(rot.y));
+                dP /= effSmooth; dY /= effSmooth;
+                DV3 nr = { cur.x + dP, cur.y + dY, cur.z };
+                memcpy((void *)(pc + (uintptr_t)O_CTRL_ROT), &nr, sizeof nr);
+                gDiagLock = YES;
+            }
+        } else {
+            gDiagLock = NO;
+        }
+    } else {
+        gDiagLock = NO;
+    }
+
     gEngDrawLast = now;
-    gDiagDrawn = (int)f.tags.count;
 }
 
 static BOOL looksCanvas(void *cv) {
@@ -3436,7 +3745,7 @@ static void installMenu(void) {
 
         CGFloat y = 10;
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, y, pw - 28, 24)];
-        title.text = @"EchoMod 43"; title.textColor = [UIColor whiteColor];
+        title.text = @"sniga  ·  made by kumailala"; title.textColor = [UIColor whiteColor];
         title.font = [UIFont boldSystemFontOfSize:17];
         [panel addSubview:title];
         y += 32;
