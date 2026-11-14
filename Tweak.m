@@ -1721,6 +1721,7 @@ static void scanPawns(void) {
                                 else if ([lcn containsString:@"tiered_chest"]) kind = 2;
                                 else if ([lcn containsString:@"tiered_ammo"]) kind = 3;
                                 else if ([lcn containsString:@"llama"] || [lcn containsString:@"supplydrop"]) kind = 4;
+                                else if ([lcn containsString:@"cannon"] && ![lcn hasPrefix:@"fortweapon"] && ![lcn containsString:@"ball"] && ![lcn containsString:@"projectile"] && ![lcn containsString:@"ability"] && ![lcn containsString:@"component"]) kind = 5;
                                 cv = @(kind);
                                 lootClassCache[ck] = cv;
                             }
@@ -1739,7 +1740,7 @@ static void scanPawns(void) {
                                 if (!actorLocation(a, &cl)) continue;
                                 EchoLoot *co = [[EchoLoot alloc] init];
                                 co.x = cl.x; co.y = cl.y; co.z = cl.z; co.tier = -kind;
-                                co.text = kind == 2 ? @"CHEST" : (kind == 3 ? @"AMMO" : @"LLAMA");
+                                co.text = kind == 2 ? @"CHEST" : (kind == 3 ? @"AMMO" : (kind == 4 ? @"LLAMA" : @"CANNON"));
                                 [lootOut addObject:co];
                                 nChest++;
                                 continue;
@@ -3497,6 +3498,7 @@ static void engineEspFrame(void *cv) {
             if (lo.tier == -2) { col[0] = 1.0f; col[1] = 0.85f; col[2] = 0.2f; }
             else if (lo.tier == -3) { col[0] = 0.7f; col[1] = 0.7f; col[2] = 0.7f; }
             else if (lo.tier == -4) { col[0] = 0.3f; col[1] = 1.0f; col[2] = 1.0f; }
+            else if (lo.tier == -5) { col[0] = 1.0f; col[1] = 0.45f; col[2] = 0.1f; }
             else { CGFloat r = 1, g = 1, b = 1, a2 = 1; [tierColor(lo.tier) getRed:&r green:&g blue:&b alpha:&a2]; col[0] = (float)r; col[1] = (float)g; col[2] = (float)b; }
             double arm = 4.0 * sc;
             engLine(cv, px - arm, py, px + arm, py, (float)(1.5 * sc), col);
@@ -4037,7 +4039,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
-        addSwitch(panel, &y, @"Chest / ammo box / llama ESP", gOptChest, 34);
+        addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSegment(panel, &y, @"Loot min rarity", @[ @"Rare+", @"Epic+", @"Legendary+" ], gOptLootMin, 32);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
