@@ -369,7 +369,7 @@ static BOOL  gOptAutoSprint = NO;
 static BOOL  gOptPeek = NO;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
-static int   gOptDelay = 3;
+static int   gOptDelay = 1;
 
 typedef struct { double x, y, z; } DV3;
 typedef struct { double q[4]; double t[3]; double tp; double s[3]; double sp; } DXf;
@@ -2201,6 +2201,20 @@ static EchoFrame *frameForTime(double T, CFTimeInterval ref, CGSize sz) {
     return frame;
 }
 
+static EchoFrame *frameForTicks(int lagTicks, CFTimeInterval ref, CGSize sz) {
+    EchoFrame *frame = emptyFrame();
+    NSArray<EchoSnap *> *snaps;
+    @synchronized (gSnapLock) { snaps = [gSnaps copy]; }
+    if (!snaps.count) return frame;
+    EchoSnap *newest = snaps.lastObject;
+    if (ref - newest->t > 0.6) return frame;
+    NSInteger idx = (NSInteger)snaps.count - 1 - lagTicks;
+    if (idx < 0) idx = 0;
+    EchoSnap *S = snaps[(NSUInteger)idx];
+    renderSnap(frame, S, S, 1.0, sz);
+    return frame;
+}
+
 static CFTimeInterval gMetalLastDraw = 0;
 
 static void drawTick(CADisplayLink *link) {
@@ -2422,7 +2436,6 @@ static int buildVerts(EchoFrame *f, CGSize sz, EVert *out) {
     return c.n;
 }
 
-static const double kLagFrames[7] = { 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 };
 
 static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     id<MTLTexture> tex = dr.texture;
@@ -2431,9 +2444,8 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     CGSize sz = gScreenSz;
     if (sz.width < 10 || sz.height < 10) return;
     CFTimeInterval now = CACurrentMediaTime();
-    int li = gOptDelay < 0 ? 0 : (gOptDelay > 6 ? 6 : gOptDelay);
-    double T = now - kLagFrames[li] * gFrameDt;
-    EchoFrame *f = frameForTime(T, now, sz);
+    int li = gOptDelay < 0 ? 0 : (gOptDelay > 3 ? 3 : gOptDelay);
+    EchoFrame *f = frameForTicks(li, now, sz);
     gMBufIdx = (gMBufIdx + 1) % kRing;
     id<MTLBuffer> buf = gMBufs[gMBufIdx];
     int n = buildVerts(f, sz, (EVert *)buf.contents);
@@ -2453,7 +2465,7 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     [enc endEncoding];
     gMDraws++;
     if (gMDraws == 1 || gMDraws % 600 == 0)
-        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %.1f frames dt %.1fms sawPresentSel %d", gMDraws, n, (int)f.tags.count, kLagFrames[li], gFrameDt * 1000.0, (int)gSawPresentSel]);
+        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %d ticks dt %.1fms sawPresentSel %d", gMDraws, n, (int)f.tags.count, li, gFrameDt * 1000.0, (int)gSawPresentSel]);
 }
 
 static void metalMark(id cb, id drawable) {
@@ -2687,7 +2699,7 @@ static void saveOptions(void) {
     [d setFloat:gOptDmgMul forKey:@"echo.dmgmul"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
-    [d setInteger:gOptDelay forKey:@"echo.lag1"];
+    [d setInteger:gOptDelay forKey:@"echo.lag2"];
 }
 
 static void loadOptions(void) {
@@ -2712,7 +2724,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.dmgmul"]) gOptDmgMul = [d floatForKey:@"echo.dmgmul"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
-    if ([d objectForKey:@"echo.lag1"]) gOptDelay = (int)[d integerForKey:@"echo.lag1"];
+    if ([d objectForKey:@"echo.lag2"]) gOptDelay = (int)[d integerForKey:@"echo.lag2"];
 }
 
 @interface EchoMenuHandler : NSObject
@@ -2873,7 +2885,7 @@ static void installMenu(void) {
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
-        addSegment(panel, &y, @"ESP lag (frames)", @[ @"0", @"0.5", @"1", @"1.5", @"2", @"2.5", @"3" ], gOptDelay, 31);
+        addSegment(panel, &y, @"ESP lag (game ticks)", @[ @"0", @"1", @"2", @"3" ], gOptDelay, 31);
 
         panel.contentSize = CGSizeMake(pw, y + 8);
         CGFloat ph = MIN(y + 8, ss.height - 40);
