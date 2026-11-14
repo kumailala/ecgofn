@@ -3785,13 +3785,18 @@ static void engineEspFrame(void *cv) {
                     double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + (cannon ? 120.0 : 220.0);
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.35) {
-                        uintptr_t mroot = rd_ptr(mover + (uintptr_t)O_ACTOR_ROOT);
-                        if (mroot > 0x100000000ULL && O_SCENE_RELLOC >= 0) {
+                        void **mvt = (void **)rd_ptr(mover);
+                        uintptr_t fTp = mvt ? rd_ptr((uintptr_t)&mvt[181]) : 0;
+                        if (fTp >= gImgBase && fTp < gImgEnd) {
                             DV3 np = { wantX, wantY, wantZ };
-                            memcpy((void *)(mroot + (uintptr_t)O_SCENE_RELLOC), &np, sizeof np);
+                            DV3 nr = { 0.0, atan2(chest.y - wantY, chest.x - wantX) * 180.0 / M_PI, 0.0 };
+                            BOOL tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
                             cfTp = now;
                             static int tpN = 0;
-                            if (++tpN <= 8 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: teleported %@ #%d to chest (%.0f, %.0f, %.0f)", cannon ? @"cannon" : @"pawn", tpN, wantX, wantY, wantZ]);
+                            if (++tpN <= 8 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: TeleportTo %@ #%d ok=%d to chest (%.0f, %.0f, %.0f)", cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ]);
+                        } else {
+                            static BOOL warnedTp = NO;
+                            if (!warnedTp) { warnedTp = YES; metalNote(@"farm: TeleportTo virtual not found"); }
                         }
                     }
                     double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
