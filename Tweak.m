@@ -3745,11 +3745,12 @@ static void engineEspFrame(void *cv) {
         BOOL farmOn = (gOptCannonFarm || now < manualUntil) && gOptChest;
         static uintptr_t farmHomeActor = 0;
         static DV3 farmHome = {0, 0, 0};
+        static double farmYaw = 0.0;
         gFarmActiveNow = farmOn;
         if (!farmOn && farmHomeActor) {
             uintptr_t fSR = SYM(0x100d0b050);
             if (fSR >= gImgBase && fSR < gImgEnd && rd_ptr(farmHomeActor + (uintptr_t)gOffClass) > 0x100000000ULL) {
-                ((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)farmHomeActor, NO, NULL, YES, farmHome.x, farmHome.y, farmHome.z + 150.0, 0.0, rot.y, 0.0);
+                ((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)farmHomeActor, NO, NULL, YES, farmHome.x, farmHome.y, farmHome.z + 150.0, 0.0, farmYaw, 0.0);
                 metalNote(@"farm: stopped, cannon returned to its start position");
             }
             farmHomeActor = 0;
@@ -3776,7 +3777,7 @@ static void engineEspFrame(void *cv) {
             if (cannon) mp = (DV3){ cannon.x, cannon.y, cannon.z };
             else if (!actorLocation(lp, &mp)) mp = cam;
             if (cannon) { DV3 fresh; if (actorLocation(cannon.actor, &fresh)) mp = fresh; }
-            if (cannon && farmHomeActor != cannon.actor) { farmHomeActor = cannon.actor; farmHome = mp; }
+            if (cannon && farmHomeActor != cannon.actor) { farmHomeActor = cannon.actor; farmHome = mp; farmYaw = rot.y; }
             double bd = 1e30;
             for (EchoLoot *lo in lootNow) {
                 if (lo.tier != -2) continue;
@@ -3817,16 +3818,14 @@ static void engineEspFrame(void *cv) {
                         }
                     }
                     static const double kShift[5][2] = { {0, 0}, {120, 0}, {-120, 0}, {0, 120}, {0, -120} };
-                    int shiftIdx = cannon ? (int)((now - cfSince) / 0.3) % 5 : 0;
+                    int shiftIdx = cannon ? (int)((now - cfSince) / 1.0) % 5 : 0;
+                    int zPhase = cannon ? ((int)((now - cfSince) / 0.4) & 1) : 0;
+                    double useYaw = cannon ? farmYaw : rot.y;
                     double wantX = cannon ? chest.x + kShift[shiftIdx][0] : chest.x - 700.0;
                     double wantY = cannon ? chest.y + kShift[shiftIdx][1] : chest.y;
-                    double wantZ = cannon ? chest.z + 40.0 + ((ramFlip & 1) ? 45.0 : -5.0) : chest.z + 220.0;
-                    if (cannon) {
-                        double sx2 = mp.x - wantX, sy2 = mp.y - wantY, sz2 = mp.z - wantZ;
-                        if (sqrt(sx2 * sx2 + sy2 * sy2 + sz2 * sz2) > 1500.0 && now - cfSince > 0.8) wantZ += 600.0;
-                    }
+                    double wantZ = cannon ? chest.z + (zPhase ? 90.0 : 40.0) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
-                    if ((cannon || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > 0.03) {
+                    if (cannon || (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
                         static int tpChain = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
@@ -3849,7 +3848,7 @@ static void engineEspFrame(void *cv) {
                             }
                         }
                         DV3 np = { wantX, wantY, wantZ };
-                        DV3 nr = { 0.0, atan2(chest.y - wantY, chest.x - wantX) * 180.0 / M_PI, 0.0 };
+                        DV3 nr = { 0.0, cannon ? useYaw : atan2(chest.y - wantY, chest.x - wantX) * 180.0 / M_PI, 0.0 };
                         BOOL tpOk = NO;
                         void **mvt = (void **)rd_ptr(mover);
                         uintptr_t fSet = SYM(0x100d0b77c);
@@ -3860,7 +3859,7 @@ static void engineEspFrame(void *cv) {
                         if (useMethod == 7) {
                             uintptr_t fSR = SYM(0x100d0b050);
                             if (fSR >= gImgBase && fSR < gImgEnd)
-                                tpOk = (((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)mover, NO, NULL, YES, wantX, wantY, wantZ, 0.0, rot.y, 0.0) & 1) != 0;
+                                tpOk = (((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)mover, NO, NULL, YES, wantX, wantY, wantZ, 0.0, useYaw, 0.0) & 1) != 0;
                         }
                         if (useMethod == 0 || useMethod == 5) {
                             if (tpFn) tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
@@ -3883,6 +3882,8 @@ static void engineEspFrame(void *cv) {
                                 tpOk = YES;
                             }
                         }
+                        if (cannon && setOk && useMethod != 2 && useMethod != 5)
+                            ((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 2);
                         tpLastWant = np; tpHaveLast = YES;
                         cfTp = now;
                         if (++tpN <= 6 || tpN % 100 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[useMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
