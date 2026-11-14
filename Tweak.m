@@ -3270,7 +3270,7 @@ static void engineEspFrame(void *cv) {
     double fovRad = fov * M_PI / 180.0;
     double ppd = sx / ((2.0 * tan(0.5 * fovRad)) * 180.0 / M_PI);
     double fovDeg = gOptFov * 60.0;
-    double dzDeg = fovDeg * 0.2;
+    double dzDeg = fmin(0.6, fovDeg * 0.05);
     double smoothS = 1.0 + gOptSmooth * 8.0;
     static CFTimeInterval lastT = 0;
     double elapsed = lastT > 0 ? now - lastT : 1.0 / 60.0;
@@ -3442,7 +3442,8 @@ static void engineEspFrame(void *cv) {
 
     if (useTarget) gAimTargetFrames++;
     static double aimSign = 1.0, lastRP = 0, lastRY = 0, lastNP = 0, lastNY = 0;
-    static int negC = 0, weakC = 0;
+    static double accNom = 0, accObs = 0;
+    static int accN = 0, weakWin = 0;
     static BOOL directMode = NO, lastApplied = NO;
     BOOL appliedNow = NO;
     if (useTarget && targeting && looks_like_uobject(pc)) {
@@ -3451,28 +3452,34 @@ static void engineEspFrame(void *cv) {
             double obsP = wrap180(rot.x - lastRP), obsY = wrap180(rot.y - lastRY);
             BOOL useYaw = fabs(lastNY) > fabs(lastNP);
             double nomV = useYaw ? lastNY : lastNP, obsV = useYaw ? obsY : obsP;
-            if (fabs(nomV) > 0.4) {
-                double ratio = obsV / nomV;
-                if (ratio < -0.25) {
-                    if (++negC >= 4) { aimSign = -aimSign; negC = 0; metalNote(@"aim: response was inverted, flipped input sign"); }
-                } else negC = 0;
-                if (fabs(ratio) < 0.12) {
-                    if (++weakC >= 30 && !directMode) { directMode = YES; metalNote(@"aim: input path had no effect, writing ControlRotation directly"); }
-                } else weakC = 0;
+            if (!directMode && fabs(nomV) > 0.3) {
+                accNom += fabs(nomV);
+                accObs += obsV * (nomV > 0 ? 1.0 : -1.0);
+                if (++accN >= 40) {
+                    double ratio = accObs / accNom;
+                    if (ratio < -0.25) {
+                        aimSign = -aimSign; weakWin = 0;
+                        metalNote(@"aim: response was inverted, flipped input sign");
+                    } else if (ratio < 0.12) {
+                        if (++weakWin >= 2) { directMode = YES; metalNote(@"aim: input path had no effect, writing ControlRotation directly"); }
+                    } else weakWin = 0;
+                    accNom = accObs = 0; accN = 0;
+                }
             }
         }
         if (!inDead) {
             double dP = wrap180(aP - wrap180(rot.x)), dY = wrap180(aY - wrap180(rot.y));
-            dP /= effSmooth; dY /= effSmooth;
-            lastRP = rot.x; lastRY = rot.y; lastNP = dP; lastNY = dY;
             if (directMode && O_CTRL_ROT >= 0) {
                 DV3 cur;
                 if (safe_read(pc + (uintptr_t)O_CTRL_ROT, &cur, sizeof cur) && sane_dv(cur)) {
-                    DV3 nr = { cur.x + dP, cur.y + dY, cur.z };
+                    double cP = wrap180(aP - wrap180(cur.x)) / effSmooth, cY = wrap180(aY - wrap180(cur.y)) / effSmooth;
+                    DV3 nr = { cur.x + cP, cur.y + cY, cur.z };
                     memcpy((void *)(pc + (uintptr_t)O_CTRL_ROT), &nr, sizeof nr);
                     appliedNow = YES; gAimApplied++; gDiagLock = YES;
                 }
             } else {
+                dP /= effSmooth; dY /= effSmooth;
+                lastRP = rot.x; lastRY = rot.y; lastNP = dP; lastNY = dY;
                 float yawScale = 0, pitchScale = 0;
                 safe_read(pc + 0x4c0, &yawScale, 4);
                 safe_read(pc + 0x4c4, &pitchScale, 4);
