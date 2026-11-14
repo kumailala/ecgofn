@@ -3742,6 +3742,16 @@ static void engineEspFrame(void *cv) {
             metalNote(@"farm: button pressed");
         }
         BOOL farmOn = (gOptCannonFarm || now < manualUntil) && gOptChest;
+        static uintptr_t farmHomeActor = 0;
+        static DV3 farmHome = {0, 0, 0};
+        if (!farmOn && farmHomeActor) {
+            uintptr_t fSR = SYM(0x100d0b050);
+            if (fSR >= gImgBase && fSR < gImgEnd && rd_ptr(farmHomeActor + (uintptr_t)gOffClass) > 0x100000000ULL) {
+                ((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)farmHomeActor, NO, NULL, YES, farmHome.x, farmHome.y, farmHome.z + 150.0, 0.0, rot.y, 0.0);
+                metalNote(@"farm: stopped, cannon returned to its start position");
+            }
+            farmHomeActor = 0;
+        }
         if (farmOn && lp && looks_like_uobject(pc)) {
             NSArray<EchoLoot *> *lootNow = gLoot;
             EchoLoot *cannon = nil, *chest = nil;
@@ -3764,6 +3774,7 @@ static void engineEspFrame(void *cv) {
             if (cannon) mp = (DV3){ cannon.x, cannon.y, cannon.z };
             else if (!actorLocation(lp, &mp)) mp = cam;
             if (cannon) { DV3 fresh; if (actorLocation(cannon.actor, &fresh)) mp = fresh; }
+            if (cannon && farmHomeActor != cannon.actor) { farmHomeActor = cannon.actor; farmHome = mp; }
             double bd = 1e30;
             for (EchoLoot *lo in lootNow) {
                 if (lo.tier != -2) continue;
@@ -3792,19 +3803,22 @@ static void engineEspFrame(void *cv) {
                     double wantZ = cannon ? chest.z + 40.0 + ((ramFlip & 1) ? 45.0 : -5.0) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if ((cannon || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > 0.03) {
-                        static int tpMethod = 1, tpFail = 0, tpN = 0;
+                        static int tpChain = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
-                        static const char *kTpNames[7] = { "TeleportTo", "SetActorLocation(physics)", "SetActorLocation(reset physics)", "SetActorLocation(sweep)", "AddActorWorldOffset", "TeleportTo+SetActorLocation", "LaunchCharacter" };
-                        int useMethod = (gFarmMethodSel >= 0 && gFarmMethodSel < 7) ? gFarmMethodSel : tpMethod;
+                        static const char *kTpNames[8] = { "TeleportTo", "SetActorLocation(physics)", "SetActorLocation(reset physics)", "SetActorLocation(sweep)", "AddActorWorldOffset", "TeleportTo+SetActorLocation", "LaunchCharacter", "SetActorLocation+Rotation(upright)" };
+                        static const int kChainCannon[6] = { 7, 1, 2, 3, 0, 4 };
+                        static const int kChainPawn[3] = { 7, 1, 6 };
+                        int autoMethod = cannon ? kChainCannon[tpChain % 6] : kChainPawn[tpChain % 3];
+                        int useMethod = (gFarmMethodSel >= 0 && gFarmMethodSel < 8) ? gFarmMethodSel : autoMethod;
                         if (tpHaveLast && gFarmMethodSel < 0) {
                             double lx = tpLastWant.x - mp.x, ly = tpLastWant.y - mp.y, lz = tpLastWant.z - mp.z;
                             if (sqrt(lx * lx + ly * ly + lz * lz) > 400.0) {
                                 if (++tpFail >= 60) {
                                     tpFail = 0;
-                                    tpMethod = (tpMethod + 1) % (cannon ? 5 : 7);
-                                    if (!cannon && tpMethod == 5) tpMethod = 6;
-                                    metalNote([NSString stringWithFormat:@"farm: no movement, switching to %s", kTpNames[tpMethod]]);
+                                    tpChain++;
+                                    useMethod = cannon ? kChainCannon[tpChain % 6] : kChainPawn[tpChain % 3];
+                                    metalNote([NSString stringWithFormat:@"farm: no movement, switching to %s", kTpNames[useMethod]]);
                                 }
                             } else if (tpFail) {
                                 tpFail = 0;
@@ -3819,6 +3833,11 @@ static void engineEspFrame(void *cv) {
                         BOOL setOk = (fSet >= gImgBase && fSet < gImgEnd);
                         uintptr_t fTp = mvt ? rd_ptr((uintptr_t)&mvt[181]) : 0;
                         BOOL tpFn = (fTp >= gImgBase && fTp < gImgEnd);
+                        if (useMethod == 7) {
+                            uintptr_t fSR = SYM(0x100d0b050);
+                            if (fSR >= gImgBase && fSR < gImgEnd)
+                                tpOk = (((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)mover, NO, NULL, YES, wantX, wantY, wantZ, 0.0, rot.y, 0.0) & 1) != 0;
+                        }
                         if (useMethod == 0 || useMethod == 5) {
                             if (tpFn) tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
                         }
@@ -4317,6 +4336,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
         addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
+        addButtonTag(panel, &y, @"TP + break chest: SetActorLocation + rotation (upright)", @selector(farmMethod:), 107);
         addButtonTag(panel, &y, @"TP + break chest: TeleportTo", @selector(farmMethod:), 100);
         addButtonTag(panel, &y, @"TP + break chest: SetActorLocation (physics)", @selector(farmMethod:), 101);
         addButtonTag(panel, &y, @"TP + break chest: SetActorLocation (reset physics)", @selector(farmMethod:), 102);
