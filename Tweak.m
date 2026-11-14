@@ -3777,14 +3777,17 @@ static void engineEspFrame(void *cv) {
             if (chest) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) { cfKey = key; cfSince = now; }
-                if (now - cfSince > 7.0) {
+                if (now - cfSince > (cannon ? 4.0 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
                     metalNote(@"farm: skipping a chest after 7 s");
                 } else {
-                    double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + (cannon ? 120.0 : 220.0);
+                    static int ramFlip = 0;
+                    ramFlip++;
+                    double wantX = cannon ? chest.x : chest.x - 700.0, wantY = chest.y;
+                    double wantZ = cannon ? chest.z + 40.0 + ((ramFlip & 1) ? 45.0 : -5.0) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
-                    if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03) {
+                    if ((cannon || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > 0.03) {
                         static int tpMethod = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
@@ -3824,6 +3827,7 @@ static void engineEspFrame(void *cv) {
                         cfTp = now;
                         if (++tpN <= 6 || tpN % 100 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[tpMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
                     }
+                    if (!cannon) {
                     double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
                     double fy = atan2(tdy, tdx) * 180.0 / M_PI;
                     double fp = atan2(tdz, sqrt(tdx * tdx + tdy * tdy)) * 180.0 / M_PI;
@@ -3846,6 +3850,7 @@ static void engineEspFrame(void *cv) {
                             ((void (*)(void *, uint8_t))fStop)((void *)lp, 0);
                             cfFire = now;
                         }
+                    }
                     }
                 }
             }
