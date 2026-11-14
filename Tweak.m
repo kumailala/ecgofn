@@ -1334,7 +1334,7 @@ static const char *kBoneNames[24] = {
     "thigh_r", "calf_r", "foot_r", NULL, NULL
 };
 #define kMaxSel 24
-#define kMaxBones 700
+#define kMaxBones 1600
 
 @interface EchoBoneMap : NSObject {
 @public
@@ -1402,19 +1402,58 @@ static void publishPawns(NSArray<EchoPawn *> *list, uintptr_t pc, uintptr_t loca
 
 static int gRefBonesOff = -1;
 
+static void metalNote(NSString *s);
+static int gRefStride = 0;
+static int gBmFail[4];
+
 static BOOL refBonesAt(uintptr_t asset, int off, uintptr_t *data, int32_t *n) {
     uintptr_t a = rd_ptr(asset + (uintptr_t)off);
     int32_t c = rd_i32(asset + (uintptr_t)off + 8), m = rd_i32(asset + (uintptr_t)off + 12);
-    if (a < 0x100000000ULL || (a & 7) || c < 20 || c > kMaxBones || m < c || m > c * 4 + 64) return NO;
-    int32_t info[16 * 4];
-    if (!safe_read(a, info, sizeof info)) return NO;
-    if (info[2] != -1) return NO;
-    for (int i = 0; i < 16; i++) {
-        if (!fname_string(info[i * 4])) return NO;
-        if (i > 0 && (info[i * 4 + 2] < 0 || info[i * 4 + 2] >= i)) return NO;
+    if (a < 0x100000000ULL || (a & 3) || c < 20 || c > kMaxBones || m < c || m > c * 4 + 64) return NO;
+    static const int strides[] = { 12, 16, 20, 24, 28, 32, 36, 40 };
+    for (int si = 0; si < 8; si++) {
+        int st = gRefStride ? gRefStride : strides[si];
+        uint8_t raw[40 * 16];
+        if (safe_read(a, raw, (size_t)st * 16)) {
+            BOOL good = YES;
+            for (int i = 0; i < 16 && good; i++) {
+                int32_t nm, par;
+                memcpy(&nm, raw + (size_t)i * (size_t)st, 4);
+                memcpy(&par, raw + (size_t)i * (size_t)st + 8, 4);
+                if (i == 0 && par != -1) good = NO;
+                else if (i > 0 && (par < 0 || par >= i)) good = NO;
+                else if (!fname_string(nm)) good = NO;
+            }
+            if (good) {
+                if (!gRefStride) metalNote([NSString stringWithFormat:@"bones: reference skeleton at asset+0x%x, %d bones, entry stride %d", off, c, st]);
+                gRefStride = st;
+                *data = a; *n = c;
+                return YES;
+            }
+        }
+        if (gRefStride) break;
     }
-    *data = a; *n = c;
-    return YES;
+    return NO;
+}
+
+static void bonesDiag(uintptr_t asset) {
+    static int logged = 0;
+    if (logged >= 2) return;
+    logged++;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"bones: no reference skeleton found in asset %p (class %@)", (void *)asset, fname_string(fnidx(rd_ptr(asset + (uintptr_t)gOffClass) + (uintptr_t)gOffName)) ?: @"?"];
+    int shown = 0;
+    for (int off = 0x30; off < 0x600 && shown < 8; off += 8) {
+        uintptr_t a = rd_ptr(asset + (uintptr_t)off);
+        int32_t c = rd_i32(asset + (uintptr_t)off + 8), mx = rd_i32(asset + (uintptr_t)off + 12);
+        if (a < 0x100000000ULL || c < 8 || c > 5000 || mx < c) continue;
+        uint8_t raw[48];
+        if (!safe_read(a, raw, sizeof raw)) continue;
+        NSMutableString *h = [NSMutableString string];
+        for (int i = 0; i < 48; i++) [h appendFormat:@"%02x", raw[i]];
+        [m appendFormat:@"\n  +0x%x count %d max %d data %@", off, c, mx, h];
+        shown++;
+    }
+    metalNote(m);
 }
 
 static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
@@ -1433,12 +1472,23 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
             if (refBonesAt(asset, off, &refData, &N)) { gRefBonesOff = off; ok = YES; RLOG(@"bones: RefSkeleton array at asset+0x%x (%d bones)", off, N); }
         }
     }
+    if (!ok) { gBmFail[0]++; bonesDiag(asset); }
     EchoBoneMap *m = [[EchoBoneMap alloc] init];
     m->n = 0; m->head = -1; m->neck = -1; m->pelvis = -1; m->boneCount = N; m->parent = NULL;
     for (int k = 0; k < 16; k++) m->rIdx[k] = -1;
     if (ok) {
-        int32_t *info = (int32_t *)malloc((size_t)N * 16);
-        if (info && safe_read(refData, info, (size_t)N * 16)) {
+        int32_t *info = (int32_t *)calloc((size_t)N * 4, sizeof(int32_t));
+        uint8_t *rawb = (uint8_t *)malloc((size_t)N * (size_t)(gRefStride ? gRefStride : 16));
+        BOOL rd = NO;
+        if (info && rawb && gRefStride && safe_read(refData, rawb, (size_t)N * (size_t)gRefStride)) {
+            for (int q = 0; q < N; q++) {
+                memcpy(&info[q * 4], rawb + (size_t)q * (size_t)gRefStride, 4);
+                memcpy(&info[q * 4 + 2], rawb + (size_t)q * (size_t)gRefStride + 8, 4);
+            }
+            rd = YES;
+        }
+        free(rawb);
+        if (rd) {
             int selBone[kMaxSel];
             int rFallL = -1, rFallR = -1;
             for (int k = 0; k < kMaxSel; k++) selBone[k] = -1;
@@ -1478,6 +1528,14 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
                 }
             }
             m->n = count;
+            if (count == 0) {
+                static int lg = 0;
+                if (lg++ < 2) {
+                    NSMutableString *q = [NSMutableString stringWithFormat:@"bones: none of the wanted bones matched; first names of %d:", N];
+                    for (int i = 0; i < N && i < 40; i++) { NSString *nm = fname_string(info[i * 4]); [q appendFormat:@" %@", nm ?: @"?"]; }
+                    metalNote(q);
+                }
+            }
         }
         free(info);
     }
