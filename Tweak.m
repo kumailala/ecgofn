@@ -1813,7 +1813,7 @@ static BOOL findSkelArray(uintptr_t mesh, EchoBoneMap *bm, uintptr_t *arr, int32
         if (!skelArrayAt(mesh, off, bc, &a, &c)) continue;
         found++;
         BOOL dir = NO;
-        int hi = bm->head;
+        int hi = (bm->head >= 0) ? bm->idx[bm->head] : -1;
         if (hi >= 0 && hi < c) {
             DXf hx;
             if (safe_read(a + (uintptr_t)hi * sizeof(DXf), &hx, sizeof hx)) dir = fabs(hx.t[2]) > 60.0;
@@ -3086,21 +3086,23 @@ static void vpProbe(void *cv, DV3 cam, DV3 rot, float fov) {
 
 typedef struct { DV3 w[16]; } RaaxBones;
 
+static int gRbFail[8];
+static int gRbOk = 0;
 static BOOL raaxBones(EchoPawn *ep, RaaxBones *out) {
-    if (!ep.bones || !ep.bones->parent || O_CHAR_MESH < 0) return NO;
+    if (!ep.bones || !ep.bones->parent || O_CHAR_MESH < 0) { gRbFail[0]++; return NO; }
     uintptr_t mesh = rd_ptr(ep.pawn + (uintptr_t)O_CHAR_MESH);
-    if (mesh < 0x100000000ULL) return NO;
+    if (mesh < 0x100000000ULL) { gRbFail[1]++; return NO; }
     DV3 center;
-    if (!actorLocation(ep.pawn, &center)) return NO;
+    if (!actorLocation(ep.pawn, &center)) { gRbFail[2]++; return NO; }
     DXf c2w;
-    if (!readC2W(mesh, center, &c2w)) return NO;
+    if (!readC2W(mesh, center, &c2w)) { gRbFail[3]++; return NO; }
     uintptr_t arr = 0;
     int32_t bn = 0;
     BOOL direct = NO;
     findSkelArray(mesh, ep.bones, &arr, &bn, &direct);
     if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
-    if (arr < 0x100000000ULL || bn <= 20 || bn > kMaxBones) return NO;
-    if (!safe_read(arr, gLocalBones, (size_t)bn * sizeof(DXf)) || !looks_like_xform(&gLocalBones[0])) return NO;
+    if (arr < 0x100000000ULL || bn <= 20 || bn > kMaxBones) { gRbFail[4]++; return NO; }
+    if (!safe_read(arr, gLocalBones, (size_t)bn * sizeof(DXf)) || !looks_like_xform(&gLocalBones[0])) { gRbFail[5]++; return NO; }
     static DXf comp[kMaxBones];
     for (int i = 0; i < bn; i++) {
         const DXf *l = &gLocalBones[i];
@@ -3124,13 +3126,19 @@ static BOOL raaxBones(EchoPawn *ep, RaaxBones *out) {
     }
     for (int k = 0; k < 15; k++) {
         int bi = ep.bones->rIdx[k];
-        if (bi < 0 || bi >= bn) return NO;
+        if (bi < 0 || bi >= bn) {
+            gRbFail[6]++;
+            static int logged = 0;
+            if (logged < 3) { logged++; metalNote([NSString stringWithFormat:@"bones: slot %d missing/out of range (bone idx %d, array %d, skeleton %d)", k, bi, bn, ep.bones->boneCount]); }
+            return NO;
+        }
         const DXf *c = &comp[bi];
         DV3 lp = { c->t[0] * c2w.s[0], c->t[1] * c2w.s[1], c->t[2] * c2w.s[2] };
         DV3 r = qrot(c2w.q, lp);
         out->w[k] = (DV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
-        if (!sane_dv(out->w[k])) return NO;
+        if (!sane_dv(out->w[k])) { gRbFail[7]++; return NO; }
     }
+    gRbOk++;
     out->w[15] = (DV3){ (out->w[3].x + out->w[6].x) * 0.5, (out->w[3].y + out->w[6].y) * 0.5, (out->w[3].z + out->w[6].z) * 0.5 };
     return YES;
 }
@@ -3430,7 +3438,7 @@ static void h_DrawTransition(void *self, void *canvas) {
         }
         gDTFrames++;
         if (gDTFrames == 1 || gDTFrames % 900 == 0)
-            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p players drawn %d aim target frames %d applied %d vp %d ads %d (flag %d) fov %.1f base %.1f", gDTFrames, canvas, gDrawnPlayers, gAimTargetFrames, gAimApplied, gVPOff, gDbgAds, gDbgAdsFlag, gDbgFov, gDbgBase]);
+            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p players drawn %d aim target frames %d applied %d vp %d ads %d (flag %d) fov %.1f base %.1f | bones ok %d fail nobones %d nomesh %d noloc %d c2w %d skel %d xform %d slot %d sane %d | skelOff %d direct %d", gDTFrames, canvas, gDrawnPlayers, gAimTargetFrames, gAimApplied, gVPOff, gDbgAds, gDbgAdsFlag, gDbgFov, gDbgBase, gRbOk, gRbFail[0], gRbFail[1], gRbFail[2], gRbFail[3], gRbFail[4], gRbFail[5], gRbFail[6], gRbFail[7], gSkelOff, (int)gSkelDirect]);
     } else if (++gDTBad > 40 && gDTSlot) {
         *gDTSlot = (void *)gDTOrig;
         gDTSlot = NULL;
