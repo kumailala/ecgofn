@@ -1464,7 +1464,7 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
     if (!looks_like_uobject(asset)) return nil;
     NSNumber *key = @(asset);
     EchoBoneMap *cached = gBoneCache[key];
-    if (cached) return cached->n > 0 ? cached : nil;
+    if (cached) return (cached->n > 0 || cached->rIdx[0] >= 0) ? cached : nil;
 
     uintptr_t refData = 0; int32_t N = 0;
     BOOL ok = NO;
@@ -1515,6 +1515,8 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
             }
             if (m->rIdx[11] < 0) m->rIdx[11] = rFallL;
             if (m->rIdx[14] < 0) m->rIdx[14] = rFallR;
+            if (m->rIdx[11] < 0) m->rIdx[11] = m->rIdx[10];
+            if (m->rIdx[14] < 0) m->rIdx[14] = m->rIdx[13];
             m->parent = (int *)malloc((size_t)N * sizeof(int));
             for (int i = 0; i < N; i++) m->parent[i] = info[i * 4 + 2];
             int count = 0;
@@ -1549,7 +1551,7 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
         free(info);
     }
     gBoneCache[key] = m;
-    return m->n > 0 ? m : nil;
+    return (m->n > 0 || m->rIdx[0] >= 0) ? m : nil;
 }
 
 #pragma mark 5.6 scan thread
