@@ -933,11 +933,7 @@ static void dumpSdk(uintptr_t classClass) {
     for (int32_t i = 0; i < gSnapN && !scriptStruct; i++) {
         if (gSnapObj[i] && gSnapCls[i] == classClass && name_is(rd_i32(gSnapObj[i] + (uintptr_t)gOffName), "ScriptStruct")) scriptStruct = gSnapObj[i];
     }
-    fprintf(f, "# Fortnite 43.10 SDK dump by EchoMod43
-# image slide %lx, GUObjectArray image+0x%llx
-# offsets: ClassPrivate obj+0x%x Name obj+0x%x Outer obj+0x%x; SuperStruct +0x%x ChildProperties +0x%x FField Next +0x%x Name +0x%x; Offset_Internal +0x%x
-
-",
+    fprintf(f, "# Fortnite 43.10 SDK dump by EchoMod43\n# image slide %lx, GUObjectArray image+0x%llx\n# offsets: ClassPrivate obj+0x%x Name obj+0x%x Outer obj+0x%x; SuperStruct +0x%x ChildProperties +0x%x FField Next +0x%x Name +0x%x; Offset_Internal +0x%x\n\n",
             (long)gSlide, (unsigned long long)A_GUOBJECTARRAY, gOffClass, gOffName, gOffOuter, OFF_SUPER, OFF_CHILD, OFF_FNEXT, OFF_FNAME, OFF_POFF);
     int structs = 0, props = 0;
     for (int32_t i = 0; i < gSnapN; i++) {
@@ -953,8 +949,7 @@ static void dumpSdk(uintptr_t classClass) {
         if (looks_like_uobject(su)) fname_read(rd_i32(su + (uintptr_t)gOffName), sup, sizeof sup);
         uintptr_t ou = rd_ptr(o + (uintptr_t)gOffOuter);
         if (looks_like_uobject(ou)) fname_read(rd_i32(ou + (uintptr_t)gOffName), pk, sizeof pk);
-        fprintf(f, "%s %s%s%s : %s // size 0x%x obj %lx
-", isClass ? "class" : "struct", pk, pk[0] ? "." : "", nm, sup[0] ? sup : "-",
+        fprintf(f, "%s %s%s%s : %s // size 0x%x obj %lx\n", isClass ? "class" : "struct", pk, pk[0] ? "." : "", nm, sup[0] ? sup : "-",
                 rd_i32(o + (uintptr_t)OFF_CHILD + 8), (unsigned long)(o - gSlide));
         structs++;
         uintptr_t p = rd_ptr(o + (uintptr_t)OFF_CHILD);
@@ -964,16 +959,13 @@ static void dumpSdk(uintptr_t classClass) {
             tn[0] = 0;
             uintptr_t fc = rd_ptr(p + 0x8);
             if (fc >= 0x100000000ULL) fname_read(rd_i32(fc), tn, sizeof tn);
-            fprintf(f, "  +0x%04x %-28s %s[%d] size %d
-", rd_i32(p + (uintptr_t)OFF_POFF), pn, tn[0] ? tn : "?", rd_i32(p + 0x38), rd_i32(p + 0x3C));
+            fprintf(f, "  +0x%04x %-28s %s[%d] size %d\n", rd_i32(p + (uintptr_t)OFF_POFF), pn, tn[0] ? tn : "?", rd_i32(p + 0x38), rd_i32(p + 0x3C));
             props++;
             p = rd_ptr(p + (uintptr_t)OFF_FNEXT);
         }
-        fprintf(f, "
-");
+        fprintf(f, "\n");
     }
-    fprintf(f, "# %d structs/classes, %d properties
-", structs, props);
+    fprintf(f, "# %d structs/classes, %d properties\n", structs, props);
     fclose(f);
     RLOG(@"sdk dump: %d structs, %d properties -> EchoMod43_sdk.txt", structs, props);
 }
