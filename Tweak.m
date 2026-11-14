@@ -36,6 +36,7 @@
 #import <mach-o/loader.h>
 #include <mach/mach.h>
 #include <dlfcn.h>
+#include <strings.h>
 #include <stdatomic.h>
 #include <math.h>
 
@@ -1052,6 +1053,21 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
     if (!f) return NO;
     int32_t o = rd_i32(f + (uintptr_t)OFF_POFF);
     if (o < 0 || o > 0x100000) return NO;
+    {
+        uintptr_t owner = 0;
+        findProp(cls, prop, &owner);
+        if (owner) {
+            int rank = 0, hits = 0;
+            uintptr_t q = rd_ptr(owner + (uintptr_t)OFF_CHILD);
+            for (int n = 0; q && n < 4000; n++) {
+                int32_t qo = rd_i32(q + (uintptr_t)OFF_POFF);
+                if (fieldNameIs(q, prop)) { hits = 1; break; }
+                if (qo == o) rank++; else rank = 0;
+                q = rd_ptr(q + (uintptr_t)OFF_FNEXT);
+            }
+            if (hits && rank < 8) { *off = o; *mask = (uint8_t)(1u << rank); RLOG(@"reflect: bool %s inferred offset 0x%x mask 0x%x", prop, o, 1u << rank); return YES; }
+        }
+    }
     uint8_t m = rd_u8(f + (uintptr_t)(0x7A + gPropShift)), fm = rd_u8(f + (uintptr_t)(0x7B + gPropShift)), bo = rd_u8(f + (uintptr_t)(0x79 + gPropShift));
     if (m == 0 || (m & (m - 1))) m = fm;
     if (rd_u8(f + (uintptr_t)(0x78 + gPropShift)) == 1 && m != 0 && !(m & (m - 1))) {
@@ -1228,7 +1244,7 @@ static BOOL resolveAll(void) {
         char nb[96];
         if (!fname_read(fnidx(gSnapObj[i] + (uintptr_t)gOffName), nb, sizeof nb)) continue;
         for (int c = 1; c < C_COUNT; c++) {
-            if (!gCls[c] && !strcmp(nb, kClsNames[c])) gCls[c] = gSnapObj[i];
+            if (!gCls[c] && !strcasecmp(nb, kClsNames[c])) gCls[c] = gSnapObj[i];
         }
     }
     int missing = 0;
