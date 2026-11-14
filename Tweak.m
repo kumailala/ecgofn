@@ -371,6 +371,7 @@ static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
+static volatile int gFarmClick = 0;
 static int   gTrigFires = 0, gTrigCand = 0, gTrigLos = 0;
 static BOOL  gOptHudLayout = NO;
 static BOOL  gOptLowGfx = NO;
@@ -3725,80 +3726,96 @@ static void engineEspFrame(void *cv) {
         }
     }
 
-    if (gOptCannonFarm && gOptChest && lp && looks_like_uobject(pc)) {
-        static CFTimeInterval cfTp = 0, cfFire = 0, cfSince = 0;
+    {
+        static int lastClick = 0;
+        static CFTimeInterval manualUntil = 0, cfTp = 0, cfFire = 0, cfSince = 0, cfLog = 0, cfClear = 0;
         static double cfKey = 0;
+        static long long cfCur = 0;
         static NSMutableSet<NSNumber *> *cfSkip = nil;
         if (!cfSkip) cfSkip = [NSMutableSet set];
-        DV3 pl = cam;
-        NSArray<EchoLoot *> *lootNow = gLoot;
-        EchoLoot *cannon = nil, *chest = nil;
-        int nCannons = 0, nChests = 0;
-        double nearestCannon = 1e30;
-        {
-            double cd = 1e30, chd = 1e30;
+        if (gFarmClick != lastClick) {
+            lastClick = gFarmClick;
+            manualUntil = now + 12.0;
+            if (cfCur) [cfSkip addObject:@(cfCur)];
+            cfKey = 0; cfCur = 0;
+            metalNote(@"farm: button pressed");
+        }
+        BOOL farmOn = (gOptCannonFarm || now < manualUntil) && gOptChest;
+        if (farmOn && lp && looks_like_uobject(pc)) {
+            NSArray<EchoLoot *> *lootNow = gLoot;
+            EchoLoot *cannon = nil, *chest = nil;
+            int nCannons = 0, nChests = 0;
+            double cd = 1e30;
             for (EchoLoot *lo in lootNow) {
-                double dx = lo.x - pl.x, dy = lo.y - pl.y, dz = lo.z - pl.z;
-                double d = sqrt(dx * dx + dy * dy + dz * dz);
-                if (lo.tier == -5 && lo.actor) { nCannons++; if (d < nearestCannon) nearestCannon = d; if (d < cd) { cd = d; cannon = lo; } }
+                if (lo.tier == -5 && lo.actor) {
+                    nCannons++;
+                    double dx = lo.x - cam.x, dy = lo.y - cam.y, dz = lo.z - cam.z;
+                    double d = sqrt(dx * dx + dy * dy + dz * dz);
+                    if (d < cd) { cd = d; cannon = lo; }
+                }
                 if (lo.tier == -2) nChests++;
             }
-            if (cannon && cd < 3000.0) {
-                for (EchoLoot *lo in lootNow) {
-                    if (lo.tier != -2) continue;
-                    if ([cfSkip containsObject:@((long long)(lo.x * 0.5) ^ ((long long)(lo.y * 0.5) << 20))]) continue;
-                    double dx = lo.x - cannon.x, dy = lo.y - cannon.y, dz = lo.z - cannon.z;
-                    double d = sqrt(dx * dx + dy * dy + dz * dz);
-                    if (d < chd && d < 60000.0) { chd = d; chest = lo; }
-                }
+            if (cd > 3000.0) cannon = nil;
+            uintptr_t mover = cannon ? cannon.actor : lp;
+            DV3 mp = cam;
+            if (cannon) mp = (DV3){ cannon.x, cannon.y, cannon.z };
+            else if (!actorLocation(lp, &mp)) mp = cam;
+            double bd = 1e30;
+            for (EchoLoot *lo in lootNow) {
+                if (lo.tier != -2) continue;
+                long long sk = (long long)(lo.x * 0.5) ^ ((long long)(lo.y * 0.5) << 20);
+                if ([cfSkip containsObject:@(sk)]) continue;
+                double dx = lo.x - mp.x, dy = lo.y - mp.y, dz = lo.z - mp.z;
+                double d = sqrt(dx * dx + dy * dy + dz * dz);
+                if (d < bd && d < 80000.0) { bd = d; chest = lo; cfCur = sk; }
             }
-        }
-        static CFTimeInterval cfLog = 0;
-        if (now - cfLog > 4.0) {
-            cfLog = now;
-            metalNote([NSString stringWithFormat:@"farm: on, cannons %d (nearest %.1f m), chests %d, target %@", nCannons, nearestCannon / 100.0, nChests, (cannon && chest) ? @"yes" : @"no"]);
-        }
-        if (cannon && chest) {
-            double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
-            if (key != cfKey) { cfKey = key; cfSince = now; }
-            if (now - cfSince > 7.0) {
-                [cfSkip addObject:@((long long)(chest.x * 0.5) ^ ((long long)(chest.y * 0.5) << 20))];
-                cfKey = 0;
-                metalNote(@"farm: skipping a chest after 7 s");
-            } else {
-                double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + 120.0;
-                double ddx = wantX - cannon.x, ddy = wantY - cannon.y, ddz = wantZ - cannon.z;
-                if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.35) {
-                    uintptr_t croot = rd_ptr(cannon.actor + (uintptr_t)O_ACTOR_ROOT);
-                    if (croot > 0x100000000ULL && O_SCENE_RELLOC >= 0) {
-                        DV3 np = { wantX, wantY, wantZ };
-                        memcpy((void *)(croot + (uintptr_t)O_SCENE_RELLOC), &np, sizeof np);
-                        cfTp = now;
-                        static int tpN = 0;
-                        if (++tpN <= 5 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: teleported cannon #%d", tpN]);
+            if (!chest && cfSkip.count && now - cfClear > 3.0) { cfClear = now; [cfSkip removeAllObjects]; }
+            if (now - cfLog > 4.0) {
+                cfLog = now;
+                metalNote([NSString stringWithFormat:@"farm: on, cannons %d (nearest %.1f m), chests %d, mover %@, target %@", nCannons, cd / 100.0, nChests, cannon ? @"cannon" : @"pawn", chest ? @"yes" : @"no"]);
+            }
+            if (chest) {
+                double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
+                if (key != cfKey) { cfKey = key; cfSince = now; }
+                if (now - cfSince > 7.0) {
+                    [cfSkip addObject:@(cfCur)];
+                    cfKey = 0;
+                    metalNote(@"farm: skipping a chest after 7 s");
+                } else {
+                    double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + (cannon ? 120.0 : 220.0);
+                    double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
+                    if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.35) {
+                        uintptr_t mroot = rd_ptr(mover + (uintptr_t)O_ACTOR_ROOT);
+                        if (mroot > 0x100000000ULL && O_SCENE_RELLOC >= 0) {
+                            DV3 np = { wantX, wantY, wantZ };
+                            memcpy((void *)(mroot + (uintptr_t)O_SCENE_RELLOC), &np, sizeof np);
+                            cfTp = now;
+                            static int tpN = 0;
+                            if (++tpN <= 8 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: teleported %@ #%d to chest (%.0f, %.0f, %.0f)", cannon ? @"cannon" : @"pawn", tpN, wantX, wantY, wantZ]);
+                        }
                     }
-                }
-                double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
-                double fy = atan2(tdy, tdx) * 180.0 / M_PI;
-                double fp = atan2(tdz, sqrt(tdx * tdx + tdy * tdy)) * 180.0 / M_PI;
-                double ep = wrap180(fp - wrap180(rot.x)), ey = wrap180(fy - wrap180(rot.y));
-                float yawScale = 1.0f, pitchScale = 1.0f;
-                safe_read(pc + 0x4c0, &yawScale, 4); safe_read(pc + 0x4c4, &pitchScale, 4);
-                if (!(fabsf(yawScale) > 1e-4f) || !isfinite(yawScale)) yawScale = 1.0f;
-                if (!(fabsf(pitchScale) > 1e-4f) || !isfinite(pitchScale)) pitchScale = 1.0f;
-                void **vt = (void **)rd_ptr(pc);
-                uintptr_t fPitch = vt ? rd_ptr((uintptr_t)&vt[420]) : 0, fYaw = vt ? rd_ptr((uintptr_t)&vt[421]) : 0;
-                if (fPitch >= gImgBase && fPitch < gImgEnd && fYaw >= gImgBase && fYaw < gImgEnd) {
-                    ((void (*)(void *, float))fPitch)((void *)pc, (float)(ep / 2.0 / pitchScale));
-                    ((void (*)(void *, float))fYaw)((void *)pc, (float)(ey / 2.0 / yawScale));
-                }
-                if (fabs(ep) < 6.0 && fabs(ey) < 6.0 && now - cfFire > 0.18) {
-                    void **lvt = (void **)rd_ptr(lp);
-                    uintptr_t fStart = lvt ? rd_ptr((uintptr_t)&lvt[233]) : 0, fStop = lvt ? rd_ptr((uintptr_t)&lvt[477]) : 0;
-                    if (fStart >= gImgBase && fStart < gImgEnd && fStop >= gImgBase && fStop < gImgEnd) {
-                        ((void (*)(void *, uint8_t))fStart)((void *)lp, 0);
-                        ((void (*)(void *, uint8_t))fStop)((void *)lp, 0);
-                        cfFire = now;
+                    double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
+                    double fy = atan2(tdy, tdx) * 180.0 / M_PI;
+                    double fp = atan2(tdz, sqrt(tdx * tdx + tdy * tdy)) * 180.0 / M_PI;
+                    double ep = wrap180(fp - wrap180(rot.x)), ey = wrap180(fy - wrap180(rot.y));
+                    float yawScale = 1.0f, pitchScale = 1.0f;
+                    safe_read(pc + 0x4c0, &yawScale, 4); safe_read(pc + 0x4c4, &pitchScale, 4);
+                    if (!(fabsf(yawScale) > 1e-4f) || !isfinite(yawScale)) yawScale = 1.0f;
+                    if (!(fabsf(pitchScale) > 1e-4f) || !isfinite(pitchScale)) pitchScale = 1.0f;
+                    void **vt = (void **)rd_ptr(pc);
+                    uintptr_t fPitch = vt ? rd_ptr((uintptr_t)&vt[420]) : 0, fYaw = vt ? rd_ptr((uintptr_t)&vt[421]) : 0;
+                    if (fPitch >= gImgBase && fPitch < gImgEnd && fYaw >= gImgBase && fYaw < gImgEnd) {
+                        ((void (*)(void *, float))fPitch)((void *)pc, (float)(ep / 2.0 / pitchScale));
+                        ((void (*)(void *, float))fYaw)((void *)pc, (float)(ey / 2.0 / yawScale));
+                    }
+                    if (fabs(ep) < 6.0 && fabs(ey) < 6.0 && now - cfFire > 0.18) {
+                        void **lvt = (void **)rd_ptr(lp);
+                        uintptr_t fStart = lvt ? rd_ptr((uintptr_t)&lvt[233]) : 0, fStop = lvt ? rd_ptr((uintptr_t)&lvt[477]) : 0;
+                        if (fStart >= gImgBase && fStart < gImgEnd && fStop >= gImgBase && fStop < gImgEnd) {
+                            ((void (*)(void *, uint8_t))fStart)((void *)lp, 0);
+                            ((void (*)(void *, uint8_t))fStop)((void *)lp, 0);
+                            cfFire = now;
+                        }
                     }
                 }
             }
@@ -4056,6 +4073,10 @@ static void loadOptions(void) {
 @property (nonatomic, strong) UILabel *trigLabel;
 @end
 @implementation EchoMenuHandler
+- (void)farmClicked:(UIButton *)b {
+    gFarmClick++;
+    [b setTitle:[NSString stringWithFormat:@"Teleport to next chest  (%d)", gFarmClick] forState:UIControlStateNormal];
+}
 - (void)toggled:(UISwitch *)s {
     BOOL on = s.isOn;
     switch (s.tag) {
@@ -4128,6 +4149,18 @@ static void addSwitch(UIView *parent, CGFloat *y, NSString *title, BOOL on, NSIn
     [s addTarget:gMenuHandler action:@selector(toggled:) forControlEvents:UIControlEventValueChanged];
     [parent addSubview:s];
     *y += 34;
+}
+
+static void addButton(UIView *parent, CGFloat *y, NSString *title, SEL action) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(14, *y, parent.bounds.size.width - 28, 32);
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.backgroundColor = [UIColor colorWithRed:0.15 green:0.45 blue:0.9 alpha:0.9];
+    b.layer.cornerRadius = 8;
+    [b addTarget:gMenuHandler action:action forControlEvents:UIControlEventTouchUpInside];
+    [parent addSubview:b];
+    *y += 40;
 }
 
 static UILabel *addSlider(UIView *parent, CGFloat *y, NSString *title, float v, NSInteger tag) {
@@ -4212,7 +4245,8 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
-        addSwitch(panel, &y, @"Cannon chest-farm (sit in a cannon)", gOptCannonFarm, 35);
+        addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
+        addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
         addSegment(panel, &y, @"Loot min rarity", @[ @"Rare+", @"Epic+", @"Legendary+" ], gOptLootMin, 32);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
