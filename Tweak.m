@@ -354,7 +354,7 @@ static void showLoadedAlert(int attempt) {
 #define SYM(va) ((uintptr_t)((intptr_t)(va) + gSlide))
 
 static BOOL  gOptBoxes = YES, gOptSkeleton = YES, gOptTags = YES;
-static BOOL  gOptAimbot = YES, gOptAdsOnly = NO, gOptShowFov = YES;
+static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
 static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static BOOL  gOptHudLayout = NO;
@@ -843,7 +843,7 @@ static const char *kClsNames[C_COUNT] = {
 };
 static uintptr_t gCls[C_COUNT];
 
-static int OFF_SUPER = -1, OFF_CHILD = -1, OFF_FNEXT = -1, OFF_FNAME = -1, OFF_POFF = 0x4C;
+static int OFF_SUPER = -1, OFF_CHILD = -1, OFF_FNEXT = -1, OFF_FNAME = -1, OFF_POFF = 0x4C, gPropShift = 0;
 
 static BOOL fieldNameIs(uintptr_t f, const char *want) {
     return name_is(fnidx(f + (uintptr_t)OFF_FNAME), want);
@@ -882,7 +882,7 @@ static int structHop(uintptr_t cls, const char *outer, const char *inner) {
     if (!f) return -1;
     int32_t base = rd_i32(f + (uintptr_t)OFF_POFF);
     uintptr_t st = 0;
-    static const int stOff[] = { 0x78, 0x80, 0x70, 0x88 };
+    const int stOff[] = { 0x78 + gPropShift, 0x80 + gPropShift, 0x78, 0x80, 0x70, 0x88 };
     for (size_t k = 0; k < sizeof stOff / sizeof stOff[0]; k++) {
         uintptr_t cand = rd_ptr(f + (uintptr_t)stOff[k]);
         if (!looks_like_uobject(cand)) continue;
@@ -898,7 +898,7 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
     uintptr_t f = findProp(cls, prop, NULL);
     if (!f) return NO;
     int32_t o = rd_i32(f + (uintptr_t)OFF_POFF);
-    uint8_t m = rd_u8(f + 0x7A), fm = rd_u8(f + 0x7B), bo = rd_u8(f + 0x79);
+    uint8_t m = rd_u8(f + (uintptr_t)(0x7A + gPropShift)), fm = rd_u8(f + (uintptr_t)(0x7B + gPropShift)), bo = rd_u8(f + (uintptr_t)(0x79 + gPropShift));
     if (m == 0 || (m & (m - 1))) m = fm;
     if (m == 0 || (m & (m - 1))) return NO;
     if (o < 0 || o > 0x100000) return NO;
@@ -955,13 +955,14 @@ static BOOL probeReflection(void) {
         uintptr_t f = rd_ptr(actor + (uintptr_t)OFF_CHILD);
         int ok = 0;
         for (int n = 0; f && n < 300; n++) {
-            int32_t o = rd_i32(f + (uintptr_t)io[k]), sz = rd_i32(f + 0x3C);
+            int32_t o = rd_i32(f + (uintptr_t)io[k]), sz = rd_i32(f + (uintptr_t)io[k] - 0x10);
             if (o >= 0 && sz > 0 && sz < 0x10000 && (psz <= 0 || o + sz <= psz + 8)) ok++;
             f = rd_ptr(f + (uintptr_t)OFF_FNEXT);
         }
         if (ok > bestOk) { bestOk = ok; bestIo = io[k]; }
     }
     OFF_POFF = bestIo;
+    gPropShift = OFF_POFF - 0x4C;
     RLOG(@"reflect: Offset_Internal +0x%x (ok=%d, Actor PropertiesSize=0x%x)", OFF_POFF, bestOk, psz);
     return YES;
 }
@@ -1013,7 +1014,7 @@ static void dumpSdk(uintptr_t classClass) {
             tn[0] = 0;
             uintptr_t fc = rd_ptr(p + 0x8);
             if (fc >= 0x100000000ULL) fname_read(fnidx(fc), tn, sizeof tn);
-            fprintf(f, "  +0x%04x %-28s %s[%d] size %d\n", rd_i32(p + (uintptr_t)OFF_POFF), pn, tn[0] ? tn : "?", rd_i32(p + 0x38), rd_i32(p + 0x3C));
+            fprintf(f, "  +0x%04x %-28s %s[%d] size %d\n", rd_i32(p + (uintptr_t)OFF_POFF), pn, tn[0] ? tn : "?", rd_i32(p + (uintptr_t)(0x38 + gPropShift)), rd_i32(p + (uintptr_t)(0x3C + gPropShift)));
             props++;
             p = rd_ptr(p + (uintptr_t)OFF_FNEXT);
         }
