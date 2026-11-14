@@ -466,19 +466,28 @@ static int gNameShift = 6;
 static int gNameStride = 2, gNameTextOff = 2;
 
 static BOOL fname_read(int32_t idx, char *out, int cap) {
-    if (!gNameBlocks || idx < 0 || cap < 2) return NO;
-    uintptr_t blk = rd_ptr(gNameBlocks + 8 * (uintptr_t)((uint32_t)idx >> 16));
-    if (!blk) return NO;
-    uintptr_t e = blk + (uintptr_t)gNameStride * (uintptr_t)((uint32_t)idx & 0xFFFF);
-    uint16_t h = 0;
-    if (!safe_read(e, &h, 2)) return NO;
-    if (h & (gNameShift == 5 ? 0x8000 : 1)) return NO;
-    int len = (h >> gNameShift) & 0x3FF;
-    if (len <= 0) return NO;
-    if (len >= cap) len = cap - 1;
-    if (!safe_read(e + (uintptr_t)gNameTextOff, out, (size_t)len)) return NO;
-    out[len] = 0;
-    return YES;
+    if (!gNameBlocks || cap < 2) return NO;
+    for (int hop = 0; hop < 3; hop++) {
+        if (idx < 0) return NO;
+        uintptr_t blk = rd_ptr(gNameBlocks + 8 * (uintptr_t)((uint32_t)idx >> 16));
+        if (!blk) return NO;
+        uintptr_t e = blk + (uintptr_t)gNameStride * (uintptr_t)((uint32_t)idx & 0xFFFF);
+        uint16_t h = 0;
+        if (!safe_read(e, &h, 2)) return NO;
+        int len = (h >> gNameShift) & 0x3FF;
+        if (len == 0) {
+            int32_t alias = 0;
+            if (!safe_read(e + 6, &alias, 4) || alias == idx) return NO;
+            idx = alias;
+            continue;
+        }
+        if (h & (gNameShift == 5 ? 0x8000 : 1)) return NO;
+        if (len >= cap) len = cap - 1;
+        if (!safe_read(e + (uintptr_t)gNameTextOff, out, (size_t)len)) return NO;
+        out[len] = 0;
+        return YES;
+    }
+    return NO;
 }
 
 static NSString *fname_string(int32_t idx) {
@@ -619,7 +628,7 @@ static BOOL poolStatic(uintptr_t cc, int classOff) {
         int32_t idx = rd_i32(cc + (uintptr_t)nk);
         if (idx <= 0) continue;
         for (int sh = 5; sh <= 6; sh++) {
-            for (int t = 2; t <= 12; t += 2) {
+            for (int t = 2; t <= 2; t += 2) {
                 gNameShift = sh; gNameStride = 2; gNameTextOff = t;
                 if (name_is(idx, "Class")) { RLOG(@"namepool: static slot %p ok (shift %d textoff %d, Class name at obj+0x%x)", (void *)gNameBlocks, sh, t, nk); return YES; }
             }
@@ -639,13 +648,7 @@ static BOOL poolByClass(uintptr_t cc, int classOff) {
         if (v > 0) idxs[ni++] = v;
     }
     if (!ni) return NO;
-    if (poolByClassIn(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL), idxs, ni, NO)) return YES;
-    if (poolByClassIn(SYM(0x10ebd3380ULL), SYM(0x112d7c850ULL), idxs, ni, NO)) return YES;
-    static BOOL indirectTried = NO;
-    if (indirectTried) return NO;
-    indirectTried = YES;
-    if (poolByClassIn(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL), idxs, ni, YES)) return YES;
-    return poolByClassIn(SYM(0x10ebd3380ULL), SYM(0x112d7c850ULL), idxs, ni, YES);
+    return poolByClassIn(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL), idxs, ni, NO);
 }
 
 static BOOL findNamePool(void) {
@@ -742,7 +745,16 @@ static BOOL snapshotObjects(void) {
         NSMutableString *d = [NSMutableString stringWithFormat:@"cc %p:", (void *)cc];
         for (int off = 0; off < 0x38; off += 8) { RLOG(@"  +0x%x = %p", off, (void *)rd_ptr(cc + (uintptr_t)off)); [d appendFormat:@" %lx", (unsigned long)rd_ptr(cc + (uintptr_t)off)]; }
         gResolveLine = @"resolve: NAMEPOOL FAILED";
-        gResolveLine2 = d;
+        {
+            uintptr_t blk0 = rd_ptr(SYM(A_NAMEPOOL_BLOCKS));
+            int32_t i20 = rd_i32(cc + 0x20);
+            uint8_t eb[16] = {0};
+            safe_read(blk0 + 2 * (uintptr_t)(i20 & 0xFFFF), eb, sizeof eb);
+            NSMutableString *x = [NSMutableString stringWithFormat:@"blk0 %p idx %x e:", (void *)blk0, i20];
+            for (int q = 0; q < 16; q++) [x appendFormat:@"%02x", eb[q]];
+            RLOG(@"namepool diag: %@", x);
+            gResolveLine2 = x;
+        }
         return NO;
     }
     RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx) shift %d stride %d textoff %d", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide), gNameShift, gNameStride, gNameTextOff);
