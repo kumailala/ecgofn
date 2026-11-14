@@ -466,6 +466,7 @@ static int gNameShift = 6;
 static int gNameStride = 2, gNameTextOff = 2, gNameIdxAdd = 0;
 static uintptr_t gNameBlobs = 0;
 static intptr_t gNameBlobDelta = 0;
+static uintptr_t gNameBlobAbs = 0;
 static int32_t rd_i32(uintptr_t a);
 static int32_t fnidx(uintptr_t a) { return rd_i32(a + (uintptr_t)gNameIdxAdd); }
 
@@ -487,11 +488,12 @@ static BOOL fname_read(int32_t idx, char *out, int cap) {
         }
         if (h & (gNameShift == 5 ? 0x8000 : 1)) return NO;
         if (len >= cap) len = cap - 1;
-        if (gNameBlobs || gNameBlobDelta) {
+        if (gNameBlobs || gNameBlobDelta || gNameBlobAbs) {
             uint16_t hi16 = 0, lo16 = 0;
             if (!safe_read(e + 2, &hi16, 2) || !safe_read(e + 4, &lo16, 2)) return NO;
-            uintptr_t blob = gNameBlobDelta ? (uintptr_t)((intptr_t)blk + gNameBlobDelta)
-                                            : rd_ptr(gNameBlobs + 8 * (uintptr_t)((uint32_t)idx >> 16));
+            uintptr_t blob = gNameBlobAbs ? gNameBlobAbs
+                                : (gNameBlobDelta ? (uintptr_t)((intptr_t)blk + gNameBlobDelta)
+                                                  : rd_ptr(gNameBlobs + 8 * (uintptr_t)((uint32_t)idx >> 16)));
             if (!blob) return NO;
             if (!safe_read(blob + (((uintptr_t)hi16 << 16) | lo16), out, (size_t)len)) return NO;
             out[len] = 0;
@@ -665,44 +667,93 @@ static BOOL findBlobSlot(uintptr_t lo, uintptr_t hi) {
     return found;
 }
 
-static BOOL poolStatic(uintptr_t cc, int classOff) {
-    uintptr_t saved = gNameBlocks;
-    gNameBlocks = SYM(A_NAMEPOOL_BLOCKS);
-    gNameShift = 5; gNameStride = 2; gNameTextOff = 2;
-    if (!gNameBlobs) {
-        uintptr_t pool = SYM(0x11317f0c0ULL);
-        if (!findBlobSlot(pool, pool + 0x27000)) findBlobSlot(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL));
-        if (!gNameBlobs) {
-            uintptr_t blk0 = rd_ptr(gNameBlocks);
-            const size_t span = 0x400000;
-            uint8_t *mem = (uint8_t *)malloc(span);
-            if (mem && blk0) {
-                size_t got = 0;
-                for (size_t off = 0; off < span; off += 0x10000) {
-                    if (!safe_read(blk0 + off, mem + off, 0x10000)) break;
-                    got = off + 0x10000;
-                }
-                for (size_t p = 0; p + 16 <= got; p += 2) {
-                    if (memcmp(mem + p, "NoneByteProperty", 16) == 0) { gNameBlobDelta = (intptr_t)p; break; }
-                }
-                RLOG(@"namepool: blob search after entries: delta 0x%lx (scanned 0x%zx)", (long)gNameBlobDelta, got);
-            }
-            free(mem);
+
+static uintptr_t gBlobCands[24];
+static int gBlobCandN = 0;
+static BOOL gBlobScanned = NO;
+
+typedef struct { uintptr_t a, n, d; } VmReg;
+static int vmregCmp(const void *x, const void *y) {
+    const VmReg *p = (const VmReg *)x, *q = (const VmReg *)y;
+    return p->d < q->d ? -1 : (p->d > q->d ? 1 : 0);
+}
+
+static void findBlobByRegions(uintptr_t nearAddr) {
+    gBlobScanned = YES;
+    gBlobCandN = 0;
+    const int maxRegs = 8192;
+    VmReg *regs = (VmReg *)malloc(sizeof(VmReg) * (size_t)maxRegs);
+    if (!regs) return;
+    int nr = 0;
+    vm_address_t addr = 0;
+    for (int guard = 0; guard < 200000 && nr < maxRegs; guard++) {
+        vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t bi;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &addr, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &obj) != KERN_SUCCESS) break;
+        uintptr_t a = (uintptr_t)addr, e = a + (uintptr_t)sz;
+        addr += sz;
+        if (!(bi.protection & VM_PROT_READ) || sz < 0x10000) continue;
+        if (a >= gImgBase && e <= gImgEnd) continue;
+        if (sz > 0x20000000) {
+            vm_region_extended_info_data_t ex;
+            mach_msg_type_number_t c2 = VM_REGION_EXTENDED_INFO_COUNT;
+            vm_address_t a2 = (vm_address_t)a; vm_size_t s2 = 0; mach_port_t o2 = MACH_PORT_NULL;
+            if (vm_region_64(mach_task_self(), &a2, &s2, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&ex, &c2, &o2) == KERN_SUCCESS) {
+                if ((uint64_t)ex.pages_resident * 16384ULL < (uint64_t)sz / 4) continue;
+            } else continue;
         }
-        RLOG(@"namepool: text blob table slot %p (image+0x%lx), blob0 %p, entries blk0 %p", (void *)gNameBlobs, gNameBlobs ? (unsigned long)(gNameBlobs - gSlide) : 0UL, (void *)(gNameBlobs ? rd_ptr(gNameBlobs) : 0), (void *)rd_ptr(gNameBlocks));
+        regs[nr].a = a; regs[nr].n = (uintptr_t)sz;
+        uintptr_t d = nearAddr >= a ? (nearAddr < e ? 0 : nearAddr - e) : a - nearAddr;
+        regs[nr].d = d;
+        nr++;
     }
-    for (int add = 0; add <= 4; add += 4) {
-        for (int nk = 0x8; nk <= 0x30; nk += 8) {
-            if (nk == classOff) continue;
-            int32_t idx = rd_i32(cc + (uintptr_t)nk + (uintptr_t)add);
-            if (idx <= 0) continue;
-            if (name_is(idx, "Class")) {
-                gNameIdxAdd = add;
-                RLOG(@"namepool: static slot %p ok (Class name idx %x at obj+0x%x+%d)", (void *)gNameBlocks, idx, nk, add);
-                return YES;
+    qsort(regs, (size_t)nr, sizeof(VmReg), vmregCmp);
+    const size_t chunk = 0x400000;
+    uint8_t *buf = (uint8_t *)malloc(chunk + 32);
+    double t0 = CACurrentMediaTime();
+    size_t scanned = 0;
+    for (int i = 0; buf && i < nr && gBlobCandN < 20; i++) {
+        if (CACurrentMediaTime() - t0 > 40.0 || scanned > 0x100000000ULL) break;
+        for (uintptr_t off = 0; off < regs[i].n && gBlobCandN < 20; off += chunk) {
+            size_t n = regs[i].n - off < chunk + 16 ? regs[i].n - off : chunk + 16;
+            if (!safe_read(regs[i].a + off, buf, n)) {
+                size_t good = 0;
+                for (size_t o2 = 0; o2 < n; o2 += 0x4000) {
+                    size_t m = n - o2 < 0x4000 ? n - o2 : 0x4000;
+                    if (safe_read(regs[i].a + off + o2, buf + o2, m)) good += m; else memset(buf + o2, 0, m);
+                }
+                if (!good) continue;
+            }
+            scanned += n;
+            const uint8_t *p = buf, *end = buf + n;
+            while (p + 16 <= end) {
+                const uint8_t *f = (const uint8_t *)memmem(p, (size_t)(end - p), "NoneByteProperty", 16);
+                if (!f) break;
+                gBlobCands[gBlobCandN++] = regs[i].a + off + (uintptr_t)(f - buf);
+                if (gBlobCandN >= 20) break;
+                p = f + 1;
             }
         }
     }
+    RLOG(@"namepool: region scan %d regions, %zu MB, %d blob candidates, %.1fs", nr, scanned >> 20, gBlobCandN, CACurrentMediaTime() - t0);
+    for (int i = 0; i < gBlobCandN && i < 6; i++) RLOG(@"namepool:  cand %d = %p", i, (void *)gBlobCands[i]);
+    free(buf);
+    free(regs);
+}
+
+static BOOL classNameOK(uintptr_t cc, int classOff) {
+    if (classNameOK(cc, classOff)) return YES;
+    if (!gNameBlobs && !gBlobScanned) findBlobByRegions(rd_ptr(gNameBlocks));
+    for (int ci = 0; ci < gBlobCandN; ci++) {
+        gNameBlobAbs = gBlobCands[ci];
+        if (classNameOK(cc, classOff)) {
+            RLOG(@"namepool: text blob = %p (image+0x%lx)", (void *)gNameBlobAbs, (unsigned long)(gNameBlobAbs - gSlide));
+            return YES;
+        }
+    }
+    gNameBlobAbs = 0;
     NSMutableString *dg = [NSMutableString string];
     for (int b = 0; b < 4; b++) {
         uintptr_t blk = rd_ptr(gNameBlocks + 8 * (uintptr_t)b);
