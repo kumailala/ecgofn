@@ -461,6 +461,7 @@ static void flushResolveLog(void) {
 #pragma mark 5.2 FName pool
 
 static uintptr_t gNameBlocks = 0;
+static int gNameShift = 6;
 
 static BOOL fname_read(int32_t idx, char *out, int cap) {
     if (!gNameBlocks || idx < 0 || cap < 2) return NO;
@@ -470,7 +471,7 @@ static BOOL fname_read(int32_t idx, char *out, int cap) {
     uint16_t h = 0;
     if (!safe_read(e, &h, 2)) return NO;
     if (h & 1) return NO;
-    int len = h >> 6;
+    int len = h >> gNameShift;
     if (len <= 0) return NO;
     if (len >= cap) len = cap - 1;
     if (!safe_read(e + 2, out, (size_t)len)) return NO;
@@ -501,12 +502,16 @@ static BOOL poolCandidate(uintptr_t v) {
     uint8_t b[32];
     if (!safe_read(v, b, sizeof b)) return NO;
     uint16_t h; memcpy(&h, b, 2);
-    if ((h >> 6) != 4 || (h & 1)) return NO;
+    int sh = ((h >> 6) == 4) ? 6 : (((h >> 1) == 4 || (h >> 1) == 4) ? 1 : 0);
+    if (!sh) return NO;
+    if (h & 1) return NO;
     if (memcmp(b + 2, "None", 4) != 0) return NO;
     uint16_t h2; memcpy(&h2, b + 6, 2);
-    int l2 = h2 >> 6;
+    int l2 = h2 >> sh;
     if (l2 <= 0 || l2 > 20 || (h2 & 1) || 8 + l2 > 32) return NO;
-    return bytes_are_name(b + 8, l2);
+    if (!bytes_are_name(b + 8, l2)) return NO;
+    gNameShift = sh;
+    return YES;
 }
 
 static BOOL scanForNamePool(uintptr_t lo, uintptr_t hi) {
@@ -547,6 +552,14 @@ static uintptr_t gOAChunks = 0;
 static uintptr_t *gSnapObj = NULL, *gSnapCls = NULL;
 static int32_t gSnapN = 0;
 
+static int gOffClass = 0x8, gOffName = 0x10, gOffOuter = 0x18;
+
+static uintptr_t decodeItem(const uint8_t *it) {
+    uint64_t a; uint32_t b;
+    memcpy(&a, it, 8); memcpy(&b, it + 0x10, 4);
+    return (uintptr_t)(((a & 0x3fff00000000ULL) | b) << 3);
+}
+
 static BOOL resolveObjArray(void) {
     uintptr_t base = SYM(A_GUOBJECTARRAY);
     for (int off = 0x20; off <= 0xA0; off += 8) {
@@ -555,9 +568,10 @@ static BOOL resolveObjArray(void) {
         uintptr_t c0 = rd_ptr(p);
         if (c0 < 0x100000000ULL) continue;
         int good = 0;
+        uint8_t items[64 * 0x18];
+        if (!safe_read(c0, items, sizeof items)) continue;
         for (int j = 0; j < 64; j++) {
-            uintptr_t o = rd_ptr(c0 + (uintptr_t)j * 0x18);
-            if (looks_like_uobject(o)) good++;
+            if (looks_like_uobject(decodeItem(items + j * 0x18))) good++;
         }
         if (good < 2) continue;
         gOAChunks = p;
@@ -589,16 +603,54 @@ static BOOL snapshotObjects(void) {
         if (cnt > 65536) cnt = 65536;
         if (!safe_read(chunk, buf, (size_t)cnt * 0x18)) continue;
         for (int32_t j = 0; j < cnt; j++) {
-            uintptr_t o;
-            memcpy(&o, buf + (size_t)j * 0x18, 8);
+            uintptr_t o = decodeItem(buf + (size_t)j * 0x18);
             if (o >= 0x100000000ULL && !(o & 7)) gSnapObj[c * 65536 + j] = o;
         }
     }
     free(buf);
     gSnapN = lim;
+    static const int clsCand[] = { 0x8, 0x10, 0x18, 0x20, 0x28 };
+    BOOL layoutOk = NO;
+    for (int pass = 0; pass < 2 && !layoutOk; pass++) {
+        int32_t upto = pass == 0 ? (lim < 40000 ? lim : 40000) : lim;
+        for (size_t k = 0; k < sizeof clsCand / sizeof clsCand[0] && !layoutOk; k++) {
+            for (int32_t i = 0; i < upto; i++) {
+                uintptr_t o = gSnapObj[i];
+                if (o && looks_like_uobject(o) && rd_ptr(o + (uintptr_t)clsCand[k]) == o) {
+                    gOffClass = clsCand[k]; layoutOk = YES;
+                    RLOG(@"layout: UClass self-class found, ClassPrivate at obj+0x%x (index %d)", gOffClass, i);
+                    break;
+                }
+            }
+        }
+    }
+    if (!layoutOk) { RLOG(@"layout: no self-class object found"); gResolveLine = @"resolve: NO CLASS LAYOUT"; return NO; }
+    uintptr_t cc = 0;
+    for (int32_t i = 0; i < lim && !cc; i++) if (gSnapObj[i] && rd_ptr(gSnapObj[i] + (uintptr_t)gOffClass) == gSnapObj[i]) cc = gSnapObj[i];
+    static const int nameCand[] = { 0x8, 0x10, 0x18, 0x20, 0x28, 0x30 };
+    BOOL nameOk = NO;
+    for (size_t k = 0; k < sizeof nameCand / sizeof nameCand[0]; k++) {
+        if (nameCand[k] == gOffClass) continue;
+        if (name_is(rd_i32(cc + (uintptr_t)nameCand[k]), "Class")) { gOffName = nameCand[k]; nameOk = YES; break; }
+    }
+    RLOG(@"layout: FName at obj+0x%x ok=%d", gOffName, (int)nameOk);
+    if (!nameOk) {
+        RLOG(@"layout: dump of Class object %p:", (void *)cc);
+        for (int off = 0; off < 0x40; off += 8) RLOG(@"  +0x%x = %p", off, (void *)rd_ptr(cc + (uintptr_t)off));
+        gResolveLine = @"resolve: NO NAME OFFSET";
+        return NO;
+    }
+    for (size_t k = 0; k < sizeof nameCand / sizeof nameCand[0]; k++) {
+        int nk = nameCand[k];
+        if (nk == gOffClass || nk == gOffName) continue;
+        uintptr_t out = rd_ptr(cc + (uintptr_t)nk);
+        if (!looks_like_uobject(out)) continue;
+        NSString *on = fname_string(rd_i32(out + (uintptr_t)gOffName));
+        if ([on hasPrefix:@"/Script/"]) { gOffOuter = nk; RLOG(@"layout: Outer at obj+0x%x (%@)", nk, on); break; }
+    }
     int valid = 0;
     for (int32_t i = 0; i < lim; i++) {
-        if (gSnapObj[i]) { gSnapCls[i] = rd_ptr(gSnapObj[i] + 0x10); valid++; }
+        if (gSnapObj[i]) { gSnapCls[i] = rd_ptr(gSnapObj[i] + (uintptr_t)gOffClass); valid++; }
     }
     RLOG(@"snapshot: %d slots, %d objects", lim, valid);
     return valid > 1000;
@@ -684,7 +736,7 @@ static BOOL probeReflection(void) {
     for (size_t k = 0; k < sizeof sup / sizeof sup[0] && OFF_SUPER < 0; k++) {
         uintptr_t c = fpp;
         for (int d = 0; d < 24 && looks_like_uobject(c); d++) {
-            if (name_is(rd_i32(c + 0x18), "Object")) { OFF_SUPER = sup[k]; break; }
+            if (name_is(rd_i32(c + (uintptr_t)gOffName), "Object")) { OFF_SUPER = sup[k]; break; }
             c = rd_ptr(c + (uintptr_t)sup[k]);
         }
     }
@@ -750,14 +802,14 @@ static BOOL resolveAll(void) {
     gResolveLine = @"resolve: objarray…";
     if (!resolveObjArray()) { flushResolveLog(); return NO; }
     gResolveLine = @"resolve: name pool…";
-    if (!findNamePool()) { RLOG(@"namepool: NOT FOUND"); gResolveLine = @"resolve: NAMEPOOL FAILED"; flushResolveLog(); return NO; }
-    RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx)", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide));
+    if (!findNamePool()) { RLOG(@"namepool: NOT FOUND"); gResolveLine = @"resolve: NAMEPOOL FAILED"; gResolveLine2 = [NSString stringWithFormat:@"scanned bss %p-%p", (void *)SYM(0x112d7f9c0ULL), (void *)SYM(0x113214000ULL)]; flushResolveLog(); return NO; }
+    RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx) shift %d", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide), gNameShift);
     gResolveLine = @"resolve: snapshot…";
-    if (!snapshotObjects()) { gResolveLine = @"resolve: SNAPSHOT FAILED"; flushResolveLog(); return NO; }
+    if (!snapshotObjects()) { if ([gResolveLine isEqualToString:@"resolve: snapshot…"]) gResolveLine = @"resolve: SNAPSHOT FAILED"; flushResolveLog(); return NO; }
 
     for (int i = 0, shown = 0; i < gSnapN && shown < 6; i++) {
         if (!gSnapObj[i]) continue;
-        RLOG(@"  obj[%d]=%p class=%p name=%@", i, (void *)gSnapObj[i], (void *)gSnapCls[i], fname_string(rd_i32(gSnapObj[i] + 0x18)) ?: @"?");
+        RLOG(@"  obj[%d]=%p class=%p name=%@", i, (void *)gSnapObj[i], (void *)gSnapCls[i], fname_string(rd_i32(gSnapObj[i] + (uintptr_t)gOffName)) ?: @"?");
         shown++;
     }
 
@@ -765,14 +817,14 @@ static BOOL resolveAll(void) {
     for (int32_t i = 0; i < gSnapN; i++) {
         if (gSnapObj[i] && gSnapCls[i] == gSnapObj[i]) { classClass = gSnapObj[i]; break; }
     }
-    RLOG(@"classclass: %p name=%@", (void *)classClass, classClass ? fname_string(rd_i32(classClass + 0x18)) : @"-");
+    RLOG(@"classclass: %p name=%@", (void *)classClass, classClass ? fname_string(rd_i32(classClass + (uintptr_t)gOffName)) : @"-");
     if (!classClass) { gResolveLine = @"resolve: no UClass"; flushResolveLog(); return NO; }
 
     gCls[C_CLASS] = classClass;
     for (int32_t i = 0; i < gSnapN; i++) {
         if (!gSnapObj[i] || gSnapCls[i] != classClass) continue;
         char nb[96];
-        if (!fname_read(rd_i32(gSnapObj[i] + 0x18), nb, sizeof nb)) continue;
+        if (!fname_read(rd_i32(gSnapObj[i] + (uintptr_t)gOffName), nb, sizeof nb)) continue;
         for (int c = 1; c < C_COUNT; c++) {
             if (!gCls[c] && !strcmp(nb, kClsNames[c])) gCls[c] = gSnapObj[i];
         }
@@ -828,7 +880,7 @@ static BOOL resolveAll(void) {
     gEngineObj = 0;
     for (int32_t i = 0; i < gSnapN; i++) {
         if (!gSnapObj[i] || gSnapCls[i] != gCls[C_FENGINE]) continue;
-        NSString *n = fname_string(rd_i32(gSnapObj[i] + 0x18));
+        NSString *n = fname_string(rd_i32(gSnapObj[i] + (uintptr_t)gOffName));
         if (n && ![n hasPrefix:@"Default__"]) { gEngineObj = gSnapObj[i]; break; }
     }
     RLOG(@"engine instance: %p", (void *)gEngineObj);
@@ -1007,7 +1059,7 @@ static int probeLevelActors(uintptr_t level) {
         uintptr_t el[8];
         if (!safe_read(arr, el, sizeof el)) continue;
         int good = 0;
-        for (int i = 0; i < 8; i++) if (looks_like_uobject(el[i]) && rd_ptr(el[i] + 0x20) == level) good++;
+        for (int i = 0; i < 8; i++) if (looks_like_uobject(el[i]) && rd_ptr(el[i] + (uintptr_t)gOffOuter) == level) good++;
         if (good >= 4) { RLOG(@"level: Actors array at Level+0x%x (num %d)", off, num); return off; }
     }
     return -1;
@@ -1093,7 +1145,7 @@ static void scanPawns(void) {
             if (looks_like_uobject(pw)) {
                 uintptr_t wd = rd_ptr(pw + (uintptr_t)O_WEAPON_DATA);
                 if (looks_like_uobject(wd)) {
-                    ep.weapon = cleanItemName(fname_string(rd_i32(wd + 0x18)));
+                    ep.weapon = cleanItemName(fname_string(rd_i32(wd + (uintptr_t)gOffName)));
                     ep.wTier = O_ITEM_RARITY >= 0 ? rd_u8(wd + (uintptr_t)O_ITEM_RARITY) + 1 : 0;
                 }
             }
@@ -1127,12 +1179,12 @@ static void scanPawns(void) {
                         for (int32_t k = 0; k < cnt && nLoot < 400; k++) {
                             uintptr_t a = chunk[k];
                             if (a < 0x100000000ULL || (a & 7)) continue;
-                            uintptr_t cls = rd_ptr(a + 0x10);
+                            uintptr_t cls = rd_ptr(a + (uintptr_t)gOffClass);
                             if (cls < 0x100000000ULL) continue;
                             NSNumber *ck = @(cls);
                             NSNumber *cv = lootClassCache[ck];
                             if (!cv) {
-                                NSString *cn = fname_string(rd_i32(cls + 0x18));
+                                NSString *cn = fname_string(rd_i32(cls + (uintptr_t)gOffName));
                                 cv = @([cn hasPrefix:@"FortPickup"]);
                                 lootClassCache[ck] = cv;
                             }
@@ -1145,7 +1197,7 @@ static void scanPawns(void) {
                             if (!actorLocation(a, &lp)) continue;
                             EchoLoot *lo = [[EchoLoot alloc] init];
                             lo.x = lp.x; lo.y = lp.y; lo.z = lp.z; lo.tier = tier;
-                            lo.text = cleanItemName(fname_string(rd_i32(def + 0x18)));
+                            lo.text = cleanItemName(fname_string(rd_i32(def + (uintptr_t)gOffName)));
                             [lootOut addObject:lo];
                             nLoot++;
                         }
