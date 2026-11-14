@@ -3785,19 +3785,44 @@ static void engineEspFrame(void *cv) {
                     double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + (cannon ? 120.0 : 220.0);
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.35) {
-                        void **mvt = (void **)rd_ptr(mover);
-                        uintptr_t fTp = mvt ? rd_ptr((uintptr_t)&mvt[181]) : 0;
-                        if (fTp >= gImgBase && fTp < gImgEnd) {
-                            DV3 np = { wantX, wantY, wantZ };
-                            DV3 nr = { 0.0, atan2(chest.y - wantY, chest.x - wantX) * 180.0 / M_PI, 0.0 };
-                            BOOL tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
-                            cfTp = now;
-                            static int tpN = 0;
-                            if (++tpN <= 8 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: TeleportTo %@ #%d ok=%d to chest (%.0f, %.0f, %.0f)", cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ]);
-                        } else {
-                            static BOOL warnedTp = NO;
-                            if (!warnedTp) { warnedTp = YES; metalNote(@"farm: TeleportTo virtual not found"); }
+                        static int tpMethod = 0, tpFail = 0, tpN = 0;
+                        static DV3 tpLastWant = {0, 0, 0};
+                        static BOOL tpHaveLast = NO;
+                        static const char *kTpNames[4] = { "TeleportTo", "SetActorLocation", "SetActorLocation+sweep", "LaunchCharacter" };
+                        if (tpHaveLast) {
+                            double lx = tpLastWant.x - mp.x, ly = tpLastWant.y - mp.y, lz = tpLastWant.z - mp.z;
+                            if (sqrt(lx * lx + ly * ly + lz * lz) > 400.0) {
+                                if (++tpFail >= 2) {
+                                    tpFail = 0;
+                                    tpMethod = (tpMethod + 1) % (cannon ? 3 : 4);
+                                    metalNote([NSString stringWithFormat:@"farm: no movement, switching to %s", kTpNames[tpMethod]]);
+                                }
+                            } else if (tpFail) {
+                                tpFail = 0;
+                            }
                         }
+                        DV3 np = { wantX, wantY, wantZ };
+                        DV3 nr = { 0.0, atan2(chest.y - wantY, chest.x - wantX) * 180.0 / M_PI, 0.0 };
+                        BOOL tpOk = NO;
+                        void **mvt = (void **)rd_ptr(mover);
+                        if (tpMethod == 0) {
+                            uintptr_t fTp = mvt ? rd_ptr((uintptr_t)&mvt[181]) : 0;
+                            if (fTp >= gImgBase && fTp < gImgEnd)
+                                tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
+                        } else if (tpMethod == 1 || tpMethod == 2) {
+                            uintptr_t fSet = SYM(0x100d0b77c);
+                            if (fSet >= gImgBase && fSet < gImgEnd)
+                                tpOk = (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, tpMethod == 2, NULL, 1) & 1) != 0;
+                        } else {
+                            uintptr_t fLaunch = mvt ? rd_ptr((uintptr_t)&mvt[292]) : 0;
+                            if (fLaunch >= gImgBase && fLaunch < gImgEnd) {
+                                ((void (*)(void *, double, double, double, BOOL, BOOL))fLaunch)((void *)mover, ddx * 2.5, ddy * 2.5, ddz * 2.5 + 400.0, YES, YES);
+                                tpOk = YES;
+                            }
+                        }
+                        tpLastWant = np; tpHaveLast = YES;
+                        cfTp = now;
+                        if (++tpN <= 10 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[tpMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
                     }
                     double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
                     double fy = atan2(tdy, tdx) * 180.0 / M_PI;
