@@ -827,8 +827,15 @@ static int structHop(uintptr_t cls, const char *outer, const char *inner) {
     uintptr_t f = findProp(cls, outer, NULL);
     if (!f) return -1;
     int32_t base = rd_i32(f + (uintptr_t)OFF_POFF);
-    uintptr_t st = rd_ptr(f + 0x78);
-    if (!looks_like_uobject(st) || base < 0) return -1;
+    uintptr_t st = 0;
+    static const int stOff[] = { 0x78, 0x80, 0x70, 0x88 };
+    for (size_t k = 0; k < sizeof stOff / sizeof stOff[0]; k++) {
+        uintptr_t cand = rd_ptr(f + (uintptr_t)stOff[k]);
+        if (!looks_like_uobject(cand)) continue;
+        uintptr_t sc = rd_ptr(cand + (uintptr_t)gOffClass);
+        if (looks_like_uobject(sc) && name_is(rd_i32(sc + (uintptr_t)gOffName), "ScriptStruct")) { st = cand; break; }
+    }
+    if (!st || base < 0) return -1;
     int o = propOff(st, inner);
     return o < 0 ? -1 : base + o;
 }
@@ -839,10 +846,11 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
     int32_t o = rd_i32(f + (uintptr_t)OFF_POFF);
     uint8_t m = rd_u8(f + 0x7A), fm = rd_u8(f + 0x7B), bo = rd_u8(f + 0x79);
     if (m == 0 || (m & (m - 1))) m = fm;
-    if (m == 0 || (m & (m - 1))) m = 1;
+    if (m == 0 || (m & (m - 1))) return NO;
+    if (o < 0 || o > 0x100000) return NO;
     *off = o + bo;
     *mask = m;
-    return o >= 0;
+    return YES;
 }
 
 static BOOL probeReflection(void) {
