@@ -3794,7 +3794,7 @@ static void engineEspFrame(void *cv) {
             if (chest && (cannon || now < manualUntil)) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) { cfKey = key; cfSince = now; }
-                if (now - cfSince > (cannon ? 1.0 : 7.0)) {
+                if (now - cfSince > (cannon ? 5.0 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
                     metalNote(@"farm: skipping a chest after 7 s");
