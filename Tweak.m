@@ -3271,19 +3271,22 @@ static void engineEspFrame(void *cv) {
     double ppd = sx / ((2.0 * tan(0.5 * fovRad)) * 180.0 / M_PI);
     double fovDeg = gOptFov * 60.0;
     double dzDeg = fmin(0.6, fovDeg * 0.05);
-    double smoothS = 1.0 + gOptSmooth * 8.0;
+    double smoothS = 1.0 + gOptSmooth * 30.0;
     static CFTimeInterval lastT = 0;
     double elapsed = lastT > 0 ? now - lastT : 1.0 / 60.0;
     lastT = now;
     if (elapsed < 0.002) elapsed = 0.002;
     if (elapsed > 0.1) elapsed = 0.1;
-    double effSmooth = smoothS <= 1.0 ? smoothS : fmax(1.0, smoothS * ((1.0 / 120.0) / elapsed));
+    double effSmooth = 1.0 + (smoothS - 1.0) * ((1.0 / 60.0) / elapsed);
+    if (effSmooth < 1.0) effSmooth = 1.0;
 
     static double fovBase = 0;
     if (fov > fovBase) fovBase = fov; else fovBase -= 0.4 * elapsed;
     if (fovBase < fov) fovBase = fov;
     BOOL adsFlag = (O_ADS >= 0) && lp && pawnFlag(lp, O_ADS, M_ADS);
-    BOOL adsFov = fov < fovBase - 3.0;
+    static BOOL flagEverSet = NO;
+    if (adsFlag) flagEverSet = YES;
+    BOOL adsFov = !flagEverSet && fov < fovBase - 8.0;
     BOOL ads = adsFlag || adsFov;
     gDbgAds = ads; gDbgAdsFlag = adsFlag; gDbgFov = fov; gDbgBase = fovBase;
     BOOL targeting = gOptAimbot && (ads || !gOptAdsOnly);
