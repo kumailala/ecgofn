@@ -3284,10 +3284,13 @@ static void engineEspFrame(void *cv) {
     if (fov > fovBase) fovBase = fov; else fovBase -= 0.4 * elapsed;
     if (fovBase < fov) fovBase = fov;
     BOOL adsFlag = (O_ADS >= 0) && lp && pawnFlag(lp, O_ADS, M_ADS);
-    static BOOL flagEverSet = NO;
-    if (adsFlag) flagEverSet = YES;
-    BOOL adsFov = !flagEverSet && fov < fovBase - 8.0;
-    BOOL ads = adsFlag || adsFov;
+    static BOOL lastAdsFlag = NO;
+    static int adsEdges = 0;
+    if (adsFlag != lastAdsFlag) {
+        lastAdsFlag = adsFlag;
+        if (adsEdges++ < 30) metalNote([NSString stringWithFormat:@"aim: ADS flag %@ (fov %.1f)", adsFlag ? @"ON" : @"off", fov]);
+    }
+    BOOL ads = adsFlag;
     gDbgAds = ads; gDbgAdsFlag = adsFlag; gDbgFov = fov; gDbgBase = fovBase;
     BOOL targeting = gOptAimbot && (ads || !gOptAdsOnly);
     if (targeting) gDbgTargetingFrames++;
@@ -3447,7 +3450,7 @@ static void engineEspFrame(void *cv) {
     static double aimSign = 1.0, lastRP = 0, lastRY = 0, lastNP = 0, lastNY = 0;
     static double accNom = 0, accObs = 0;
     static int accN = 0, weakWin = 0;
-    static BOOL directMode = NO, lastApplied = NO;
+    static BOOL directMode = YES, lastApplied = NO;
     BOOL appliedNow = NO;
     if (useTarget && targeting && looks_like_uobject(pc)) {
         BOOL inDead = (tPix <= dzDeg * ppd);
