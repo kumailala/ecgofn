@@ -610,7 +610,28 @@ static BOOL poolByClassIn(uintptr_t lo, uintptr_t hi, const int32_t *idxs, int n
     return found;
 }
 
+#define A_NAMEPOOL_BLOCKS 0x11317f190ULL
+
+static BOOL poolStatic(uintptr_t cc, int classOff) {
+    uintptr_t saved = gNameBlocks;
+    gNameBlocks = SYM(A_NAMEPOOL_BLOCKS);
+    for (int nk = 0x8; nk <= 0x30; nk += 8) {
+        if (nk == classOff) continue;
+        int32_t idx = rd_i32(cc + (uintptr_t)nk);
+        if (idx <= 0) continue;
+        for (int sh = 6; sh >= 1; sh -= 5) {
+            for (int t = 2; t <= 8; t += 2) {
+                gNameShift = sh; gNameStride = 2; gNameTextOff = t;
+                if (name_is(idx, "Class")) { RLOG(@"namepool: static slot %p ok (shift %d textoff %d, Class name at obj+0x%x)", (void *)gNameBlocks, sh, t, nk); return YES; }
+            }
+        }
+    }
+    gNameBlocks = saved;
+    return NO;
+}
+
 static BOOL poolByClass(uintptr_t cc, int classOff) {
+    if (poolStatic(cc, classOff)) return YES;
     int32_t idxs[8];
     int ni = 0;
     for (int nk = 0x8; nk <= 0x30 && ni < 8; nk += 8) {
