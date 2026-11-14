@@ -3795,10 +3795,10 @@ static void engineEspFrame(void *cv) {
             if (chest && (cannon || now < manualUntil)) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) { cfKey = key; cfSince = now; }
-                if (now - cfSince > (cannon ? 5.0 : 7.0)) {
+                if (now - cfSince > (cannon ? 1.0 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
-                    metalNote(@"farm: skipping a chest after 7 s");
+                    metalNote(cannon ? @"farm: chest not broken after 1 s, next chest" : @"farm: skipping a chest after 7 s");
                 } else {
                     static int ramFlip = 0;
                     static double testKey = 0;
@@ -3818,8 +3818,8 @@ static void engineEspFrame(void *cv) {
                         }
                     }
                     static const double kShift[5][2] = { {0, 0}, {120, 0}, {-120, 0}, {0, 120}, {0, -120} };
-                    int shiftIdx = cannon ? (int)((now - cfSince) / 1.0) % 5 : 0;
-                    int zPhase = cannon ? ((int)((now - cfSince) / 0.4) & 1) : 0;
+                    int shiftIdx = cannon ? (int)((now - cfSince) / 0.5) % 5 : 0;
+                    int zPhase = cannon ? ((int)((now - cfSince) / 0.5) & 1) : 0;
                     double useYaw = cannon ? farmYaw : rot.y;
                     double wantX = cannon ? chest.x + kShift[shiftIdx][0] : chest.x - 700.0;
                     double wantY = cannon ? chest.y + kShift[shiftIdx][1] : chest.y;
