@@ -3102,10 +3102,10 @@ static void installEngineHook(void) {
         if (fn < gImgBase || fn >= gImgEnd) break;
         uint32_t code[48];
         if (!safe_read(fn, code, sizeof code)) continue;
-        for (int k = 0; k < 48; k++) {
+        for (int k = 0; k < 6; k++) {
             uint32_t w = code[k];
-            if ((w & 0xFFC00000u) == 0x39400000u && (int)((w >> 10) & 0xFFF) == supOff) {
-                [m appendFormat:@"\n  candidate slot %d fn image+0x%lx", i, (unsigned long)(fn - gSlide)];
+            if ((w & 0xFFC00000u) == 0x39400000u && (int)((w >> 10) & 0xFFF) == supOff && ((w >> 5) & 31) == 0) {
+                [m appendFormat:@"\n  candidate slot %d fn image+0x%lx (word %d)", i, (unsigned long)(fn - gSlide), k];
                 if (pick < 0) pick = i;
                 break;
             }
