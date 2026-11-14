@@ -549,20 +549,26 @@ static int32_t gSnapN = 0;
 
 static BOOL resolveObjArray(void) {
     uintptr_t base = SYM(A_GUOBJECTARRAY);
-    for (int off = 0x20; off <= 0x80; off += 8) {
+    for (int off = 0x20; off <= 0xA0; off += 8) {
         uintptr_t p = rd_ptr(base + off);
         if (p < 0x100000000ULL) continue;
         uintptr_t c0 = rd_ptr(p);
-        if (c0 < 0x100000000ULL || looks_like_uobject(c0)) continue;
-        BOOL ok = NO;
-        for (int j = 0; j < 8 && !ok; j++) ok = looks_like_uobject(rd_ptr(c0 + (uintptr_t)j * 0x18));
-        if (!ok) continue;
+        if (c0 < 0x100000000ULL) continue;
+        int good = 0;
+        for (int j = 0; j < 64; j++) {
+            uintptr_t o = rd_ptr(c0 + (uintptr_t)j * 0x18);
+            if (looks_like_uobject(o)) good++;
+        }
+        if (good < 2) continue;
         gOAChunks = p;
-        RLOG(@"objarray: base=%p chunks@+0x%x max=%d num=%d(+0x40)", (void *)base, off, rd_i32(base + 0x3C), rd_i32(base + 0x40));
+        RLOG(@"objarray: base=%p chunks@+0x%x max=%d num=%d(+0x40) good=%d", (void *)base, off, rd_i32(base + 0x3C), rd_i32(base + 0x40), good);
         return YES;
     }
-    RLOG(@"objarray: FAILED, dump +0x20..0x80:");
-    for (int off = 0x20; off <= 0x80; off += 8) RLOG(@"  +0x%x = %p", off, (void *)rd_ptr(base + off));
+    RLOG(@"objarray: FAILED, dump +0x20..0xA0 (img %p..%p slide %lx):", (void *)gImgBase, (void *)gImgEnd, (long)gSlide);
+    for (int off = 0x20; off <= 0xA0; off += 8) RLOG(@"  +0x%x = %p", off, (void *)rd_ptr(base + off));
+    gResolveLine2 = [NSString stringWithFormat:@"base %p sl %lx img %p-%p v3c %d v40 %d v48 %p v50 %p", (void *)base, (long)gSlide, (void *)gImgBase, (void *)gImgEnd, rd_i32(base + 0x3C), rd_i32(base + 0x40), (void *)rd_ptr(base + 0x48), (void *)rd_ptr(base + 0x50)];
+    uintptr_t p48 = rd_ptr(base + 0x48), c = p48 ? rd_ptr(p48) : 0, o0 = c ? rd_ptr(c) : 0;
+    gResolveLine = [NSString stringWithFormat:@"resolve: OBJARRAY FAILED c0 %p o0 %p vt %p", (void *)c, (void *)o0, (void *)(o0 ? rd_ptr(o0) : 0)];
     return NO;
 }
 
@@ -742,7 +748,7 @@ static uintptr_t gEngineObj = 0;
 static BOOL resolveAll(void) {
     if (!gSlide || !gImgBase) return NO;
     gResolveLine = @"resolve: objarray…";
-    if (!resolveObjArray()) { gResolveLine = @"resolve: OBJARRAY FAILED"; flushResolveLog(); return NO; }
+    if (!resolveObjArray()) { flushResolveLog(); return NO; }
     gResolveLine = @"resolve: name pool…";
     if (!findNamePool()) { RLOG(@"namepool: NOT FOUND"); gResolveLine = @"resolve: NAMEPOOL FAILED"; flushResolveLog(); return NO; }
     RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx)", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide));
@@ -1022,7 +1028,7 @@ static void scanPawns(void) {
         CFTimeInterval now = CACurrentMediaTime();
         static CFTimeInterval firstTry = 0;
         if (!firstTry) firstTry = now;
-        if (gResolving || now - gLastResolveTry < 4.0 || now - firstTry < 15.0) { publishPawns(nil, 0, 0); return; }
+        if (gResolving || now - gLastResolveTry < 6.0 || now - firstTry < 15.0) { publishPawns(nil, 0, 0); return; }
         gResolving = YES; gLastResolveTry = now;
         gResolved = resolveAll();
         gResolving = NO;
