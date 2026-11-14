@@ -667,7 +667,6 @@ static BOOL findBlobSlot(uintptr_t lo, uintptr_t hi) {
     return found;
 }
 
-
 static uintptr_t gBlobCands[24];
 static int gBlobCandN = 0;
 static BOOL gBlobScanned = NO;
@@ -744,6 +743,30 @@ static void findBlobByRegions(uintptr_t nearAddr) {
 }
 
 static BOOL classNameOK(uintptr_t cc, int classOff) {
+    for (int add = 0; add <= 4; add += 4) {
+        for (int nk = 0x8; nk <= 0x30; nk += 8) {
+            if (nk == classOff) continue;
+            int32_t idx = rd_i32(cc + (uintptr_t)nk + (uintptr_t)add);
+            if (idx <= 0) continue;
+            if (name_is(idx, "Class")) {
+                gNameIdxAdd = add;
+                RLOG(@"namepool: static slot %p ok (Class name idx %x at obj+0x%x+%d)", (void *)gNameBlocks, idx, nk, add);
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static BOOL poolStatic(uintptr_t cc, int classOff) {
+    uintptr_t saved = gNameBlocks;
+    gNameBlocks = SYM(A_NAMEPOOL_BLOCKS);
+    gNameShift = 5; gNameStride = 2; gNameTextOff = 2;
+    if (!gNameBlobs) {
+        uintptr_t pool = SYM(0x11317f0c0ULL);
+        if (!findBlobSlot(pool, pool + 0x27000)) findBlobSlot(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL));
+        RLOG(@"namepool: text blob table slot %p (image+0x%lx), blob0 %p, entries blk0 %p", (void *)gNameBlobs, gNameBlobs ? (unsigned long)(gNameBlobs - gSlide) : 0UL, (void *)(gNameBlobs ? rd_ptr(gNameBlobs) : 0), (void *)rd_ptr(gNameBlocks));
+    }
     if (classNameOK(cc, classOff)) return YES;
     if (!gNameBlobs && !gBlobScanned) findBlobByRegions(rd_ptr(gNameBlocks));
     for (int ci = 0; ci < gBlobCandN; ci++) {
