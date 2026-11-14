@@ -372,6 +372,7 @@ static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
 static volatile int gFarmClick = 0;
+static volatile int gFarmMethodSel = -1;
 static int   gTrigFires = 0, gTrigCand = 0, gTrigLos = 0;
 static BOOL  gOptHudLayout = NO;
 static BOOL  gOptLowGfx = NO;
@@ -3760,6 +3761,7 @@ static void engineEspFrame(void *cv) {
             DV3 mp = cam;
             if (cannon) mp = (DV3){ cannon.x, cannon.y, cannon.z };
             else if (!actorLocation(lp, &mp)) mp = cam;
+            if (cannon) { DV3 fresh; if (actorLocation(cannon.actor, &fresh)) mp = fresh; }
             double bd = 1e30;
             for (EchoLoot *lo in lootNow) {
                 if (lo.tier != -2) continue;
@@ -3791,13 +3793,15 @@ static void engineEspFrame(void *cv) {
                         static int tpMethod = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
-                        static const char *kTpNames[4] = { "TeleportTo", "SetActorLocation", "SetActorLocation+sweep", "LaunchCharacter" };
-                        if (tpHaveLast) {
+                        static const char *kTpNames[7] = { "TeleportTo", "SetActorLocation(physics)", "SetActorLocation(reset physics)", "SetActorLocation(sweep)", "AddActorWorldOffset", "TeleportTo+SetActorLocation", "LaunchCharacter" };
+                        int useMethod = (gFarmMethodSel >= 0 && gFarmMethodSel < 7) ? gFarmMethodSel : tpMethod;
+                        if (tpHaveLast && gFarmMethodSel < 0) {
                             double lx = tpLastWant.x - mp.x, ly = tpLastWant.y - mp.y, lz = tpLastWant.z - mp.z;
                             if (sqrt(lx * lx + ly * ly + lz * lz) > 400.0) {
                                 if (++tpFail >= 60) {
                                     tpFail = 0;
-                                    tpMethod = (tpMethod + 1) % (cannon ? 3 : 4);
+                                    tpMethod = (tpMethod + 1) % (cannon ? 5 : 7);
+                                    if (!cannon && tpMethod == 5) tpMethod = 6;
                                     metalNote([NSString stringWithFormat:@"farm: no movement, switching to %s", kTpNames[tpMethod]]);
                                 }
                             } else if (tpFail) {
@@ -3808,15 +3812,26 @@ static void engineEspFrame(void *cv) {
                         DV3 nr = { 0.0, atan2(chest.y - wantY, chest.x - wantX) * 180.0 / M_PI, 0.0 };
                         BOOL tpOk = NO;
                         void **mvt = (void **)rd_ptr(mover);
-                        if (tpMethod == 0) {
-                            uintptr_t fTp = mvt ? rd_ptr((uintptr_t)&mvt[181]) : 0;
-                            if (fTp >= gImgBase && fTp < gImgEnd)
-                                tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
-                        } else if (tpMethod == 1 || tpMethod == 2) {
-                            uintptr_t fSet = SYM(0x100d0b77c);
-                            if (fSet >= gImgBase && fSet < gImgEnd)
-                                tpOk = (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, tpMethod == 2, NULL, 1) & 1) != 0;
-                        } else {
+                        uintptr_t fSet = SYM(0x100d0b77c);
+                        uintptr_t fAdd = SYM(0x10534f428);
+                        BOOL setOk = (fSet >= gImgBase && fSet < gImgEnd);
+                        uintptr_t fTp = mvt ? rd_ptr((uintptr_t)&mvt[181]) : 0;
+                        BOOL tpFn = (fTp >= gImgBase && fTp < gImgEnd);
+                        if (useMethod == 0 || useMethod == 5) {
+                            if (tpFn) tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
+                        }
+                        if (useMethod == 1) {
+                            if (setOk) tpOk = (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 1) & 1) != 0;
+                        } else if (useMethod == 2 || useMethod == 5) {
+                            if (setOk) tpOk |= (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 2) & 1) != 0;
+                        } else if (useMethod == 3) {
+                            if (setOk) tpOk = (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, YES, NULL, 1) & 1) != 0;
+                        } else if (useMethod == 4) {
+                            if (fAdd >= gImgBase && fAdd < gImgEnd) {
+                                ((void (*)(void *, BOOL, void *, double, double, double, int))fAdd)((void *)mover, NO, NULL, ddx, ddy, ddz, 1);
+                                tpOk = YES;
+                            }
+                        } else if (useMethod == 6) {
                             uintptr_t fLaunch = mvt ? rd_ptr((uintptr_t)&mvt[292]) : 0;
                             if (fLaunch >= gImgBase && fLaunch < gImgEnd) {
                                 ((void (*)(void *, double, double, double, BOOL, BOOL))fLaunch)((void *)mover, ddx * 2.5, ddy * 2.5, ddz * 2.5 + 400.0, YES, YES);
@@ -3825,7 +3840,7 @@ static void engineEspFrame(void *cv) {
                         }
                         tpLastWant = np; tpHaveLast = YES;
                         cfTp = now;
-                        if (++tpN <= 6 || tpN % 100 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[tpMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
+                        if (++tpN <= 6 || tpN % 100 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[useMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
                     }
                     if (!cannon) {
                     double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
@@ -4108,6 +4123,10 @@ static void loadOptions(void) {
 @property (nonatomic, strong) UILabel *trigLabel;
 @end
 @implementation EchoMenuHandler
+- (void)farmMethod:(UIButton *)b {
+    gFarmMethodSel = (int)b.tag - 100;
+    gFarmClick++;
+}
 - (void)farmClicked:(UIButton *)b {
     gFarmClick++;
     [b setTitle:[NSString stringWithFormat:@"Teleport to next chest  (%d)", gFarmClick] forState:UIControlStateNormal];
@@ -4198,6 +4217,20 @@ static void addButton(UIView *parent, CGFloat *y, NSString *title, SEL action) {
     *y += 40;
 }
 
+static void addButtonTag(UIView *parent, CGFloat *y, NSString *title, SEL action, NSInteger tag) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(14, *y, parent.bounds.size.width - 28, 30);
+    b.tag = tag;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:13];
+    b.backgroundColor = [UIColor colorWithRed:0.55 green:0.2 blue:0.75 alpha:0.9];
+    b.layer.cornerRadius = 8;
+    [b addTarget:gMenuHandler action:action forControlEvents:UIControlEventTouchUpInside];
+    [parent addSubview:b];
+    *y += 36;
+}
+
 static UILabel *addSlider(UIView *parent, CGFloat *y, NSString *title, float v, NSInteger tag) {
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, *y, parent.bounds.size.width - 28, 20)];
     l.text = [NSString stringWithFormat:@"%@  %.0f%%", title, v * 100];
@@ -4282,6 +4315,14 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
         addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
+        addButtonTag(panel, &y, @"TP + break chest: TeleportTo", @selector(farmMethod:), 100);
+        addButtonTag(panel, &y, @"TP + break chest: SetActorLocation (physics)", @selector(farmMethod:), 101);
+        addButtonTag(panel, &y, @"TP + break chest: SetActorLocation (reset physics)", @selector(farmMethod:), 102);
+        addButtonTag(panel, &y, @"TP + break chest: SetActorLocation (sweep)", @selector(farmMethod:), 103);
+        addButtonTag(panel, &y, @"TP + break chest: AddActorWorldOffset", @selector(farmMethod:), 104);
+        addButtonTag(panel, &y, @"TP + break chest: TeleportTo + SetActorLocation", @selector(farmMethod:), 105);
+        addButtonTag(panel, &y, @"TP + break chest: LaunchCharacter (no cannon)", @selector(farmMethod:), 106);
+        addButtonTag(panel, &y, @"TP + break chest: Auto (tries each)", @selector(farmMethod:), 99);
         addSegment(panel, &y, @"Loot min rarity", @[ @"Rare+", @"Epic+", @"Legendary+" ], gOptLootMin, 32);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
