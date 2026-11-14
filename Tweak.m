@@ -463,7 +463,9 @@ static void flushResolveLog(void) {
 static uintptr_t gNameBlocks = 0;
 static int gNameShift = 6;
 
-static int gNameStride = 2, gNameTextOff = 2;
+static int gNameStride = 2, gNameTextOff = 2, gNameIdxAdd = 0;
+static int32_t rd_i32(uintptr_t a);
+static int32_t fnidx(uintptr_t a) { return rd_i32(a + (uintptr_t)gNameIdxAdd); }
 
 static BOOL fname_read(int32_t idx, char *out, int cap) {
     if (!gNameBlocks || cap < 2) return NO;
@@ -620,20 +622,61 @@ static BOOL poolByClassIn(uintptr_t lo, uintptr_t hi, const int32_t *idxs, int n
 
 #define A_NAMEPOOL_BLOCKS 0x11317f190ULL
 
+static NSString *gPoolDiag = @"";
+
 static BOOL poolStatic(uintptr_t cc, int classOff) {
     uintptr_t saved = gNameBlocks;
     gNameBlocks = SYM(A_NAMEPOOL_BLOCKS);
-    for (int nk = 0x8; nk <= 0x30; nk += 8) {
-        if (nk == classOff) continue;
-        int32_t idx = rd_i32(cc + (uintptr_t)nk);
-        if (idx <= 0) continue;
-        for (int sh = 5; sh <= 6; sh++) {
-            for (int t = 2; t <= 2; t += 2) {
-                gNameShift = sh; gNameStride = 2; gNameTextOff = t;
-                if (name_is(idx, "Class")) { RLOG(@"namepool: static slot %p ok (shift %d textoff %d, Class name at obj+0x%x)", (void *)gNameBlocks, sh, t, nk); return YES; }
+    gNameShift = 5; gNameStride = 2; gNameTextOff = 2;
+    for (int add = 0; add <= 4; add += 4) {
+        for (int nk = 0x8; nk <= 0x30; nk += 8) {
+            if (nk == classOff) continue;
+            int32_t idx = rd_i32(cc + (uintptr_t)nk + (uintptr_t)add);
+            if (idx <= 0) continue;
+            if (name_is(idx, "Class")) {
+                gNameIdxAdd = add;
+                RLOG(@"namepool: static slot %p ok (Class name idx %x at obj+0x%x+%d)", (void *)gNameBlocks, idx, nk, add);
+                return YES;
             }
         }
     }
+    NSMutableString *dg = [NSMutableString string];
+    for (int b = 0; b < 4; b++) {
+        uintptr_t blk = rd_ptr(gNameBlocks + 8 * (uintptr_t)b);
+        if (!blk) break;
+        uint8_t *buf = (uint8_t *)malloc(131072);
+        if (!buf) break;
+        if (safe_read(blk, buf, 131072)) {
+            if (b == 0) {
+                [dg appendString:@"b0:"];
+                for (int q = 0; q < 24; q++) [dg appendFormat:@"%02x", buf[q]];
+                RLOG(@"namepool: block0 first bytes %@", dg);
+            }
+            int found = 0;
+            for (int pos = 2; pos + 5 <= 131072 && found < 6; pos += 2) {
+                if (memcmp(buf + pos, "Class", 5) != 0) continue;
+                uint16_t h; memcpy(&h, buf + pos - 2, 2);
+                if (((h >> 5) & 0x3FF) != 5) continue;
+                uint32_t X = ((uint32_t)b << 16) | (uint32_t)((pos - 2) / 2);
+                [dg appendFormat:@" C@%x", X];
+                RLOG(@"namepool: 'Class' text entry at idx %x (block %d offset 0x%x)", X, b, pos - 2);
+                found++;
+                for (int add = 0; add <= 4; add += 4) {
+                    for (int nk = 0x8; nk <= 0x30; nk += 8) {
+                        if (nk == classOff) continue;
+                        if ((uint32_t)rd_i32(cc + (uintptr_t)nk + (uintptr_t)add) == X) {
+                            gNameIdxAdd = add;
+                            free(buf);
+                            RLOG(@"namepool: matched via scan, name idx at obj+0x%x+%d", nk, add);
+                            return YES;
+                        }
+                    }
+                }
+            }
+        }
+        free(buf);
+    }
+    gPoolDiag = dg;
     gNameBlocks = saved;
     return NO;
 }
@@ -752,15 +795,15 @@ static BOOL snapshotObjects(void) {
             safe_read(blk0 + 2 * (uintptr_t)(i20 & 0xFFFF), eb, sizeof eb);
             NSMutableString *x = [NSMutableString stringWithFormat:@"blk0 %p idx %x e:", (void *)blk0, i20];
             for (int q = 0; q < 16; q++) [x appendFormat:@"%02x", eb[q]];
-            RLOG(@"namepool diag: %@", x);
-            gResolveLine2 = x;
+            RLOG(@"namepool diag: %@ | %@", x, gPoolDiag);
+            gResolveLine2 = [NSString stringWithFormat:@"%@ | %@ | cc20 %lx", x, gPoolDiag, (unsigned long)rd_ptr(cc + 0x20)];
         }
         return NO;
     }
     RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx) shift %d stride %d textoff %d", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide), gNameShift, gNameStride, gNameTextOff);
     for (size_t k = 0; k < sizeof nameCand / sizeof nameCand[0]; k++) {
         if (nameCand[k] == gOffClass) continue;
-        if (name_is(rd_i32(cc + (uintptr_t)nameCand[k]), "Class")) { gOffName = nameCand[k]; nameOk = YES; break; }
+        if (name_is(fnidx(cc + (uintptr_t)nameCand[k]), "Class")) { gOffName = nameCand[k]; nameOk = YES; break; }
     }
     RLOG(@"layout: FName at obj+0x%x ok=%d", gOffName, (int)nameOk);
     if (!nameOk) {
@@ -774,7 +817,7 @@ static BOOL snapshotObjects(void) {
         if (nk == gOffClass || nk == gOffName) continue;
         uintptr_t out = rd_ptr(cc + (uintptr_t)nk);
         if (!looks_like_uobject(out)) continue;
-        NSString *on = fname_string(rd_i32(out + (uintptr_t)gOffName));
+        NSString *on = fname_string(fnidx(out + (uintptr_t)gOffName));
         if ([on hasPrefix:@"/Script/"]) { gOffOuter = nk; RLOG(@"layout: Outer at obj+0x%x (%@)", nk, on); break; }
     }
     int valid = 0;
@@ -803,7 +846,7 @@ static uintptr_t gCls[C_COUNT];
 static int OFF_SUPER = -1, OFF_CHILD = -1, OFF_FNEXT = -1, OFF_FNAME = -1, OFF_POFF = 0x4C;
 
 static BOOL fieldNameIs(uintptr_t f, const char *want) {
-    return name_is(rd_i32(f + (uintptr_t)OFF_FNAME), want);
+    return name_is(fnidx(f + (uintptr_t)OFF_FNAME), want);
 }
 
 static uintptr_t findProp(uintptr_t cls, const char *prop, uintptr_t *ownerOut) {
@@ -844,7 +887,7 @@ static int structHop(uintptr_t cls, const char *outer, const char *inner) {
         uintptr_t cand = rd_ptr(f + (uintptr_t)stOff[k]);
         if (!looks_like_uobject(cand)) continue;
         uintptr_t sc = rd_ptr(cand + (uintptr_t)gOffClass);
-        if (looks_like_uobject(sc) && name_is(rd_i32(sc + (uintptr_t)gOffName), "ScriptStruct")) { st = cand; break; }
+        if (looks_like_uobject(sc) && name_is(fnidx(sc + (uintptr_t)gOffName), "ScriptStruct")) { st = cand; break; }
     }
     if (!st || base < 0) return -1;
     int o = propOff(st, inner);
@@ -873,7 +916,7 @@ static BOOL probeReflection(void) {
     for (size_t k = 0; k < sizeof sup / sizeof sup[0] && OFF_SUPER < 0; k++) {
         uintptr_t c = fpp;
         for (int d = 0; d < 24 && looks_like_uobject(c); d++) {
-            if (name_is(rd_i32(c + (uintptr_t)gOffName), "Object")) { OFF_SUPER = sup[k]; break; }
+            if (name_is(fnidx(c + (uintptr_t)gOffName), "Object")) { OFF_SUPER = sup[k]; break; }
             c = rd_ptr(c + (uintptr_t)sup[k]);
         }
     }
@@ -893,7 +936,7 @@ static BOOL probeReflection(void) {
         for (int n = 0; f && n < 600; n++) {
             if (f < 0x100000000ULL || (f & 7)) break;
             char nameb[96];
-            if (fname_read(rd_i32(f + (uintptr_t)nm[c]), nameb, sizeof nameb)) {
+            if (fname_read(fnidx(f + (uintptr_t)nm[c]), nameb, sizeof nameb)) {
                 score++;
                 if (!strcmp(nameb, "RootComponent")) root = YES;
             } else break;
@@ -942,7 +985,7 @@ static void dumpSdk(uintptr_t classClass) {
     if (!f) return;
     uintptr_t scriptStruct = 0;
     for (int32_t i = 0; i < gSnapN && !scriptStruct; i++) {
-        if (gSnapObj[i] && gSnapCls[i] == classClass && name_is(rd_i32(gSnapObj[i] + (uintptr_t)gOffName), "ScriptStruct")) scriptStruct = gSnapObj[i];
+        if (gSnapObj[i] && gSnapCls[i] == classClass && name_is(fnidx(gSnapObj[i] + (uintptr_t)gOffName), "ScriptStruct")) scriptStruct = gSnapObj[i];
     }
     fprintf(f, "# Fortnite 43.10 SDK dump by EchoMod43\n# image slide %lx, GUObjectArray image+0x%llx\n# offsets: ClassPrivate obj+0x%x Name obj+0x%x Outer obj+0x%x; SuperStruct +0x%x ChildProperties +0x%x FField Next +0x%x Name +0x%x; Offset_Internal +0x%x\n\n",
             (long)gSlide, (unsigned long long)A_GUOBJECTARRAY, gOffClass, gOffName, gOffOuter, OFF_SUPER, OFF_CHILD, OFF_FNEXT, OFF_FNAME, OFF_POFF);
@@ -954,22 +997,22 @@ static void dumpSdk(uintptr_t classClass) {
         BOOL isStruct = scriptStruct && gSnapCls[i] == scriptStruct;
         if (!isClass && !isStruct) continue;
         char nm[160], sup[160], pk[160];
-        if (!fname_read(rd_i32(o + (uintptr_t)gOffName), nm, sizeof nm)) continue;
+        if (!fname_read(fnidx(o + (uintptr_t)gOffName), nm, sizeof nm)) continue;
         sup[0] = 0; pk[0] = 0;
         uintptr_t su = rd_ptr(o + (uintptr_t)OFF_SUPER);
-        if (looks_like_uobject(su)) fname_read(rd_i32(su + (uintptr_t)gOffName), sup, sizeof sup);
+        if (looks_like_uobject(su)) fname_read(fnidx(su + (uintptr_t)gOffName), sup, sizeof sup);
         uintptr_t ou = rd_ptr(o + (uintptr_t)gOffOuter);
-        if (looks_like_uobject(ou)) fname_read(rd_i32(ou + (uintptr_t)gOffName), pk, sizeof pk);
+        if (looks_like_uobject(ou)) fname_read(fnidx(ou + (uintptr_t)gOffName), pk, sizeof pk);
         fprintf(f, "%s %s%s%s : %s // size 0x%x obj %lx\n", isClass ? "class" : "struct", pk, pk[0] ? "." : "", nm, sup[0] ? sup : "-",
                 rd_i32(o + (uintptr_t)OFF_CHILD + 8), (unsigned long)(o - gSlide));
         structs++;
         uintptr_t p = rd_ptr(o + (uintptr_t)OFF_CHILD);
         for (int n = 0; p && n < 3000; n++) {
             char pn[160], tn[96];
-            if (!fname_read(rd_i32(p + (uintptr_t)OFF_FNAME), pn, sizeof pn)) break;
+            if (!fname_read(fnidx(p + (uintptr_t)OFF_FNAME), pn, sizeof pn)) break;
             tn[0] = 0;
             uintptr_t fc = rd_ptr(p + 0x8);
-            if (fc >= 0x100000000ULL) fname_read(rd_i32(fc), tn, sizeof tn);
+            if (fc >= 0x100000000ULL) fname_read(fnidx(fc), tn, sizeof tn);
             fprintf(f, "  +0x%04x %-28s %s[%d] size %d\n", rd_i32(p + (uintptr_t)OFF_POFF), pn, tn[0] ? tn : "?", rd_i32(p + 0x38), rd_i32(p + 0x3C));
             props++;
             p = rd_ptr(p + (uintptr_t)OFF_FNEXT);
@@ -991,7 +1034,7 @@ static BOOL resolveAll(void) {
 
     for (int i = 0, shown = 0; i < gSnapN && shown < 6; i++) {
         if (!gSnapObj[i]) continue;
-        RLOG(@"  obj[%d]=%p class=%p name=%@", i, (void *)gSnapObj[i], (void *)gSnapCls[i], fname_string(rd_i32(gSnapObj[i] + (uintptr_t)gOffName)) ?: @"?");
+        RLOG(@"  obj[%d]=%p class=%p name=%@", i, (void *)gSnapObj[i], (void *)gSnapCls[i], fname_string(fnidx(gSnapObj[i] + (uintptr_t)gOffName)) ?: @"?");
         shown++;
     }
 
@@ -999,14 +1042,14 @@ static BOOL resolveAll(void) {
     for (int32_t i = 0; i < gSnapN; i++) {
         if (gSnapObj[i] && gSnapCls[i] == gSnapObj[i]) { classClass = gSnapObj[i]; break; }
     }
-    RLOG(@"classclass: %p name=%@", (void *)classClass, classClass ? fname_string(rd_i32(classClass + (uintptr_t)gOffName)) : @"-");
+    RLOG(@"classclass: %p name=%@", (void *)classClass, classClass ? fname_string(fnidx(classClass + (uintptr_t)gOffName)) : @"-");
     if (!classClass) { gResolveLine = @"resolve: no UClass"; flushResolveLog(); return NO; }
 
     gCls[C_CLASS] = classClass;
     for (int32_t i = 0; i < gSnapN; i++) {
         if (!gSnapObj[i] || gSnapCls[i] != classClass) continue;
         char nb[96];
-        if (!fname_read(rd_i32(gSnapObj[i] + (uintptr_t)gOffName), nb, sizeof nb)) continue;
+        if (!fname_read(fnidx(gSnapObj[i] + (uintptr_t)gOffName), nb, sizeof nb)) continue;
         for (int c = 1; c < C_COUNT; c++) {
             if (!gCls[c] && !strcmp(nb, kClsNames[c])) gCls[c] = gSnapObj[i];
         }
@@ -1065,7 +1108,7 @@ static BOOL resolveAll(void) {
     gEngineObj = 0;
     for (int32_t i = 0; i < gSnapN; i++) {
         if (!gSnapObj[i] || gSnapCls[i] != gCls[C_FENGINE]) continue;
-        NSString *n = fname_string(rd_i32(gSnapObj[i] + (uintptr_t)gOffName));
+        NSString *n = fname_string(fnidx(gSnapObj[i] + (uintptr_t)gOffName));
         if (n && ![n hasPrefix:@"Default__"]) { gEngineObj = gSnapObj[i]; break; }
     }
     RLOG(@"engine instance: %p", (void *)gEngineObj);
@@ -1333,7 +1376,7 @@ static void scanPawns(void) {
             if (looks_like_uobject(pw)) {
                 uintptr_t wd = rd_ptr(pw + (uintptr_t)O_WEAPON_DATA);
                 if (looks_like_uobject(wd)) {
-                    ep.weapon = cleanItemName(fname_string(rd_i32(wd + (uintptr_t)gOffName)));
+                    ep.weapon = cleanItemName(fname_string(fnidx(wd + (uintptr_t)gOffName)));
                     ep.wTier = O_ITEM_RARITY >= 0 ? rd_u8(wd + (uintptr_t)O_ITEM_RARITY) + 1 : 0;
                 }
             }
@@ -1372,7 +1415,7 @@ static void scanPawns(void) {
                             NSNumber *ck = @(cls);
                             NSNumber *cv = lootClassCache[ck];
                             if (!cv) {
-                                NSString *cn = fname_string(rd_i32(cls + (uintptr_t)gOffName));
+                                NSString *cn = fname_string(fnidx(cls + (uintptr_t)gOffName));
                                 cv = @([cn hasPrefix:@"FortPickup"]);
                                 lootClassCache[ck] = cv;
                             }
@@ -1385,7 +1428,7 @@ static void scanPawns(void) {
                             if (!actorLocation(a, &lp)) continue;
                             EchoLoot *lo = [[EchoLoot alloc] init];
                             lo.x = lp.x; lo.y = lp.y; lo.z = lp.z; lo.tier = tier;
-                            lo.text = cleanItemName(fname_string(rd_i32(def + (uintptr_t)gOffName)));
+                            lo.text = cleanItemName(fname_string(fnidx(def + (uintptr_t)gOffName)));
                             [lootOut addObject:lo];
                             nLoot++;
                         }
