@@ -3784,7 +3784,7 @@ static void engineEspFrame(void *cv) {
                 } else {
                     double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + (cannon ? 120.0 : 220.0);
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
-                    if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.35) {
+                    if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03) {
                         static int tpMethod = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
@@ -3792,7 +3792,7 @@ static void engineEspFrame(void *cv) {
                         if (tpHaveLast) {
                             double lx = tpLastWant.x - mp.x, ly = tpLastWant.y - mp.y, lz = tpLastWant.z - mp.z;
                             if (sqrt(lx * lx + ly * ly + lz * lz) > 400.0) {
-                                if (++tpFail >= 2) {
+                                if (++tpFail >= 60) {
                                     tpFail = 0;
                                     tpMethod = (tpMethod + 1) % (cannon ? 3 : 4);
                                     metalNote([NSString stringWithFormat:@"farm: no movement, switching to %s", kTpNames[tpMethod]]);
@@ -3822,7 +3822,7 @@ static void engineEspFrame(void *cv) {
                         }
                         tpLastWant = np; tpHaveLast = YES;
                         cfTp = now;
-                        if (++tpN <= 10 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[tpMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
+                        if (++tpN <= 6 || tpN % 100 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[tpMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
                     }
                     double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
                     double fy = atan2(tdy, tdx) * 180.0 / M_PI;
