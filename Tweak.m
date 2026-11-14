@@ -2273,11 +2273,14 @@ static GVote gLock;
 static volatile int gGpuSeq = -1;
 static volatile double gGpuStamp = 0;
 static double gLagEma = 1.0;
+static int gStatCalls[2][32];
+static int gStatMax[2][32];
+static int gBulkCalls = 0;
 static const void *gLastBufData[2][32];
 static size_t gLastBufLen[2][32];
 
 static inline BOOL near3(float a, float b, float c, const float *v, float sgn) {
-    const float tol = 3.0e-4f;
+    const float tol = 1.5e-3f;
     return fabsf(a - sgn * v[0]) < tol && fabsf(b - sgn * v[1]) < tol && fabsf(c - sgn * v[2]) < tol;
 }
 
@@ -2360,7 +2363,7 @@ static void gpuMatchLocked(const void *data, size_t len) {
         if (e < bestE) { secondE = bestE; bestE = e; bestSeq = sq; }
         else if (e < secondE) secondE = e;
     }
-    if (bestSeq < 0 || bestE > 4.0e-4f) return;
+    if (bestSeq < 0 || bestE > 2.0e-3f) return;
     if (secondE > bestE * 4.0f + 2.0e-4f) {
         gLagEma = gLagEma * 0.95 + (double)(head - bestSeq) * 0.05;
     } else {
@@ -2374,8 +2377,10 @@ static void gpuMatchLocked(const void *data, size_t len) {
 static inline void gpuInspect(int stage, int index, const void *data, size_t len) {
     int mode = gGpuMode;
     if (mode == 1) {
-        if (len < 64 || len > 8192 || !data) return;
-        if ((++gGpuCalls & 31) != 0) return;
+        if (len < 64 || len > 16384 || !data) return;
+        gStatCalls[stage][index & 31]++;
+        if (len > gStatMax[stage][index & 31]) gStatMax[stage][index & 31] = (int)len;
+        if ((++gGpuCalls & 7) != 0) return;
         gpuDiscover(stage, index, data, len);
     } else if (mode == 2) {
         if (stage != gLock.stage || index != gLock.index || !data) return;
@@ -2395,7 +2400,7 @@ static inline void gpuBuf(int stage, int index, id buf, NSUInteger off) {
     const uint8_t *base = (const uint8_t *)b.contents;
     if (!base || off >= b.length) return;
     size_t len = (size_t)(b.length - off);
-    if (len > 8192) len = 8192;
+    if (len > 16384) len = 16384;
     gLastBufData[stage][index] = base;
     gLastBufLen[stage][index] = (size_t)(b.length);
     gpuInspect(stage, index, base + off, len);
@@ -2405,7 +2410,8 @@ static void gpuFinalize(void) {
     os_unfair_lock_lock(&gVoteLock);
     int best = -1;
     for (int i = 0; i < gVoteN; i++) if (best < 0 || gVotes[i].hits > gVotes[best].hits) best = i;
-    NSMutableString *m = [NSMutableString stringWithFormat:@"gpu discovery: %d candidate slots, calls %d", gVoteN, gGpuCalls];
+    NSMutableString *m = [NSMutableString stringWithFormat:@"gpu discovery: %d candidate slots, calls %d, bulk-setter calls %d", gVoteN, gGpuCalls, gBulkCalls];
+    for (int st = 0; st < 2; st++) for (int ix = 0; ix < 32; ix++) if (gStatCalls[st][ix] > 0) [m appendFormat:@"\n  bound stage %d idx %d: %d calls, max %d bytes", st, ix, gStatCalls[st][ix], gStatMax[st][ix]];
     int shown = 0;
     for (int pass = 0; pass < 5; pass++) {
         int bi = -1;
@@ -2811,6 +2817,20 @@ static void hookEncoderClass(Class c) {
             });
             class_replaceMethod(c, sy, n, method_getTypeEncoding(m2));
         }
+        SEL sbulk = st == 0 ? @selector(setVertexBuffers:offsets:withRange:) : @selector(setFragmentBuffers:offsets:withRange:);
+        Method mb = class_getInstanceMethod(c, sbulk);
+        if (mb) {
+            IMP o = method_getImplementation(mb);
+            int stage = st;
+            IMP n = imp_implementationWithBlock(^(id s, const __unsafe_unretained id *bufs, const NSUInteger *offs, NSRange rg) {
+                if (gGpuMode == 1 || gGpuMode == 2) {
+                    gBulkCalls++;
+                    for (NSUInteger i = 0; i < rg.length && i < 31; i++) if (bufs[i]) gpuBuf(stage, (int)(rg.location + i), bufs[i], offs[i]);
+                }
+                ((void (*)(id, SEL, const __unsafe_unretained id *, const NSUInteger *, NSRange))o)(s, sbulk, bufs, offs, rg);
+            });
+            class_replaceMethod(c, sbulk, n, method_getTypeEncoding(mb));
+        }
         SEL so = st == 0 ? @selector(setVertexBufferOffset:atIndex:) : @selector(setFragmentBufferOffset:atIndex:);
         Method m3 = class_getInstanceMethod(c, so);
         if (m3) {
@@ -2819,7 +2839,7 @@ static void hookEncoderClass(Class c) {
             IMP n = imp_implementationWithBlock(^(id s, NSUInteger off, NSUInteger idx) {
                 if ((gGpuMode == 1 || gGpuMode == 2) && idx < 32 && gLastBufData[stage][idx] && off < gLastBufLen[stage][idx]) {
                     size_t len = gLastBufLen[stage][idx] - (size_t)off;
-                    if (len > 8192) len = 8192;
+                    if (len > 16384) len = 16384;
                     gpuInspect(stage, (int)idx, (const uint8_t *)gLastBufData[stage][idx] + off, len);
                 }
                 ((void (*)(id, SEL, NSUInteger, NSUInteger))o)(s, so, off, idx);
