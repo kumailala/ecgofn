@@ -3730,17 +3730,20 @@ static void engineEspFrame(void *cv) {
         static double cfKey = 0;
         static NSMutableSet<NSNumber *> *cfSkip = nil;
         if (!cfSkip) cfSkip = [NSMutableSet set];
-        DV3 pl;
+        DV3 pl = cam;
         NSArray<EchoLoot *> *lootNow = gLoot;
         EchoLoot *cannon = nil, *chest = nil;
-        if (actorLocation(lp, &pl)) {
+        int nCannons = 0, nChests = 0;
+        double nearestCannon = 1e30;
+        {
             double cd = 1e30, chd = 1e30;
             for (EchoLoot *lo in lootNow) {
                 double dx = lo.x - pl.x, dy = lo.y - pl.y, dz = lo.z - pl.z;
                 double d = sqrt(dx * dx + dy * dy + dz * dz);
-                if (lo.tier == -5 && lo.actor && d < cd) { cd = d; cannon = lo; }
+                if (lo.tier == -5 && lo.actor) { nCannons++; if (d < nearestCannon) nearestCannon = d; if (d < cd) { cd = d; cannon = lo; } }
+                if (lo.tier == -2) nChests++;
             }
-            if (cannon && cd < 1200.0) {
+            if (cannon && cd < 3000.0) {
                 for (EchoLoot *lo in lootNow) {
                     if (lo.tier != -2) continue;
                     if ([cfSkip containsObject:@((long long)(lo.x * 0.5) ^ ((long long)(lo.y * 0.5) << 20))]) continue;
@@ -3749,6 +3752,11 @@ static void engineEspFrame(void *cv) {
                     if (d < chd && d < 60000.0) { chd = d; chest = lo; }
                 }
             }
+        }
+        static CFTimeInterval cfLog = 0;
+        if (now - cfLog > 4.0) {
+            cfLog = now;
+            metalNote([NSString stringWithFormat:@"farm: on, cannons %d (nearest %.1f m), chests %d, target %@", nCannons, nearestCannon / 100.0, nChests, (cannon && chest) ? @"yes" : @"no"]);
         }
         if (cannon && chest) {
             double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
