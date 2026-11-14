@@ -494,8 +494,15 @@ static BOOL fname_read(int32_t idx, char *out, int cap) {
             if (!safe_read(e + 2, &hi16, 2) || !safe_read(e + 4, &lo16, 2)) return NO;
             uintptr_t blob;
             if (gNameBlobTab) {
+                if (hi16 >= 0x7000) return NO;
                 uintptr_t st = rd_ptr(gNameBlobTab + 8 * (uintptr_t)hi16);
-                blob = st ? (rd_ptr(st) & 0xff00ffffffffffffULL) : 0;
+                uint64_t probe = 0;
+                if (!st || !safe_read(st, &probe, 8)) return NO;
+                char tmp[1100];
+                ((void (*)(char *, const void *, uint32_t))SYM(0x1006d55a4ULL))(tmp, (const void *)(e + 2), (uint32_t)len);
+                memcpy(out, tmp, (size_t)len);
+                out[len] = 0;
+                return YES;
             } else blob = gNameBlobAbs ? gNameBlobAbs
                                 : (gNameBlobDelta ? (uintptr_t)((intptr_t)blk + gNameBlobDelta)
                                                   : rd_ptr(gNameBlobs + 8 * (uintptr_t)((uint32_t)idx >> 16)));
