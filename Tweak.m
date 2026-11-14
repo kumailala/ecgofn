@@ -2049,7 +2049,7 @@ static void renderSnap(EchoFrame *frame, EchoSnap *A, EchoSnap *B, double alpha,
 
     for (EchoSnapPawn *pb in B->pawns) {
         EchoSnapPawn *pa = nil;
-        if (A != B && alpha < 1.0) {
+        if (A != B) {
             for (EchoSnapPawn *c in A->pawns) if (c->pawn == pb->pawn) { pa = c; break; }
             if (pa) {
                 double dx = pa->feet.x - pb->feet.x, dy = pa->feet.y - pb->feet.y, dz = pa->feet.z - pb->feet.z;
@@ -2154,29 +2154,26 @@ static void drawTick(CADisplayLink *link) {
     NSArray<EchoSnap *> *snaps;
     @synchronized (gSnapLock) { snaps = [gSnaps copy]; }
     if (snaps.count) {
-        static const double kMs[5] = { 0, 25, 50, 75, 100 };
-        int di = gOptDelay < 0 ? 0 : (gOptDelay > 4 ? 4 : gOptDelay);
-        CFTimeInterval shown = link.targetTimestamp > 0 ? link.targetTimestamp : CACurrentMediaTime();
-        double T = shown - kMs[di] / 1000.0;
-        EchoSnap *newest = snaps.lastObject, *oldest = snaps.firstObject;
-        if (shown - newest->t < 0.6) {
-            EchoSnap *A = newest, *B = newest;
+        static const double kMs[6] = { -33, -16, 0, 16, 33, 50 };
+        int di = gOptDelay < 0 ? 0 : (gOptDelay > 5 ? 5 : gOptDelay);
+        CFTimeInterval now = CACurrentMediaTime();
+        CFTimeInterval shown = (link.targetTimestamp > 0 ? link.targetTimestamp : now) + (link.duration > 0 ? link.duration : 1.0 / 60.0);
+        double T = shown + kMs[di] / 1000.0;
+        EchoSnap *B = snaps.lastObject;
+        if (shown - B->t < 0.6) {
+            EchoSnap *A = B;
+            for (NSInteger i = (NSInteger)snaps.count - 2; i >= 0; i--) {
+                A = snaps[(NSUInteger)i];
+                if (A->t <= B->t - 0.030) break;
+            }
             double alpha = 1.0;
-            if (T >= newest->t || snaps.count == 1) {
-            } else if (T <= oldest->t) {
-                A = B = oldest;
+            double span = B->t - A->t;
+            if (A != B && span > 0.004 && span < 0.25) {
+                double tt = T > B->t + 0.07 ? B->t + 0.07 : T;
+                alpha = (tt - A->t) / span;
+                if (alpha < 0.0) alpha = 0.0;
             } else {
-                for (NSInteger i = (NSInteger)snaps.count - 1; i >= 1; i--) {
-                    if (snaps[(NSUInteger)i - 1]->t <= T) {
-                        A = snaps[(NSUInteger)i - 1]; B = snaps[(NSUInteger)i];
-                        double span = B->t - A->t;
-                        alpha = span > 1e-6 ? (T - A->t) / span : 1.0;
-                        if (alpha < 0.0) alpha = 0.0;
-                        if (alpha > 1.0) alpha = 1.0;
-                        if (span > 0.25) alpha = 1.0;
-                        break;
-                    }
-                }
+                A = B;
             }
             renderSnap(frame, A, B, alpha, sz);
         }
@@ -2327,7 +2324,7 @@ static void saveOptions(void) {
     [d setFloat:gOptDmgMul forKey:@"echo.dmgmul"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
-    [d setInteger:gOptDelay forKey:@"echo.sync2"];
+    [d setInteger:gOptDelay forKey:@"echo.sync3"];
 }
 
 static void loadOptions(void) {
@@ -2352,7 +2349,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.dmgmul"]) gOptDmgMul = [d floatForKey:@"echo.dmgmul"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
-    if ([d objectForKey:@"echo.sync2"]) gOptDelay = (int)[d integerForKey:@"echo.sync2"];
+    if ([d objectForKey:@"echo.sync3"]) gOptDelay = (int)[d integerForKey:@"echo.sync3"];
 }
 
 @interface EchoMenuHandler : NSObject
@@ -2513,7 +2510,7 @@ static void installMenu(void) {
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
-        addSegment(panel, &y, @"ESP sync delay (ms)", @[ @"0", @"25", @"50", @"75", @"100" ], gOptDelay, 31);
+        addSegment(panel, &y, @"ESP lead (ms)", @[ @"-33", @"-16", @"0", @"+16", @"+33", @"+50" ], gOptDelay, 31);
 
         panel.contentSize = CGSizeMake(pw, y + 8);
         CGFloat ph = MIN(y + 8, ss.height - 40);
