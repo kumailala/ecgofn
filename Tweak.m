@@ -32,6 +32,7 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
+#include <os/lock.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -1839,12 +1840,17 @@ static void applyFrame(EchoFrame *f, CGSize sz);
     float fov;
     NSArray<EchoSnapPawn *> *pawns;
     NSArray<EchoLoot *> *loot;
+    int seq;
 }
 @end
 @implementation EchoSnap
 @end
 
 static double gFrameDt = 1.0 / 60.0;
+typedef struct { int seq; float v[9]; } CamRec;
+static CamRec gCamRing[32];
+static _Atomic int gCamSeq = 0;
+static inline int gCamSeq_load(void) { return atomic_load(&gCamSeq); }
 static NSMutableArray<EchoSnap *> *gSnaps = nil;
 static NSObject *gSnapLock = nil;
 static CGSize gScreenSz = {0, 0};
@@ -2044,6 +2050,17 @@ static void samplerMain(void) {
             lastCam = cam; lastRot = rot; lastTs = ts; lastCap = now; lastPawns = pawns;
             atomic_fetch_add(&gCapCount, 1);
             EchoSnap *s = captureSnap(pawns, cam, rot, fov, now);
+            {
+                int sq = atomic_fetch_add(&gCamSeq, 1) + 1;
+                s->seq = sq;
+                EchoView vw = makeView(cam, rot, fov, CGSizeMake(1, 1));
+                CamRec *rc = &gCamRing[sq & 31];
+                rc->seq = 0;
+                rc->v[0] = (float)vw.fwd.x;   rc->v[1] = (float)vw.fwd.y;   rc->v[2] = (float)vw.fwd.z;
+                rc->v[3] = (float)vw.right.x; rc->v[4] = (float)vw.right.y; rc->v[5] = (float)vw.right.z;
+                rc->v[6] = (float)vw.up.x;    rc->v[7] = (float)vw.up.y;    rc->v[8] = (float)vw.up.z;
+                rc->seq = sq;
+            }
             @synchronized (gSnapLock) {
                 [gSnaps addObject:s];
                 while (gSnaps.count > 160 || (gSnaps.count > 2 && now - gSnaps[0]->t > 1.0)) [gSnaps removeObjectAtIndex:0];
@@ -2241,6 +2258,166 @@ static void drawTick(CADisplayLink *link) {
 }
 
 #pragma mark 6.3 in-frame Metal overlay
+
+#pragma mark 6.4 GPU view matching (find the exact camera the renderer used)
+
+typedef struct { int stage, index, pos, strided, kind, neg, hits; int lagHist[8]; } GVote;
+static GVote gVotes[256];
+static int gVoteN = 0;
+static os_unfair_lock gVoteLock = OS_UNFAIR_LOCK_INIT;
+static volatile int gGpuMode = 0;
+static CFTimeInterval gGpuStart = 0;
+static int gGpuCalls = 0;
+static GVote gLock;
+static volatile int gGpuSeq = -1;
+static volatile double gGpuStamp = 0;
+static double gLagEma = 1.0;
+static const void *gLastBufData[2][32];
+static size_t gLastBufLen[2][32];
+
+static inline BOOL near3(float a, float b, float c, const float *v, float sgn) {
+    const float tol = 3.0e-4f;
+    return fabsf(a - sgn * v[0]) < tol && fabsf(b - sgn * v[1]) < tol && fabsf(c - sgn * v[2]) < tol;
+}
+
+static void gpuVote(int stage, int index, int pos, int strided, int kind, int neg, int back) {
+    os_unfair_lock_lock(&gVoteLock);
+    int k = -1;
+    for (int i = 0; i < gVoteN; i++) {
+        GVote *g = &gVotes[i];
+        if (g->stage == stage && g->index == index && g->pos == pos && g->strided == strided && g->kind == kind && g->neg == neg) { k = i; break; }
+    }
+    if (k < 0 && gVoteN < 256) {
+        k = gVoteN++;
+        memset(&gVotes[k], 0, sizeof gVotes[k]);
+        gVotes[k].stage = stage; gVotes[k].index = index; gVotes[k].pos = pos;
+        gVotes[k].strided = strided; gVotes[k].kind = kind; gVotes[k].neg = neg;
+    }
+    if (k >= 0) { gVotes[k].hits++; if (back >= 0 && back < 8) gVotes[k].lagHist[back]++; }
+    os_unfair_lock_unlock(&gVoteLock);
+}
+
+static void gpuDiscover(int stage, int index, const void *data, size_t len) {
+    size_t nf = len / 4;
+    if (nf < 12) return;
+    const float *f = (const float *)data;
+    int head = gCamSeq_load();
+    for (int back = 0; back < 4; back++) {
+        int sq = head - back;
+        if (sq <= 0) break;
+        CamRec *r = &gCamRing[sq & 31];
+        if (r->seq != sq) continue;
+        for (int kind = 0; kind < 3; kind++) {
+            const float *v = &r->v[kind * 3];
+            for (size_t p = 0; p + 2 < nf; p++) {
+                float a = f[p];
+                if (!(a > -1.0001f && a < 1.0001f)) continue;
+                float b = f[p + 1], c = f[p + 2];
+                if (near3(a, b, c, v, 1.0f)) gpuVote(stage, index, (int)p, 0, kind, 0, back);
+                else if (near3(a, b, c, v, -1.0f)) gpuVote(stage, index, (int)p, 0, kind, 1, back);
+                if (p + 8 < nf) {
+                    float b2 = f[p + 4], c2 = f[p + 8];
+                    if (near3(a, b2, c2, v, 1.0f)) gpuVote(stage, index, (int)p, 1, kind, 0, back);
+                    else if (near3(a, b2, c2, v, -1.0f)) gpuVote(stage, index, (int)p, 1, kind, 1, back);
+                }
+            }
+        }
+    }
+}
+
+static void gpuMatchLocked(const void *data, size_t len) {
+    const float *f = (const float *)data;
+    size_t need = (size_t)gLock.pos + (gLock.strided ? 9 : 3);
+    if (len < need * 4) return;
+    float t0 = f[gLock.pos], t1, t2;
+    if (gLock.strided) { t1 = f[gLock.pos + 4]; t2 = f[gLock.pos + 8]; } else { t1 = f[gLock.pos + 1]; t2 = f[gLock.pos + 2]; }
+    float sgn = gLock.neg ? -1.0f : 1.0f;
+    int head = gCamSeq_load();
+    float bestE = 1e9f, secondE = 1e9f;
+    int bestSeq = -1;
+    for (int back = 0; back < 24; back++) {
+        int sq = head - back;
+        if (sq <= 0) break;
+        CamRec *r = &gCamRing[sq & 31];
+        if (r->seq != sq) continue;
+        const float *v = &r->v[gLock.kind * 3];
+        float e = fmaxf(fabsf(t0 - sgn * v[0]), fmaxf(fabsf(t1 - sgn * v[1]), fabsf(t2 - sgn * v[2])));
+        if (e < bestE) { secondE = bestE; bestE = e; bestSeq = sq; }
+        else if (e < secondE) secondE = e;
+    }
+    if (bestSeq < 0 || bestE > 4.0e-4f) return;
+    if (secondE > bestE * 4.0f + 2.0e-4f) {
+        gLagEma = gLagEma * 0.95 + (double)(head - bestSeq) * 0.05;
+    } else {
+        bestSeq = head - (int)floor(gLagEma + 0.5);
+        if (bestSeq <= 0) return;
+    }
+    gGpuSeq = bestSeq;
+    gGpuStamp = CACurrentMediaTime();
+}
+
+static inline void gpuInspect(int stage, int index, const void *data, size_t len) {
+    int mode = gGpuMode;
+    if (mode == 1) {
+        if (len < 64 || len > 8192 || !data) return;
+        if ((++gGpuCalls & 31) != 0) return;
+        gpuDiscover(stage, index, data, len);
+    } else if (mode == 2) {
+        if (stage != gLock.stage || index != gLock.index || !data) return;
+        gpuMatchLocked(data, len);
+    }
+}
+
+static inline void gpuBuf(int stage, int index, id buf, NSUInteger off) {
+    if (index < 0 || index > 31) return;
+    int mode = gGpuMode;
+    if (mode == 0 || mode == 3) return;
+    if (mode == 2 && (stage != gLock.stage || index != gLock.index)) {
+        return;
+    }
+    id<MTLBuffer> b = (id<MTLBuffer>)buf;
+    if (!b) return;
+    const uint8_t *base = (const uint8_t *)b.contents;
+    if (!base || off >= b.length) return;
+    size_t len = (size_t)(b.length - off);
+    if (len > 8192) len = 8192;
+    gLastBufData[stage][index] = base;
+    gLastBufLen[stage][index] = (size_t)(b.length);
+    gpuInspect(stage, index, base + off, len);
+}
+
+static void gpuFinalize(void) {
+    os_unfair_lock_lock(&gVoteLock);
+    int best = -1;
+    for (int i = 0; i < gVoteN; i++) if (best < 0 || gVotes[i].hits > gVotes[best].hits) best = i;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"gpu discovery: %d candidate slots, calls %d", gVoteN, gGpuCalls];
+    int shown = 0;
+    for (int pass = 0; pass < 5; pass++) {
+        int bi = -1;
+        for (int i = 0; i < gVoteN; i++) {
+            if (gVotes[i].hits < 0) continue;
+            if (bi < 0 || gVotes[i].hits > gVotes[bi].hits) bi = i;
+        }
+        if (bi < 0) break;
+        GVote *g = &gVotes[bi];
+        [m appendFormat:@"\n  stage %d idx %d pos %d strided %d kind %d neg %d hits %d lag[%d %d %d %d]", g->stage, g->index, g->pos, g->strided, g->kind, g->neg, g->hits, g->lagHist[0], g->lagHist[1], g->lagHist[2], g->lagHist[3]];
+        if (pass == 0) best = bi;
+        g->hits = -g->hits;
+        shown++;
+    }
+    for (int i = 0; i < gVoteN; i++) if (gVotes[i].hits < 0) gVotes[i].hits = -gVotes[i].hits;
+    if (best >= 0 && gVotes[best].hits >= 12) {
+        gLock = gVotes[best];
+        gGpuMode = 2;
+        [m appendString:@"\n  -> LOCKED"];
+    } else {
+        gGpuMode = 3;
+        [m appendString:@"\n  -> nothing found, using lag slider"];
+    }
+    os_unfair_lock_unlock(&gVoteLock);
+    metalNote(m);
+}
+
 
 typedef struct { float p[2]; float uv[2]; float c[4]; } EVert;
 
@@ -2443,6 +2620,30 @@ static int buildVerts(EchoFrame *f, CGSize sz, EVert *out) {
 }
 
 
+static EchoFrame *frameForSeq(int seq, CFTimeInterval ref, CGSize sz) {
+    NSArray<EchoSnap *> *snaps;
+    @synchronized (gSnapLock) { snaps = [gSnaps copy]; }
+    for (NSInteger i = (NSInteger)snaps.count - 1; i >= 0; i--) {
+        EchoSnap *S = snaps[(NSUInteger)i];
+        if (S->seq == seq) {
+            EchoFrame *frame = emptyFrame();
+            if (ref - snaps.lastObject->t > 0.6) return frame;
+            renderSnap(frame, S, S, 1.0, sz);
+            return frame;
+        }
+        if (S->seq < seq) break;
+    }
+    return nil;
+}
+
+static BOOL camMoving(void) {
+    int head = gCamSeq_load();
+    CamRec *a = &gCamRing[head & 31], *b = &gCamRing[(head - 8) & 31];
+    if (a->seq != head || b->seq != head - 8) return NO;
+    float d = a->v[0] * b->v[0] + a->v[1] * b->v[1] + a->v[2] * b->v[2];
+    return d < 0.9995f;
+}
+
 static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     id<MTLTexture> tex = dr.texture;
     if (!tex || !(tex.usage & MTLTextureUsageRenderTarget) || tex.sampleCount != 1) return;
@@ -2451,7 +2652,17 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     if (sz.width < 10 || sz.height < 10) return;
     CFTimeInterval now = CACurrentMediaTime();
     float li = gOptLagF < 0.0f ? 0.0f : (gOptLagF > 3.0f ? 3.0f : gOptLagF);
-    EchoFrame *f = frameForTicks(li, now, sz);
+    if (gGpuMode == 0 && gMDraws > 150 && camMoving()) { gGpuStart = now; gGpuMode = 1; metalNote(@"gpu view discovery started"); }
+    if (gGpuMode == 1 && now - gGpuStart > 7.0) gpuFinalize();
+    EchoFrame *f = nil;
+    BOOL exact = NO;
+    if (gGpuMode == 2) {
+        int gs = gGpuSeq;
+        if (gs > 0 && now - gGpuStamp < 0.05) { f = frameForSeq(gs, now, sz); exact = (f != nil); }
+    }
+    if (!f) f = frameForTicks(li, now, sz);
+    static int exactN = 0, totalN = 0;
+    totalN++; if (exact) exactN++;
     gMBufIdx = (gMBufIdx + 1) % kRing;
     id<MTLBuffer> buf = gMBufs[gMBufIdx];
     int n = buildVerts(f, sz, (EVert *)buf.contents);
@@ -2471,7 +2682,7 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     [enc endEncoding];
     gMDraws++;
     if (gMDraws == 1 || gMDraws % 600 == 0)
-        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %.2f ticks caps %d sawPresentSel %d", gMDraws, n, (int)f.tags.count, li, atomic_load(&gCapCount), (int)gSawPresentSel]);
+        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %.2f ticks caps %d exact %d/%d lagEma %.2f mode %d", gMDraws, n, (int)f.tags.count, li, atomic_load(&gCapCount), exactN, totalN, gLagEma, gGpuMode]);
 }
 
 static void metalMark(id cb, id drawable) {
@@ -2547,6 +2758,53 @@ static void hookMetalClass(Class c) {
     }
 }
 
+static void hookEncoderClass(Class c) {
+    static NSMutableSet *done = nil;
+    if (!done) done = [NSMutableSet set];
+    NSString *cn = NSStringFromClass(c);
+    if ([done containsObject:cn]) return;
+    [done addObject:cn];
+    for (int st = 0; st < 2; st++) {
+        SEL sb = st == 0 ? @selector(setVertexBuffer:offset:atIndex:) : @selector(setFragmentBuffer:offset:atIndex:);
+        Method m = class_getInstanceMethod(c, sb);
+        if (m) {
+            IMP o = method_getImplementation(m);
+            int stage = st;
+            IMP n = imp_implementationWithBlock(^(id s, id b, NSUInteger off, NSUInteger idx) {
+                gpuBuf(stage, (int)idx, b, off);
+                ((void (*)(id, SEL, id, NSUInteger, NSUInteger))o)(s, sb, b, off, idx);
+            });
+            class_replaceMethod(c, sb, n, method_getTypeEncoding(m));
+        }
+        SEL sy = st == 0 ? @selector(setVertexBytes:length:atIndex:) : @selector(setFragmentBytes:length:atIndex:);
+        Method m2 = class_getInstanceMethod(c, sy);
+        if (m2) {
+            IMP o = method_getImplementation(m2);
+            int stage = st;
+            IMP n = imp_implementationWithBlock(^(id s, const void *bytes, NSUInteger len, NSUInteger idx) {
+                if (gGpuMode == 1 || gGpuMode == 2) gpuInspect(stage, (int)idx, bytes, (size_t)len);
+                ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))o)(s, sy, bytes, len, idx);
+            });
+            class_replaceMethod(c, sy, n, method_getTypeEncoding(m2));
+        }
+        SEL so = st == 0 ? @selector(setVertexBufferOffset:atIndex:) : @selector(setFragmentBufferOffset:atIndex:);
+        Method m3 = class_getInstanceMethod(c, so);
+        if (m3) {
+            IMP o = method_getImplementation(m3);
+            int stage = st;
+            IMP n = imp_implementationWithBlock(^(id s, NSUInteger off, NSUInteger idx) {
+                if ((gGpuMode == 1 || gGpuMode == 2) && idx < 32 && gLastBufData[stage][idx] && off < gLastBufLen[stage][idx]) {
+                    size_t len = gLastBufLen[stage][idx] - (size_t)off;
+                    if (len > 8192) len = 8192;
+                    gpuInspect(stage, (int)idx, (const uint8_t *)gLastBufData[stage][idx] + off, len);
+                }
+                ((void (*)(id, SEL, NSUInteger, NSUInteger))o)(s, so, off, idx);
+            });
+            class_replaceMethod(c, so, n, method_getTypeEncoding(m3));
+        }
+    }
+}
+
 static void installMetalHooks(void) {
     static BOOL done = NO;
     if (done) return;
@@ -2560,6 +2818,30 @@ static void installMetalHooks(void) {
     hookMetalClass(c1);
     if (c2 != c1 && class_getSuperclass(c2) != c1) hookMetalClass(c2);
     metalNote([NSString stringWithFormat:@"hooked command buffer classes: %@ %@", NSStringFromClass(c1), NSStringFromClass(c2)]);
+    @try {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:4 height:4 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = t;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+        id<MTLRenderCommandEncoder> enc = [cb1 renderCommandEncoderWithDescriptor:rp];
+        Class ec = object_getClass(enc);
+        [enc endEncoding];
+        hookEncoderClass(ec);
+        id<MTLCommandBuffer> cb3 = [q commandBuffer];
+        id<MTLParallelRenderCommandEncoder> pe = [cb3 parallelRenderCommandEncoderWithDescriptor:rp];
+        id<MTLRenderCommandEncoder> sub = [pe renderCommandEncoder];
+        Class sc = object_getClass(sub);
+        [sub endEncoding];
+        [pe endEncoding];
+        if (sc != ec) hookEncoderClass(sc);
+        metalNote([NSString stringWithFormat:@"hooked encoder classes: %@ %@", NSStringFromClass(ec), NSStringFromClass(sc)]);
+    } @catch (NSException *ex) {
+        metalNote([NSString stringWithFormat:@"encoder hook exception: %@", ex]);
+    }
 }
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
