@@ -373,6 +373,7 @@ static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
+static volatile BOOL gFarmActiveNow = NO;
 static int   gTrigFires = 0, gTrigCand = 0, gTrigLos = 0;
 static BOOL  gOptHudLayout = NO;
 static BOOL  gOptLowGfx = NO;
@@ -3744,6 +3745,7 @@ static void engineEspFrame(void *cv) {
         BOOL farmOn = (gOptCannonFarm || now < manualUntil) && gOptChest;
         static uintptr_t farmHomeActor = 0;
         static DV3 farmHome = {0, 0, 0};
+        gFarmActiveNow = farmOn;
         if (!farmOn && farmHomeActor) {
             uintptr_t fSR = SYM(0x100d0b050);
             if (fSR >= gImgBase && fSR < gImgEnd && rd_ptr(farmHomeActor + (uintptr_t)gOffClass) > 0x100000000ULL) {
@@ -3792,15 +3794,37 @@ static void engineEspFrame(void *cv) {
             if (chest && (cannon || now < manualUntil)) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) { cfKey = key; cfSince = now; }
-                if (now - cfSince > (cannon ? 2.5 : 7.0)) {
+                if (now - cfSince > (cannon ? 1.0 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
                     metalNote(@"farm: skipping a chest after 7 s");
                 } else {
                     static int ramFlip = 0;
+                    static double testKey = 0;
                     ramFlip++;
-                    double wantX = cannon ? chest.x : chest.x - 700.0, wantY = chest.y;
+                    if (cannon && testKey != key) {
+                        testKey = key;
+                        void **svt = (void **)rd_ptr(cannon.actor);
+                        uintptr_t fTest = svt ? rd_ptr((uintptr_t)&svt[181]) : 0;
+                        static int testLog = 0;
+                        if (fTest >= gImgBase && fTest < gImgEnd && testLog < 30) {
+                            testLog++;
+                            DV3 trot = { 0.0, rot.y, 0.0 };
+                            DV3 c0 = { chest.x, chest.y, chest.z + 40.0 }, c1 = { chest.x, chest.y, chest.z + 220.0 };
+                            BOOL r0 = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTest)((void *)cannon.actor, &c0, &trot, YES, NO) & 1) != 0;
+                            BOOL r1 = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTest)((void *)cannon.actor, &c1, &trot, YES, NO) & 1) != 0;
+                            metalNote([NSString stringWithFormat:@"farm: placement test at chest ok=%d, above chest ok=%d", r0, r1]);
+                        }
+                    }
+                    static const double kShift[5][2] = { {0, 0}, {120, 0}, {-120, 0}, {0, 120}, {0, -120} };
+                    int shiftIdx = cannon ? (int)((now - cfSince) / 0.3) % 5 : 0;
+                    double wantX = cannon ? chest.x + kShift[shiftIdx][0] : chest.x - 700.0;
+                    double wantY = cannon ? chest.y + kShift[shiftIdx][1] : chest.y;
                     double wantZ = cannon ? chest.z + 40.0 + ((ramFlip & 1) ? 45.0 : -5.0) : chest.z + 220.0;
+                    if (cannon) {
+                        double sx2 = mp.x - wantX, sy2 = mp.y - wantY, sz2 = mp.z - wantZ;
+                        if (sqrt(sx2 * sx2 + sy2 * sy2 + sz2 * sz2) > 1500.0 && now - cfSince > 0.8) wantZ += 600.0;
+                    }
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if ((cannon || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > 0.03) {
                         static int tpChain = 0, tpFail = 0, tpN = 0;
@@ -4059,7 +4083,16 @@ static void installLabelLayer(void) {
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                                   250ull * NSEC_PER_MSEC, 50ull * NSEC_PER_MSEC);
-        dispatch_source_set_event_handler(t, ^{ scanPawns(); });
+        __block BOOL fastScan = NO;
+        dispatch_source_set_event_handler(t, ^{
+            scanPawns();
+            BOOL want = gFarmActiveNow;
+            if (want != fastScan) {
+                fastScan = want;
+                dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 20ull * NSEC_PER_MSEC),
+                                          (want ? 70ull : 250ull) * NSEC_PER_MSEC, 10ull * NSEC_PER_MSEC);
+            }
+        });
         gScanTimer = t;
         dispatch_resume(t);
     });
