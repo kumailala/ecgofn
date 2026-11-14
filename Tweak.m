@@ -463,18 +463,20 @@ static void flushResolveLog(void) {
 static uintptr_t gNameBlocks = 0;
 static int gNameShift = 6;
 
+static int gNameStride = 2, gNameTextOff = 2;
+
 static BOOL fname_read(int32_t idx, char *out, int cap) {
     if (!gNameBlocks || idx < 0 || cap < 2) return NO;
     uintptr_t blk = rd_ptr(gNameBlocks + 8 * (uintptr_t)((uint32_t)idx >> 16));
     if (!blk) return NO;
-    uintptr_t e = blk + 2 * (uintptr_t)((uint32_t)idx & 0xFFFF);
+    uintptr_t e = blk + (uintptr_t)gNameStride * (uintptr_t)((uint32_t)idx & 0xFFFF);
     uint16_t h = 0;
-    if (!safe_read(e, &h, 2)) return NO;
+    if (!safe_read(e + (uintptr_t)gNameTextOff - 2, &h, 2)) return NO;
     if (h & 1) return NO;
     int len = h >> gNameShift;
     if (len <= 0) return NO;
     if (len >= cap) len = cap - 1;
-    if (!safe_read(e + 2, out, (size_t)len)) return NO;
+    if (!safe_read(e + (uintptr_t)gNameTextOff, out, (size_t)len)) return NO;
     out[len] = 0;
     return YES;
 }
@@ -546,6 +548,84 @@ static BOOL scanForNamePool(uintptr_t lo, uintptr_t hi) {
     }
     free(buf);
     return found;
+}
+
+static BOOL poolTestBlock(uintptr_t v, uintptr_t slotForBi0, const int32_t *idxs, int ni, int levelBi) {
+    (void)levelBi;
+    static const int strides[] = { 2, 4, 8 };
+    for (int k = 0; k < ni; k++) {
+        uint32_t bi = (uint32_t)idxs[k] >> 16;
+        if (bi > 64) continue;
+        for (int si = 0; si < 3; si++) {
+            uint8_t b[24];
+            if (!safe_read(v + (uintptr_t)strides[si] * (uintptr_t)((uint32_t)idxs[k] & 0xFFFF), b, sizeof b)) continue;
+            for (int t = 2; t <= 12; t += 2) {
+                if (memcmp(b + t, "Class", 5) != 0) continue;
+                uint16_t h; memcpy(&h, b + t - 2, 2);
+                if (h & 1) continue;
+                int sh = ((h >> 6) == 5) ? 6 : (((h >> 1) == 5) ? 1 : 0);
+                if (!sh) continue;
+                gNameShift = sh; gNameStride = strides[si]; gNameTextOff = t;
+                gNameBlocks = slotForBi0 - 8 * (uintptr_t)bi;
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static BOOL poolByClassIn(uintptr_t lo, uintptr_t hi, const int32_t *idxs, int ni, BOOL indirect) {
+    const size_t slab = 1 << 20;
+    uint64_t *buf = (uint64_t *)malloc(slab);
+    if (!buf) return NO;
+    BOOL found = NO;
+    for (uintptr_t a = lo; a < hi && !found; a += slab) {
+        size_t n = hi - a < slab ? hi - a : slab;
+        if (!safe_read(a, buf, n)) {
+            size_t good = 0;
+            for (size_t off = 0; off < n; off += 16384) {
+                size_t m = n - off < 16384 ? n - off : 16384;
+                if (!safe_read(a + off, (uint8_t *)buf + off, m)) memset((uint8_t *)buf + off, 0, m);
+                else good += m;
+            }
+            if (!good) continue;
+        }
+        for (size_t i = 0; i < n / 8 && !found; i++) {
+            uint64_t v = buf[i];
+            if (v < 0x100000000ULL || v > 0x0000FFFFFFFFFFFFULL) continue;
+            if (v >= gImgBase && v < gImgEnd) continue;
+            if (!indirect) {
+                if (poolTestBlock((uintptr_t)v, a + i * 8, idxs, ni, 0)) found = YES;
+            } else {
+                uint64_t w[24];
+                if (!safe_read((uintptr_t)v, w, sizeof w)) continue;
+                for (int j = 0; j < 24 && !found; j++) {
+                    if (w[j] < 0x100000000ULL || w[j] > 0x0000FFFFFFFFFFFFULL || (w[j] >= gImgBase && w[j] < gImgEnd)) continue;
+                    if (poolTestBlock((uintptr_t)w[j], (uintptr_t)v + (uintptr_t)j * 8, idxs, ni, 1)) found = YES;
+                }
+            }
+        }
+    }
+    free(buf);
+    return found;
+}
+
+static BOOL poolByClass(uintptr_t cc, int classOff) {
+    int32_t idxs[8];
+    int ni = 0;
+    for (int nk = 0x8; nk <= 0x30 && ni < 8; nk += 8) {
+        if (nk == classOff) continue;
+        int32_t v = rd_i32(cc + (uintptr_t)nk);
+        if (v > 0) idxs[ni++] = v;
+    }
+    if (!ni) return NO;
+    if (poolByClassIn(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL), idxs, ni, NO)) return YES;
+    if (poolByClassIn(SYM(0x10ebd3380ULL), SYM(0x112d7c850ULL), idxs, ni, NO)) return YES;
+    static BOOL indirectTried = NO;
+    if (indirectTried) return NO;
+    indirectTried = YES;
+    if (poolByClassIn(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL), idxs, ni, YES)) return YES;
+    return poolByClassIn(SYM(0x10ebd3380ULL), SYM(0x112d7c850ULL), idxs, ni, YES);
 }
 
 static BOOL findNamePool(void) {
@@ -637,6 +717,15 @@ static BOOL snapshotObjects(void) {
     for (int32_t i = 0; i < lim && !cc; i++) if (gSnapObj[i] && rd_ptr(gSnapObj[i] + (uintptr_t)gOffClass) == gSnapObj[i]) cc = gSnapObj[i];
     static const int nameCand[] = { 0x8, 0x10, 0x18, 0x20, 0x28, 0x30 };
     BOOL nameOk = NO;
+    if (!gNameBlocks && !poolByClass(cc, gOffClass)) {
+        RLOG(@"namepool: not found via Class entry; Class object %p dump:", (void *)cc);
+        NSMutableString *d = [NSMutableString stringWithFormat:@"cc %p:", (void *)cc];
+        for (int off = 0; off < 0x38; off += 8) { RLOG(@"  +0x%x = %p", off, (void *)rd_ptr(cc + (uintptr_t)off)); [d appendFormat:@" %lx", (unsigned long)rd_ptr(cc + (uintptr_t)off)]; }
+        gResolveLine = @"resolve: NAMEPOOL FAILED";
+        gResolveLine2 = d;
+        return NO;
+    }
+    RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx) shift %d stride %d textoff %d", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide), gNameShift, gNameStride, gNameTextOff);
     for (size_t k = 0; k < sizeof nameCand / sizeof nameCand[0]; k++) {
         if (nameCand[k] == gOffClass) continue;
         if (name_is(rd_i32(cc + (uintptr_t)nameCand[k]), "Class")) { gOffName = nameCand[k]; nameOk = YES; break; }
@@ -810,8 +899,6 @@ static BOOL resolveAll(void) {
     gResolveLine = @"resolve: objarray…";
     if (!resolveObjArray()) { flushResolveLog(); return NO; }
     gResolveLine = @"resolve: name pool…";
-    if (!findNamePool()) { RLOG(@"namepool: NOT FOUND"); gResolveLine = @"resolve: NAMEPOOL FAILED"; gResolveLine2 = [NSString stringWithFormat:@"scanned bss %p-%p", (void *)SYM(0x112d7f9c0ULL), (void *)SYM(0x113214000ULL)]; flushResolveLog(); return NO; }
-    RLOG(@"namepool: Blocks[0] slot at %p (image+0x%lx) shift %d", (void *)gNameBlocks, (unsigned long)(gNameBlocks - gSlide), gNameShift);
     gResolveLine = @"resolve: snapshot…";
     if (!snapshotObjects()) { if ([gResolveLine isEqualToString:@"resolve: snapshot…"]) gResolveLine = @"resolve: SNAPSHOT FAILED"; flushResolveLog(); return NO; }
 
@@ -1089,6 +1176,9 @@ static void scanPawns(void) {
         static CFTimeInterval firstTry = 0;
         if (!firstTry) firstTry = now;
         if (gResolving || now - gLastResolveTry < 6.0 || now - firstTry < 15.0) { publishPawns(nil, 0, 0); return; }
+        static int attempts = 0;
+        if (attempts >= 5) { publishPawns(nil, 0, 0); return; }
+        attempts++;
         gResolving = YES; gLastResolveTry = now;
         gResolved = resolveAll();
         gResolving = NO;
