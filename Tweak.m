@@ -465,6 +465,7 @@ static int gNameShift = 6;
 
 static int gNameStride = 2, gNameTextOff = 2, gNameIdxAdd = 0;
 static uintptr_t gNameBlobs = 0;
+static intptr_t gNameBlobDelta = 0;
 static int32_t rd_i32(uintptr_t a);
 static int32_t fnidx(uintptr_t a) { return rd_i32(a + (uintptr_t)gNameIdxAdd); }
 
@@ -486,10 +487,11 @@ static BOOL fname_read(int32_t idx, char *out, int cap) {
         }
         if (h & (gNameShift == 5 ? 0x8000 : 1)) return NO;
         if (len >= cap) len = cap - 1;
-        if (gNameBlobs) {
+        if (gNameBlobs || gNameBlobDelta) {
             uint16_t hi16 = 0, lo16 = 0;
             if (!safe_read(e + 2, &hi16, 2) || !safe_read(e + 4, &lo16, 2)) return NO;
-            uintptr_t blob = rd_ptr(gNameBlobs + 8 * (uintptr_t)((uint32_t)idx >> 16));
+            uintptr_t blob = gNameBlobDelta ? (uintptr_t)((intptr_t)blk + gNameBlobDelta)
+                                            : rd_ptr(gNameBlobs + 8 * (uintptr_t)((uint32_t)idx >> 16));
             if (!blob) return NO;
             if (!safe_read(blob + (((uintptr_t)hi16 << 16) | lo16), out, (size_t)len)) return NO;
             out[len] = 0;
@@ -670,6 +672,23 @@ static BOOL poolStatic(uintptr_t cc, int classOff) {
     if (!gNameBlobs) {
         uintptr_t pool = SYM(0x11317f0c0ULL);
         if (!findBlobSlot(pool, pool + 0x27000)) findBlobSlot(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL));
+        if (!gNameBlobs) {
+            uintptr_t blk0 = rd_ptr(gNameBlocks);
+            const size_t span = 0x400000;
+            uint8_t *mem = (uint8_t *)malloc(span);
+            if (mem && blk0) {
+                size_t got = 0;
+                for (size_t off = 0; off < span; off += 0x10000) {
+                    if (!safe_read(blk0 + off, mem + off, 0x10000)) break;
+                    got = off + 0x10000;
+                }
+                for (size_t p = 0; p + 16 <= got; p += 2) {
+                    if (memcmp(mem + p, "NoneByteProperty", 16) == 0) { gNameBlobDelta = (intptr_t)p; break; }
+                }
+                RLOG(@"namepool: blob search after entries: delta 0x%lx (scanned 0x%zx)", (long)gNameBlobDelta, got);
+            }
+            free(mem);
+        }
         RLOG(@"namepool: text blob table slot %p (image+0x%lx), blob0 %p, entries blk0 %p", (void *)gNameBlobs, gNameBlobs ? (unsigned long)(gNameBlobs - gSlide) : 0UL, (void *)(gNameBlobs ? rd_ptr(gNameBlobs) : 0), (void *)rd_ptr(gNameBlocks));
     }
     for (int add = 0; add <= 4; add += 4) {
