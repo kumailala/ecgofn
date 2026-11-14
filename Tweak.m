@@ -365,7 +365,7 @@ static BOOL  gOptAutoSprint = NO;
 static BOOL  gOptPeek = NO;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
-static int   gOptDelay = 1;
+static int   gOptDelay = 2;
 
 typedef struct { double x, y, z; } DV3;
 typedef struct { double q[4]; double t[3]; double tp; double s[3]; double sp; } DXf;
@@ -1813,13 +1813,336 @@ static BOOL readC2W(uintptr_t mesh, DV3 nearPt, DXf *out) {
 
 static void applyFrame(EchoFrame *f, CGSize sz);
 
-static void updateESP(void) {
+@interface EchoSnapPawn : NSObject {
+@public
+    uintptr_t pawn;
+    BOOL team, downed, haveBones;
+    DV3 feet, top, head, body;
+    DV3 pts[kMaxSel];
+    BOOL ptOk[kMaxSel];
+    EchoPawn *meta;
+}
+@end
+@implementation EchoSnapPawn
+@end
+
+@interface EchoSnap : NSObject {
+@public
+    CFTimeInterval t;
+    DV3 cam, rot;
+    float fov;
+    NSArray<EchoSnapPawn *> *pawns;
+    NSArray<EchoLoot *> *loot;
+}
+@end
+@implementation EchoSnap
+@end
+
+static NSMutableArray<EchoSnap *> *gSnaps = nil;
+static NSObject *gSnapLock = nil;
+static CGSize gScreenSz = {0, 0};
+
+static EchoView makeView(DV3 cam, DV3 rot, float fov, CGSize sz) {
+    double pr = rot.x * M_PI / 180.0, yr = rot.y * M_PI / 180.0, rr = rot.z * M_PI / 180.0;
+    double sp = sin(pr), cp = cos(pr), sy = sin(yr), cy = cos(yr), sr = sin(rr), cr = cos(rr);
+    EchoView view;
+    view.cam = cam;
+    view.fwd   = (DV3){ cp * cy, cp * sy, sp };
+    view.right = (DV3){ sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp };
+    view.up    = (DV3){ -(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp };
+    view.tanHalf = tan(fov * M_PI / 360.0);
+    view.aspect = sz.height > 0 ? sz.width / sz.height : 1.0;
+    return view;
+}
+
+static inline DV3 lerpV(DV3 a, DV3 b, double t) {
+    return (DV3){ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t };
+}
+
+static inline DV3 lerpRot(DV3 a, DV3 b, double t) {
+    return (DV3){ a.x + wrap180(b.x - a.x) * t, a.y + wrap180(b.y - a.y) * t, a.z + wrap180(b.z - a.z) * t };
+}
+
+static EchoSnap *captureSnap(NSArray<EchoPawn *> *pawns, DV3 cam, DV3 rot, float fov, CFTimeInterval t) {
+    EchoSnap *s = [[EchoSnap alloc] init];
+    s->t = t; s->cam = cam; s->rot = rot; s->fov = fov;
+    NSMutableArray<EchoSnapPawn *> *list = [NSMutableArray arrayWithCapacity:pawns.count];
+    for (EchoPawn *ep in pawns) {
+        if (pawnFlag(ep.pawn, O_DYING, M_DYING)) continue;
+        BOOL downed = pawnFlag(ep.pawn, O_DBNO, M_DBNO);
+
+        DV3 center = {0,0,0};
+        double half = 0.0;
+        BOOL haveCap = NO;
+        uintptr_t cap = O_CHAR_CAPSULE >= 0 ? rd_ptr(ep.pawn + (uintptr_t)O_CHAR_CAPSULE) : 0;
+        if (cap >= 0x100000000ULL && O_CAPSULE_HH >= 0 && O_SCENE_RELLOC >= 0) {
+            half = rd_f32(cap + (uintptr_t)O_CAPSULE_HH);
+            if (half > 20.0 && half < 140.0 &&
+                safe_read(cap + (uintptr_t)O_SCENE_RELLOC, &center, sizeof center) && sane_dv(center)) haveCap = YES;
+        }
+        if (!haveCap) {
+            if (!actorLocation(ep.pawn, &center)) continue;
+            half = 88.0;
+        }
+
+        EchoSnapPawn *sp = [[EchoSnapPawn alloc] init];
+        sp->pawn = ep.pawn; sp->meta = ep; sp->team = ep.team; sp->downed = downed;
+        sp->feet = (DV3){ center.x, center.y, center.z - half };
+        sp->head = (DV3){ center.x, center.y, center.z + half * 0.80 };
+        sp->body = (DV3){ center.x, center.y, center.z + half * 0.25 };
+        sp->top  = (DV3){ center.x, center.y, center.z + half };
+        memset(sp->ptOk, 0, sizeof sp->ptOk);
+        sp->haveBones = NO;
+
+        if ((gOptSkeleton || gOptAimbot) && ep.bones && ep.bones->parent && O_CHAR_MESH >= 0) {
+            uintptr_t mesh = rd_ptr(ep.pawn + (uintptr_t)O_CHAR_MESH);
+            DXf c2w;
+            if (mesh >= 0x100000000ULL && readC2W(mesh, center, &c2w)) {
+                uintptr_t arr = 0;
+                int32_t bn = 0;
+                BOOL direct = NO;
+                findSkelArray(mesh, ep.bones, &arr, &bn, &direct);
+                if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
+                if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
+                    safe_read(arr, gLocalBones, (size_t)bn * sizeof(DXf)) && looks_like_xform(&gLocalBones[0])) {
+                    static DXf comp[kMaxBones];
+                    for (int i = 0; i < bn; i++) {
+                        const DXf *l = &gLocalBones[i];
+                        int pi = ep.bones->parent[i];
+                        DXf *c = &comp[i];
+                        if (direct || pi < 0 || pi >= i) {
+                            *c = *l;
+                        } else {
+                            const DXf *pc2 = &comp[pi];
+                            DV3 lt = { l->t[0] * pc2->s[0], l->t[1] * pc2->s[1], l->t[2] * pc2->s[2] };
+                            DV3 rt = qrot(pc2->q, lt);
+                            c->t[0] = pc2->t[0] + rt.x; c->t[1] = pc2->t[1] + rt.y; c->t[2] = pc2->t[2] + rt.z;
+                            double ax = pc2->q[0], ay = pc2->q[1], az = pc2->q[2], aw = pc2->q[3];
+                            double bx = l->q[0], by2 = l->q[1], bz = l->q[2], bw = l->q[3];
+                            c->q[0] = aw * bx + ax * bw + ay * bz - az * by2;
+                            c->q[1] = aw * by2 - ax * bz + ay * bw + az * bx;
+                            c->q[2] = aw * bz + ax * by2 - ay * bx + az * bw;
+                            c->q[3] = aw * bw - ax * bx - ay * by2 - az * bz;
+                            c->s[0] = pc2->s[0] * l->s[0]; c->s[1] = pc2->s[1] * l->s[1]; c->s[2] = pc2->s[2] * l->s[2];
+                        }
+                    }
+                    for (int k = 0; k < ep.bones->n; k++) {
+                        int bi = ep.bones->idx[k];
+                        if (bi >= bn) continue;
+                        const DXf *c = &comp[bi];
+                        DV3 lp = { c->t[0] * c2w.s[0], c->t[1] * c2w.s[1], c->t[2] * c2w.s[2] };
+                        DV3 r = qrot(c2w.q, lp);
+                        sp->pts[k] = (DV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
+                        sp->ptOk[k] = sane_dv(sp->pts[k]);
+                    }
+                    sp->haveBones = YES;
+                    int hi = ep.bones->head, ni = ep.bones->neck, pi2 = ep.bones->pelvis;
+                    if (hi >= 0 && sp->ptOk[hi]) sp->head = sp->pts[hi];
+                    if (ni >= 0 && pi2 >= 0 && sp->ptOk[ni] && sp->ptOk[pi2])
+                        sp->body = (DV3){ (sp->pts[ni].x + sp->pts[pi2].x) * 0.5, (sp->pts[ni].y + sp->pts[pi2].y) * 0.5, (sp->pts[ni].z + sp->pts[pi2].z) * 0.5 };
+                }
+            }
+        }
+        if (sp->haveBones) sp->top = (DV3){ sp->head.x, sp->head.y, sp->head.z + 16.0 };
+        [list addObject:sp];
+    }
+    s->pawns = list;
+    s->loot = gLoot;
+    return s;
+}
+
+static void aimStep(EchoSnap *s, uintptr_t pc, uintptr_t localPawn) {
+    if (!gOptAimbot || !looks_like_uobject(pc) || O_CTRL_ROT < 0 || gScreenSz.width < 10) { gAimTarget = 0; gDiagLock = NO; return; }
+    BOOL ads = (O_ADS < 0) ? YES : (localPawn && pawnFlag(localPawn, O_ADS, M_ADS));
+    gDiagAds = ads;
+    if (!(ads || !gOptAdsOnly)) { gAimTarget = 0; gDiagLock = NO; return; }
+    CGSize sz = gScreenSz;
+    EchoView view = makeView(s->cam, s->rot, s->fov, sz);
+    CGFloat R = gOptFov * sz.height;
+    int pick = -1;
+    CGFloat bestD = 1.0e30;
+    DV3 pickAim = {0,0,0};
+    uintptr_t pickPawn = 0;
+    for (EchoSnapPawn *sp in s->pawns) {
+        if (sp->team || sp->downed) continue;
+        DV3 aim = gOptAimBody ? sp->body : sp->head;
+        CGFloat ax, ay; float ad;
+        if (!project(&view, aim, &ax, &ay, &ad)) continue;
+        CGFloat d = hypot((ax - 0.5) * sz.width, (ay - 0.5) * sz.height);
+        CGFloat lim = (sp->pawn == gAimTarget) ? R * 1.35 : R;
+        if (d <= lim && d < bestD) { bestD = d; pick = 1; pickAim = aim; pickPawn = sp->pawn; }
+    }
+    if (pick < 0) { gAimTarget = 0; gDiagLock = NO; return; }
+    gAimTarget = pickPawn;
+    double dx = pickAim.x - s->cam.x, dy = pickAim.y - s->cam.y, dz = pickAim.z - s->cam.z;
+    double yaw = atan2(dy, dx) * 180.0 / M_PI;
+    double pitch = atan2(dz, sqrt(dx * dx + dy * dy)) * 180.0 / M_PI;
+    DV3 cur;
+    if (!(safe_read(pc + (uintptr_t)O_CTRL_ROT, &cur, sizeof cur) && sane_dv(cur))) return;
+    static CFTimeInterval lastAim = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    double dt = lastAim > 0 ? now - lastAim : 1.0 / 60.0;
+    lastAim = now;
+    if (dt < 0.001) dt = 0.001;
+    if (dt > 0.05) dt = 0.05;
+    double f120 = 1.0 - 0.97 * gOptSmooth;
+    double f = 1.0 - pow(1.0 - f120, dt * 120.0);
+    double cp0 = wrap180(cur.x), cy0 = wrap180(cur.y);
+    DV3 nr = { cp0 + wrap180(pitch - cp0) * f, cy0 + wrap180(yaw - cy0) * f, cur.z };
+    memcpy((void *)(pc + (uintptr_t)O_CTRL_ROT), &nr, sizeof nr);
+    gDiagLock = YES;
+}
+
+static BOOL readCameraStable(uintptr_t pc, DV3 *loc, DV3 *rot, float *fov, float *ts) {
+    for (int tries = 0; tries < 4; tries++) {
+        DV3 l1, r1, l2, r2; float f1, f2;
+        if (!readCamera(pc, &l1, &r1, &f1)) return NO;
+        float t1 = gCamTime;
+        if (!readCamera(pc, &l2, &r2, &f2)) return NO;
+        if (memcmp(&l1, &l2, sizeof l1) == 0 && memcmp(&r1, &r2, sizeof r1) == 0 && t1 == gCamTime) {
+            *loc = l1; *rot = r1; *fov = f1; *ts = t1;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void samplerMain(void) {
+    [NSThread setThreadPriority:1.0];
+    DV3 lastCam = {0,0,0}, lastRot = {0,0,0};
+    float lastTs = -1.0f;
+    CFTimeInterval lastCap = 0;
+    NSArray<EchoPawn *> *lastPawns = nil;
+    for (;;) {
+        @autoreleasepool {
+            if (!gResolved) { usleep(100000); continue; }
+            NSArray<EchoPawn *> *pawns; uintptr_t pc, lp;
+            @synchronized ([NSProcessInfo processInfo]) { pawns = gPawns; pc = gLocalPC; lp = gLocalPawn; }
+            if (!pc || !pawns.count) {
+                @synchronized (gSnapLock) { [gSnaps removeAllObjects]; }
+                gAimTarget = 0;
+                usleep(30000);
+                continue;
+            }
+            DV3 cam, rot; float fov, ts;
+            if (!readCameraStable(pc, &cam, &rot, &fov, &ts)) { usleep(4000); continue; }
+            CFTimeInterval now = CACurrentMediaTime();
+            BOOL changed = ts != lastTs || memcmp(&cam, &lastCam, sizeof cam) != 0 || memcmp(&rot, &lastRot, sizeof rot) != 0;
+            if (!changed && pawns == lastPawns && now - lastCap < 0.1) { usleep(1000); continue; }
+            lastCam = cam; lastRot = rot; lastTs = ts; lastCap = now; lastPawns = pawns;
+            EchoSnap *s = captureSnap(pawns, cam, rot, fov, now);
+            @synchronized (gSnapLock) {
+                [gSnaps addObject:s];
+                while (gSnaps.count > 160 || (gSnaps.count > 2 && now - gSnaps[0]->t > 1.0)) [gSnaps removeObjectAtIndex:0];
+            }
+            aimStep(s, pc, lp);
+            usleep(500);
+        }
+    }
+}
+
+static void renderSnap(EchoFrame *frame, EchoSnap *A, EchoSnap *B, double alpha, CGSize sz) {
+    DV3 cam = lerpV(A->cam, B->cam, alpha);
+    DV3 rot = lerpRot(A->rot, B->rot, alpha);
+    float fov = A->fov + (B->fov - A->fov) * (float)alpha;
+    EchoView view = makeView(cam, rot, fov, sz);
+
+    for (EchoSnapPawn *pb in B->pawns) {
+        EchoSnapPawn *pa = nil;
+        if (A != B && alpha < 1.0) {
+            for (EchoSnapPawn *c in A->pawns) if (c->pawn == pb->pawn) { pa = c; break; }
+            if (pa) {
+                double dx = pa->feet.x - pb->feet.x, dy = pa->feet.y - pb->feet.y, dz = pa->feet.z - pb->feet.z;
+                if (dx * dx + dy * dy + dz * dz > 1500.0 * 1500.0) pa = nil;
+            }
+        }
+        DV3 feet = pb->feet, topW = pb->top, headW = pb->head, bodyW = pb->body;
+        (void)headW; (void)bodyW;
+        DV3 pts[kMaxSel];
+        BOOL ptOk[kMaxSel];
+        memcpy(pts, pb->pts, sizeof pts);
+        memcpy(ptOk, pb->ptOk, sizeof ptOk);
+        if (pa) {
+            feet = lerpV(pa->feet, pb->feet, alpha);
+            topW = lerpV(pa->top, pb->top, alpha);
+            if (pa->haveBones && pb->haveBones) {
+                for (int k = 0; k < kMaxSel; k++) {
+                    if (pa->ptOk[k] && pb->ptOk[k]) pts[k] = lerpV(pa->pts[k], pb->pts[k], alpha);
+                }
+            }
+        }
+
+        CGFloat tx, ty, bx, by; float d1, d2;
+        if (!project(&view, topW, &tx, &ty, &d1)) continue;
+        if (!project(&view, feet, &bx, &by, &d2)) continue;
+
+        CGFloat ptop = ty * sz.height, pbot = by * sz.height;
+        CGFloat h = pbot - ptop;
+        if (h < 4.0 || h > sz.height * 3.0) continue;
+        CGFloat w = h * 0.5;
+        CGFloat cx = (tx + bx) * 0.5 * sz.width;
+        if (cx < -w || cx > sz.width + w || pbot < 0 || ptop > sz.height) continue;
+
+        CGRect boxRect = CGRectMake(cx - w * 0.5, ptop, w, h);
+        [(pb->team ? frame.tb : frame.eb) appendPath:[UIBezierPath bezierPathWithRect:boxRect]];
+
+        EchoPawn *ep = pb->meta;
+        if (pb->haveBones && ep.bones) {
+            UIBezierPath *bp = pb->team ? frame.tbn : frame.ebn;
+            CGPoint scr[kMaxSel];
+            BOOL scrOk[kMaxSel];
+            for (int k = 0; k < ep.bones->n; k++) {
+                CGFloat px, py; float dd;
+                scrOk[k] = ptOk[k] && project(&view, pts[k], &px, &py, &dd);
+                if (scrOk[k]) scr[k] = CGPointMake(px * sz.width, py * sz.height);
+            }
+            for (int k = 0; k < ep.bones->n; k++) {
+                int l = ep.bones->link[k];
+                if (l < 0 || !scrOk[k] || !scrOk[l]) continue;
+                [bp moveToPoint:scr[k]];
+                [bp addLineToPoint:scr[l]];
+            }
+        }
+
+        double ddx = feet.x - cam.x, ddy = feet.y - cam.y, ddz = feet.z - cam.z;
+        double dist = sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0;
+        if (gOptTags) {
+            EchoTag *tg = [[EchoTag alloc] init];
+            tg.text = [NSString stringWithFormat:@"%@  %.0fm", ep.tag, dist];
+            tg.c = CGPointMake(cx, ptop - 10);
+            [frame.tags addObject:tg];
+        }
+        if (gOptWeaponEsp && ep.weapon.length) {
+            EchoTag *wt = [[EchoTag alloc] init];
+            wt.text = ep.weapon;
+            wt.color = tierColor(ep.wTier);
+            wt.c = CGPointMake(cx, pbot + 18);
+            [frame.tags addObject:wt];
+        }
+    }
+
+    if (gOptLoot) {
+        for (EchoLoot *lo in B->loot) {
+            DV3 lp = { lo.x, lo.y, lo.z };
+            CGFloat lx, ly; float ld;
+            if (!project(&view, lp, &lx, &ly, &ld)) continue;
+            double ddx = lp.x - cam.x, ddy = lp.y - cam.y, ddz = lp.z - cam.z;
+            double dm = sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0;
+            if (dm > 250.0) continue;
+            EchoTag *lt = [[EchoTag alloc] init];
+            lt.text = [NSString stringWithFormat:@"%@  %.0fm", lo.text, dm];
+            lt.color = tierColor(lo.tier);
+            lt.c = CGPointMake(lx * sz.width, ly * sz.height);
+            [frame.tags addObject:lt];
+        }
+    }
+}
+
+static void drawTick(CADisplayLink *link) {
     if (!gLabelRoot) return;
     attachScene(gLabelWindow);
-
-    NSArray<EchoPawn *> *pawns;
-    uintptr_t pc, localPawn;
-    @synchronized ([NSProcessInfo processInfo]) { pawns = gPawns; pc = gLocalPC; localPawn = gLocalPawn; }
+    CGSize sz = gLabelRoot.bounds.size;
+    gScreenSz = sz;
 
     EchoFrame *frame = [[EchoFrame alloc] init];
     frame.eb = [UIBezierPath bezierPath];
@@ -1827,222 +2150,40 @@ static void updateESP(void) {
     frame.ebn = [UIBezierPath bezierPath];
     frame.tbn = [UIBezierPath bezierPath];
     frame.tags = [NSMutableArray array];
-    gDiagDrawn = 0; gDiagAds = NO; gDiagLock = NO;
 
-    CGSize sz = gLabelRoot.bounds.size;
-    AimCand cands[64];
-    int nc = 0;
-    DV3 cam = {0,0,0}, rot = {0,0,0};
-    float fov = 0;
-    BOOL haveCam = (pc && pawns.count && readCamera(pc, &cam, &rot, &fov));
-
-    if (haveCam) {
-        double pr = rot.x * M_PI / 180.0, yr = rot.y * M_PI / 180.0, rr = rot.z * M_PI / 180.0;
-        double sp = sin(pr), cp = cos(pr), sy = sin(yr), cy = cos(yr), sr = sin(rr), cr = cos(rr);
-        EchoView view;
-        view.cam = cam;
-        view.fwd   = (DV3){ cp * cy, cp * sy, sp };
-        view.right = (DV3){ sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp };
-        view.up    = (DV3){ -(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp };
-        view.tanHalf = tan(fov * M_PI / 360.0);
-        view.aspect = sz.height > 0 ? sz.width / sz.height : 1.0;
-
-        for (EchoPawn *ep in pawns) {
-            if (pawnFlag(ep.pawn, O_DYING, M_DYING)) continue;
-            BOOL downed = pawnFlag(ep.pawn, O_DBNO, M_DBNO);
-
-            DV3 center = {0,0,0};
-            double half = 0.0;
-            BOOL haveCap = NO;
-            uintptr_t cap = O_CHAR_CAPSULE >= 0 ? rd_ptr(ep.pawn + (uintptr_t)O_CHAR_CAPSULE) : 0;
-            if (cap >= 0x100000000ULL && O_CAPSULE_HH >= 0 && O_SCENE_RELLOC >= 0) {
-                half = rd_f32(cap + (uintptr_t)O_CAPSULE_HH);
-                if (half > 20.0 && half < 140.0 &&
-                    safe_read(cap + (uintptr_t)O_SCENE_RELLOC, &center, sizeof center) && sane_dv(center)) haveCap = YES;
-            }
-            if (!haveCap) {
-                if (!actorLocation(ep.pawn, &center)) continue;
-                half = 88.0;
-            }
-
-            DV3 feet  = { center.x, center.y, center.z - half };
-            DV3 headW = { center.x, center.y, center.z + half * 0.80 };
-            DV3 bodyW = { center.x, center.y, center.z + half * 0.25 };
-            DV3 topW  = { center.x, center.y, center.z + half };
-
-            DV3 pts[kMaxSel];
-            BOOL ptOk[kMaxSel];
-            memset(ptOk, 0, sizeof ptOk);
-            BOOL haveBones = NO;
-
-            if ((gOptSkeleton || gOptAimbot) && ep.bones && ep.bones->parent && O_CHAR_MESH >= 0) {
-                uintptr_t mesh = rd_ptr(ep.pawn + (uintptr_t)O_CHAR_MESH);
-                DXf c2w;
-                if (mesh >= 0x100000000ULL && readC2W(mesh, center, &c2w)) {
-                    uintptr_t arr = 0;
-                    int32_t bn = 0;
-                    BOOL direct = NO;
-                    findSkelArray(mesh, ep.bones, &arr, &bn, &direct);
-                    if (bn > ep.bones->boneCount) bn = ep.bones->boneCount;
-                    if (arr >= 0x100000000ULL && bn > 20 && bn <= kMaxBones &&
-                        safe_read(arr, gLocalBones, (size_t)bn * sizeof(DXf)) && looks_like_xform(&gLocalBones[0])) {
-                        static DXf comp[kMaxBones];
-                        for (int i = 0; i < bn; i++) {
-                            const DXf *l = &gLocalBones[i];
-                            int pi = ep.bones->parent[i];
-                            DXf *c = &comp[i];
-                            if (direct || pi < 0 || pi >= i) {
-                                *c = *l;
-                            } else {
-                                const DXf *pc2 = &comp[pi];
-                                DV3 lt = { l->t[0] * pc2->s[0], l->t[1] * pc2->s[1], l->t[2] * pc2->s[2] };
-                                DV3 rt = qrot(pc2->q, lt);
-                                c->t[0] = pc2->t[0] + rt.x; c->t[1] = pc2->t[1] + rt.y; c->t[2] = pc2->t[2] + rt.z;
-                                double ax = pc2->q[0], ay = pc2->q[1], az = pc2->q[2], aw = pc2->q[3];
-                                double bx = l->q[0], by2 = l->q[1], bz = l->q[2], bw = l->q[3];
-                                c->q[0] = aw * bx + ax * bw + ay * bz - az * by2;
-                                c->q[1] = aw * by2 - ax * bz + ay * bw + az * bx;
-                                c->q[2] = aw * bz + ax * by2 - ay * bx + az * bw;
-                                c->q[3] = aw * bw - ax * bx - ay * by2 - az * bz;
-                                c->s[0] = pc2->s[0] * l->s[0]; c->s[1] = pc2->s[1] * l->s[1]; c->s[2] = pc2->s[2] * l->s[2];
-                            }
-                        }
-                        for (int k = 0; k < ep.bones->n; k++) {
-                            int bi = ep.bones->idx[k];
-                            if (bi >= bn) continue;
-                            const DXf *c = &comp[bi];
-                            DV3 lp = { c->t[0] * c2w.s[0], c->t[1] * c2w.s[1], c->t[2] * c2w.s[2] };
-                            DV3 r = qrot(c2w.q, lp);
-                            pts[k] = (DV3){ r.x + c2w.t[0], r.y + c2w.t[1], r.z + c2w.t[2] };
-                            ptOk[k] = sane_dv(pts[k]);
-                        }
-                        haveBones = YES;
-                        int hi = ep.bones->head, ni = ep.bones->neck, pi2 = ep.bones->pelvis;
-                        if (hi >= 0 && ptOk[hi]) headW = pts[hi];
-                        if (ni >= 0 && pi2 >= 0 && ptOk[ni] && ptOk[pi2])
-                            bodyW = (DV3){ (pts[ni].x + pts[pi2].x) * 0.5, (pts[ni].y + pts[pi2].y) * 0.5, (pts[ni].z + pts[pi2].z) * 0.5 };
+    NSArray<EchoSnap *> *snaps;
+    @synchronized (gSnapLock) { snaps = [gSnaps copy]; }
+    if (snaps.count) {
+        static const double kMs[5] = { 0, 25, 50, 75, 100 };
+        int di = gOptDelay < 0 ? 0 : (gOptDelay > 4 ? 4 : gOptDelay);
+        CFTimeInterval shown = link.targetTimestamp > 0 ? link.targetTimestamp : CACurrentMediaTime();
+        double T = shown - kMs[di] / 1000.0;
+        EchoSnap *newest = snaps.lastObject, *oldest = snaps.firstObject;
+        if (shown - newest->t < 0.6) {
+            EchoSnap *A = newest, *B = newest;
+            double alpha = 1.0;
+            if (T >= newest->t || snaps.count == 1) {
+            } else if (T <= oldest->t) {
+                A = B = oldest;
+            } else {
+                for (NSInteger i = (NSInteger)snaps.count - 1; i >= 1; i--) {
+                    if (snaps[(NSUInteger)i - 1]->t <= T) {
+                        A = snaps[(NSUInteger)i - 1]; B = snaps[(NSUInteger)i];
+                        double span = B->t - A->t;
+                        alpha = span > 1e-6 ? (T - A->t) / span : 1.0;
+                        if (alpha < 0.0) alpha = 0.0;
+                        if (alpha > 1.0) alpha = 1.0;
+                        if (span > 0.25) alpha = 1.0;
+                        break;
                     }
                 }
             }
-            if (haveBones) topW = (DV3){ headW.x, headW.y, headW.z + 16.0 };
-
-            CGFloat tx, ty, bx, by; float d1, d2;
-            if (!project(&view, topW, &tx, &ty, &d1)) continue;
-            if (!project(&view, feet, &bx, &by, &d2)) continue;
-
-            CGFloat ptop = ty * sz.height, pbot = by * sz.height;
-            CGFloat h = pbot - ptop;
-            if (h < 4.0 || h > sz.height * 3.0) continue;
-            CGFloat w = h * 0.5;
-            CGFloat cx = (tx + bx) * 0.5 * sz.width;
-            if (cx < -w || cx > sz.width + w || pbot < 0 || ptop > sz.height) continue;
-
-            CGRect boxRect = CGRectMake(cx - w * 0.5, ptop, w, h);
-            [(ep.team ? frame.tb : frame.eb) appendPath:[UIBezierPath bezierPathWithRect:boxRect]];
-
-            if (haveBones) {
-                UIBezierPath *bp = ep.team ? frame.tbn : frame.ebn;
-                CGPoint scr[kMaxSel];
-                BOOL scrOk[kMaxSel];
-                for (int k = 0; k < ep.bones->n; k++) {
-                    CGFloat px, py; float dd;
-                    scrOk[k] = ptOk[k] && project(&view, pts[k], &px, &py, &dd);
-                    if (scrOk[k]) scr[k] = CGPointMake(px * sz.width, py * sz.height);
-                }
-                for (int k = 0; k < ep.bones->n; k++) {
-                    int l = ep.bones->link[k];
-                    if (l < 0 || !scrOk[k] || !scrOk[l]) continue;
-                    [bp moveToPoint:scr[k]];
-                    [bp addLineToPoint:scr[l]];
-                }
-            }
-
-            double ddx = center.x - cam.x, ddy = center.y - cam.y, ddz = center.z - cam.z;
-            double dist = sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0;
-            EchoTag *tg = [[EchoTag alloc] init];
-            tg.text = [NSString stringWithFormat:@"%@  %.0fm", ep.tag, dist];
-            tg.c = CGPointMake(cx, ptop - 10);
-            if (gOptTags) [frame.tags addObject:tg];
-            if (gOptWeaponEsp && ep.weapon.length) {
-                EchoTag *wt = [[EchoTag alloc] init];
-                wt.text = ep.weapon;
-                wt.color = tierColor(ep.wTier);
-                wt.c = CGPointMake(cx, pbot + 18);
-                [frame.tags addObject:wt];
-            }
-
-            if (!ep.team && !downed && nc < 64) {
-                DV3 aim = gOptAimBody ? bodyW : headW;
-                CGFloat ax, ay; float ad;
-                if (project(&view, aim, &ax, &ay, &ad)) {
-                    cands[nc].pawn = ep.pawn;
-                    cands[nc].aim = aim;
-                    cands[nc].sx = (ax - 0.5) * sz.width;
-                    cands[nc].sy = (ay - 0.5) * sz.height;
-                    cands[nc].onCross = CGRectContainsPoint(CGRectInset(boxRect, w * 0.15, h * 0.08), CGPointMake(sz.width * 0.5, sz.height * 0.5));
-                    nc++;
-                }
-            }
-        }
-
-        if (gOptLoot) {
-            for (EchoLoot *lo in gLoot) {
-                DV3 lp = { lo.x, lo.y, lo.z };
-                CGFloat lx, ly; float ld;
-                if (!project(&view, lp, &lx, &ly, &ld)) continue;
-                double ddx = lp.x - cam.x, ddy = lp.y - cam.y, ddz = lp.z - cam.z;
-                double dm = sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0;
-                if (dm > 250.0) continue;
-                EchoTag *lt = [[EchoTag alloc] init];
-                lt.text = [NSString stringWithFormat:@"%@  %.0fm", lo.text, dm];
-                lt.color = tierColor(lo.tier);
-                lt.c = CGPointMake(lx * sz.width, ly * sz.height);
-                [frame.tags addObject:lt];
-            }
-        }
-
-        BOOL ads = (O_ADS < 0) ? YES : (localPawn && pawnFlag(localPawn, O_ADS, M_ADS));
-        gDiagAds = ads;
-        if (gOptAimbot && (ads || !gOptAdsOnly) && looks_like_uobject(pc) && nc > 0 && O_CTRL_ROT >= 0) {
-            CGFloat R = gOptFov * sz.height;
-            int pick = -1;
-            CGFloat bestD = 1.0e30;
-            for (int i = 0; i < nc; i++) {
-                CGFloat d = hypot(cands[i].sx, cands[i].sy);
-                CGFloat lim = (cands[i].pawn == gAimTarget) ? R * 1.35 : R;
-                if (d <= lim && d < bestD) { bestD = d; pick = i; }
-            }
-            if (pick >= 0) {
-                gAimTarget = cands[pick].pawn;
-                DV3 aim = cands[pick].aim;
-                double dx = aim.x - cam.x, dy = aim.y - cam.y, dz = aim.z - cam.z;
-                double yaw = atan2(dy, dx) * 180.0 / M_PI;
-                double pitch = atan2(dz, sqrt(dx * dx + dy * dy)) * 180.0 / M_PI;
-                DV3 cur;
-                if (safe_read(pc + (uintptr_t)O_CTRL_ROT, &cur, sizeof cur) && sane_dv(cur)) {
-                    double f = 1.0 - 0.97 * gOptSmooth;
-                    double cp0 = wrap180(cur.x), cy0 = wrap180(cur.y);
-                    DV3 nr = { cp0 + wrap180(pitch - cp0) * f, cy0 + wrap180(yaw - cy0) * f, cur.z };
-                    memcpy((void *)(pc + (uintptr_t)O_CTRL_ROT), &nr, sizeof nr);
-                    gDiagLock = YES;
-                }
-            } else {
-                gAimTarget = 0;
-            }
-        } else {
-            gAimTarget = 0;
+            renderSnap(frame, A, B, alpha, sz);
         }
     }
-
     gDiagDrawn = (int)frame.tags.count;
-    if (!gHistory) gHistory = [NSMutableArray array];
-    [gHistory insertObject:frame atIndex:0];
-    while (gHistory.count > 5) [gHistory removeLastObject];
-    NSUInteger di = (NSUInteger)gOptDelay;
-    if (di >= gHistory.count) di = gHistory.count - 1;
-    applyFrame(gHistory[di], sz);
+    applyFrame(frame, sz);
 }
-
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
     for (NSUInteger i = 0; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
@@ -2078,7 +2219,7 @@ static void applyFrame(EchoFrame *f, CGSize sz) {
 @interface EchoEspTicker : NSObject
 @end
 @implementation EchoEspTicker
-- (void)tick:(CADisplayLink *)link { updateESP(); }
+- (void)tick:(CADisplayLink *)link { drawTick(link); }
 @end
 static EchoEspTicker *gEspTicker = nil;
 
@@ -2131,6 +2272,14 @@ static void installLabelLayer(void) {
         }
         [gLabelLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
+        gSnapLock = [[NSObject alloc] init];
+        gSnaps = [NSMutableArray array];
+        gScreenSz = [UIScreen mainScreen].bounds.size;
+        NSThread *samp = [[NSThread alloc] initWithBlock:^{ samplerMain(); }];
+        samp.name = @"echomod.sampler";
+        samp.qualityOfService = NSQualityOfServiceUserInteractive;
+        [samp start];
+
         dispatch_queue_t q = dispatch_queue_create("echomod.scan", DISPATCH_QUEUE_SERIAL);
         dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
@@ -2178,7 +2327,7 @@ static void saveOptions(void) {
     [d setFloat:gOptDmgMul forKey:@"echo.dmgmul"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
-    [d setInteger:gOptDelay forKey:@"echo.delay"];
+    [d setInteger:gOptDelay forKey:@"echo.sync2"];
 }
 
 static void loadOptions(void) {
@@ -2203,7 +2352,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.dmgmul"]) gOptDmgMul = [d floatForKey:@"echo.dmgmul"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
-    gOptDelay = (int)[d integerForKey:@"echo.delay"];
+    if ([d objectForKey:@"echo.sync2"]) gOptDelay = (int)[d integerForKey:@"echo.sync2"];
 }
 
 @interface EchoMenuHandler : NSObject
@@ -2364,7 +2513,7 @@ static void installMenu(void) {
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
-        addSegment(panel, &y, @"ESP delay (frames)", @[ @"0", @"1", @"2", @"3" ], gOptDelay, 31);
+        addSegment(panel, &y, @"ESP sync delay (ms)", @[ @"0", @"25", @"50", @"75", @"100" ], gOptDelay, 31);
 
         panel.contentSize = CGSizeMake(pw, y + 8);
         CGFloat ph = MIN(y + 8, ss.height - 40);
