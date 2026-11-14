@@ -1058,11 +1058,13 @@ static int structHop(uintptr_t cls, const char *outer, const char *inner) {
     return o < 0 ? -1 : base + o;
 }
 
+static void metalNote(NSString *s);
 static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
     uintptr_t f = findProp(cls, prop, NULL);
     if (!f) return NO;
     int32_t o = rd_i32(f + (uintptr_t)OFF_POFF);
     if (o < 0 || o > 0x100000) return NO;
+    int infOff = -1; uint8_t infMask = 0;
     {
         uintptr_t owner = 0;
         findProp(cls, prop, &owner);
@@ -1075,21 +1077,23 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
                 if (qo == o) rank++; else rank = 0;
                 q = rd_ptr(q + (uintptr_t)OFF_FNEXT);
             }
-            if (hits && rank < 8) { *off = o; *mask = (uint8_t)(1u << rank); RLOG(@"reflect: bool %s inferred offset 0x%x mask 0x%x", prop, o, 1u << rank); return YES; }
+            if (hits && rank < 8) { infOff = o; infMask = (uint8_t)(1u << rank); }
         }
     }
-    uint8_t m = rd_u8(f + (uintptr_t)(0x7A + gPropShift)), fm = rd_u8(f + (uintptr_t)(0x7B + gPropShift)), bo = rd_u8(f + (uintptr_t)(0x79 + gPropShift));
-    if (m == 0 || (m & (m - 1))) m = fm;
-    if (rd_u8(f + (uintptr_t)(0x78 + gPropShift)) == 1 && m != 0 && !(m & (m - 1))) {
-        *off = o + bo; *mask = m; return YES;
-    }
+    int scanOff = -1; uint8_t scanMask = 0; int scanPos = -1;
     for (int pos = 0x60; pos <= 0xA0; pos++) {
         uint8_t b4[4];
         if (!safe_read(f + (uintptr_t)pos, b4, 4)) continue;
-        if (b4[0] == 1 && b4[1] < 8 && b4[2] && !(b4[2] & (b4[2] - 1)) && (b4[3] == b4[2] || b4[3] == 0xFF)) {
-            *off = o + b4[1]; *mask = b4[2]; return YES;
+        if (b4[0] == 1 && b4[1] < 8 && b4[2] && !(b4[2] & (b4[2] - 1)) && b4[3] == b4[2]) {
+            scanOff = o + b4[1]; scanMask = b4[2]; scanPos = pos; break;
         }
     }
+    uint8_t dump[0x30];
+    NSMutableString *hx = [NSMutableString string];
+    if (safe_read(f + 0x60, dump, sizeof dump)) for (int i = 0; i < 0x30; i++) [hx appendFormat:@"%02x", dump[i]];
+    metalNote([NSString stringWithFormat:@"bool %s: off 0x%x inferred 0x%x/0x%x scan %d/0x%x @0x%x raw+0x60 %@", prop, o, infOff, infMask, scanOff, scanMask, scanPos, hx]);
+    if (scanOff >= 0) { *off = scanOff; *mask = scanMask; return YES; }
+    if (infOff >= 0) { *off = infOff; *mask = infMask; return YES; }
     return NO;
 }
 
