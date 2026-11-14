@@ -370,6 +370,7 @@ static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
 static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
+static BOOL  gOptCannonFarm = NO;
 static int   gTrigFires = 0, gTrigCand = 0, gTrigLos = 0;
 static BOOL  gOptHudLayout = NO;
 static BOOL  gOptLowGfx = NO;
@@ -1184,6 +1185,7 @@ static BOOL probeReflection(void) {
 }
 
 // resolved property offsets
+static int O_WORLD_LEVELS = -1;
 static int O_ENGINE_VIEWPORT = -1, O_VIEWPORT_WORLD = -1, O_WORLD_GAMESTATE = -1, O_WORLD_LEVEL = -1, O_WORLD_GI = -1;
 static int O_GI_LOCALPLAYERS = -1, O_PLAYER_PC = -1, O_PC_ACKPAWN = -1, O_PC_CAMMGR = -1, O_CTRL_ROT = -1;
 static int O_CTRL_PS = -1, O_PAWN_PS = -1, O_GS_PLAYERS = -1, O_PS_PAWN = -1, O_PS_NAME = -1, O_PS_TEAM = -1, O_PS_PLATFORM = -1;
@@ -1285,6 +1287,7 @@ static BOOL resolveAll(void) {
     P(O_VIEWPORT_WORLD, C_VIEWPORT, "World");
     P(O_WORLD_GAMESTATE, C_WORLD, "GameState");
     P(O_WORLD_LEVEL, C_WORLD, "PersistentLevel");
+    P(O_WORLD_LEVELS, C_WORLD, "Levels");
     P(O_WORLD_GI, C_WORLD, "OwningGameInstance");
     P(O_GI_LOCALPLAYERS, C_GI, "LocalPlayers");
     P(O_PLAYER_PC, C_PLAYER, "PlayerController");
@@ -1375,6 +1378,7 @@ static const char *kBoneNames[24] = {
 @property (nonatomic, assign) double x, y, z;
 @property (nonatomic, copy)   NSString *text;
 @property (nonatomic, assign) int tier;
+@property (nonatomic, assign) uintptr_t actor;
 @end
 @implementation EchoLoot
 @end
@@ -1599,6 +1603,99 @@ static BOOL pawnFlag(uintptr_t pawn, int off, uint8_t mask) {
     return off >= 0 && (rd_u8(pawn + (uintptr_t)off) & mask) != 0;
 }
 
+static int containerKind(uintptr_t cls, NSString *cn) {
+    NSString *lc = cn.lowercaseString;
+    BOOL isCont = NO;
+    uintptr_t c = cls;
+    for (int d = 0; d < 14 && looks_like_uobject(c); d++) {
+        NSString *n = fname_string(fnidx(c + (uintptr_t)gOffName));
+        if ([n isEqualToString:@"BuildingContainer"]) { isCont = YES; break; }
+        c = rd_ptr(c + (uintptr_t)OFF_SUPER);
+    }
+    static int logged = 0;
+    if (isCont && logged < 60) { logged++; metalNote([NSString stringWithFormat:@"container class: %@", cn]); }
+    if ([lc containsString:@"chest"]) return (isCont || [lc containsString:@"tiered"]) ? 2 : 0;
+    if ([lc containsString:@"ammo"]) return (isCont || [lc containsString:@"tiered"]) ? 3 : 0;
+    return 0;
+}
+
+static BOOL containerSearched(uintptr_t a, uintptr_t cls) {
+    static NSMutableDictionary<NSNumber *, NSNumber *> *cache = nil;
+    if (!cache) cache = [NSMutableDictionary dictionary];
+    NSNumber *ck = @(cls);
+    NSNumber *sv = cache[ck];
+    if (!sv) {
+        int so = -1; uint8_t sm = 1;
+        sv = boolMask(cls, "bAlreadySearched", &so, &sm) ? @((so << 8) | sm) : @(-1);
+        cache[ck] = sv;
+    }
+    if (sv.intValue < 0) return NO;
+    return (rd_u8(a + (uintptr_t)(sv.intValue >> 8)) & (uint8_t)(sv.intValue & 0xff)) != 0;
+}
+
+static void scanSublevelContainers(uintptr_t world, uintptr_t persistent, NSMutableArray<EchoLoot *> *out) {
+    if (O_WORLD_LEVELS < 0 || gLevelActorsOff < 0) return;
+    uintptr_t arr = rd_ptr(world + (uintptr_t)O_WORLD_LEVELS);
+    int32_t n = rd_i32(world + (uintptr_t)O_WORLD_LEVELS + 8);
+    if (arr < 0x100000000ULL || n <= 0 || n > 512) return;
+    static NSMutableDictionary<NSNumber *, NSDictionary *> *lvCache = nil;
+    static NSMutableDictionary<NSNumber *, NSNumber *> *kindCache = nil;
+    if (!lvCache) lvCache = [NSMutableDictionary dictionary];
+    if (!kindCache) kindCache = [NSMutableDictionary dictionary];
+    static int lastLogN = -1;
+    int added = 0, classified = 0;
+    for (int32_t i = 0; i < n && added < 600; i++) {
+        uintptr_t level = rd_ptr(arr + (uintptr_t)i * 8);
+        if (!looks_like_uobject(level) || level == persistent) continue;
+        uintptr_t aData = rd_ptr(level + (uintptr_t)gLevelActorsOff);
+        int32_t aNum = rd_i32(level + (uintptr_t)gLevelActorsOff + 8);
+        if (aData < 0x100000000ULL || aNum <= 0 || aNum > 800000) continue;
+        NSNumber *lk = @(level);
+        NSDictionary *ent = lvCache[lk];
+        if (!ent || [ent[@"n"] intValue] != aNum || [ent[@"d"] unsignedLongValue] != (unsigned long)aData) {
+            NSMutableArray<NSNumber *> *list = [NSMutableArray array];
+            uintptr_t chunk[2048];
+            for (int32_t base = 0; base < aNum; base += 2048) {
+                int32_t cnt = aNum - base > 2048 ? 2048 : aNum - base;
+                if (!safe_read(aData + (uintptr_t)base * 8, chunk, (size_t)cnt * 8)) continue;
+                for (int32_t k = 0; k < cnt; k++) {
+                    uintptr_t a = chunk[k];
+                    if (a < 0x100000000ULL || (a & 7)) continue;
+                    uintptr_t cls = rd_ptr(a + (uintptr_t)gOffClass);
+                    if (cls < 0x100000000ULL) continue;
+                    NSNumber *ck = @(cls);
+                    NSNumber *kv = kindCache[ck];
+                    if (!kv) {
+                        NSString *cn = fname_string(fnidx(cls + (uintptr_t)gOffName));
+                        kv = @(containerKind(cls, cn ?: @""));
+                        kindCache[ck] = kv;
+                    }
+                    if (kv.intValue) { [list addObject:@(a)]; [list addObject:kv]; [list addObject:ck]; }
+                }
+            }
+            ent = @{ @"n": @(aNum), @"d": @((unsigned long)aData), @"l": list };
+            lvCache[lk] = ent;
+            classified++;
+        }
+        NSArray<NSNumber *> *list = ent[@"l"];
+        for (NSUInteger q = 0; q + 2 < list.count && added < 600; q += 3) {
+            uintptr_t a = list[q].unsignedLongValue;
+            int kind = list[q + 1].intValue;
+            uintptr_t cls = list[q + 2].unsignedLongValue;
+            if (rd_ptr(a + (uintptr_t)gOffClass) != cls) continue;
+            if (containerSearched(a, cls)) continue;
+            DV3 cl;
+            if (!actorLocation(a, &cl)) continue;
+            EchoLoot *co = [[EchoLoot alloc] init];
+            co.x = cl.x; co.y = cl.y; co.z = cl.z; co.tier = -kind; co.actor = a;
+            co.text = kind == 2 ? @"CHEST" : @"AMMO";
+            [out addObject:co];
+            added++;
+        }
+    }
+    if (added != lastLogN && (classified || lastLogN < 0)) { lastLogN = added; metalNote([NSString stringWithFormat:@"containers: %d chests/ammo in %d sublevels", added, (int)n]); }
+}
+
 static void scanPawns(void) {
     if (!gResolved) {
         CFTimeInterval now = CACurrentMediaTime();
@@ -1699,8 +1796,6 @@ static void scanPawns(void) {
                 if (!lootClassCache) lootClassCache = [NSMutableDictionary dictionary];
                 uintptr_t chunk[2048];
                 int nLoot = 0, nChest = 0;
-                static NSMutableDictionary<NSNumber *, NSNumber *> *searchedCache = nil;
-                if (!searchedCache) searchedCache = [NSMutableDictionary dictionary];
                 if (aData && aNum > 0 && aNum < 500000) {
                     gDiagActors = aNum;
                     for (int32_t base = 0; base < aNum && (nLoot < 400 || nChest < 400); base += 2048) {
@@ -1718,8 +1813,7 @@ static void scanPawns(void) {
                                 NSString *lcn = cn.lowercaseString;
                                 int kind = 0;
                                 if ([cn hasPrefix:@"FortPickup"]) kind = 1;
-                                else if ([lcn containsString:@"tiered_chest"]) kind = 2;
-                                else if ([lcn containsString:@"tiered_ammo"]) kind = 3;
+                                else if (containerKind(cls, cn)) kind = containerKind(cls, cn);
                                 else if ([lcn containsString:@"llama"] || [lcn containsString:@"supplydrop"]) kind = 4;
                                 else if ([lcn containsString:@"cannon"] && ![lcn hasPrefix:@"fortweapon"] && ![lcn containsString:@"ball"] && ![lcn containsString:@"projectile"] && ![lcn containsString:@"ability"] && ![lcn containsString:@"component"]) kind = 5;
                                 cv = @(kind);
@@ -1729,17 +1823,11 @@ static void scanPawns(void) {
                             if (!kind) continue;
                             if (kind != 1) {
                                 if (!gOptChest || nChest >= 400) continue;
-                                NSNumber *sv = searchedCache[ck];
-                                if (!sv) {
-                                    int so = -1; uint8_t sm = 1;
-                                    sv = boolMask(cls, "bAlreadySearched", &so, &sm) ? @((so << 8) | sm) : @(-1);
-                                    searchedCache[ck] = sv;
-                                }
-                                if (sv.intValue >= 0 && (rd_u8(a + (uintptr_t)(sv.intValue >> 8)) & (uint8_t)(sv.intValue & 0xff))) continue;
+                                if (containerSearched(a, cls)) continue;
                                 DV3 cl;
                                 if (!actorLocation(a, &cl)) continue;
                                 EchoLoot *co = [[EchoLoot alloc] init];
-                                co.x = cl.x; co.y = cl.y; co.z = cl.z; co.tier = -kind;
+                                co.x = cl.x; co.y = cl.y; co.z = cl.z; co.tier = -kind; co.actor = a;
                                 co.text = kind == 2 ? @"CHEST" : (kind == 3 ? @"AMMO" : (kind == 4 ? @"LLAMA" : @"CANNON"));
                                 [lootOut addObject:co];
                                 nChest++;
@@ -1763,6 +1851,7 @@ static void scanPawns(void) {
             }
         }
     }
+    if (gOptChest && gLevelActorsOff >= 0) scanSublevelContainers(world, O_WORLD_LEVEL >= 0 ? rd_ptr(world + (uintptr_t)O_WORLD_LEVEL) : 0, lootOut);
     gLoot = lootOut;
     publishPawns(out, pc, localPawn);
     gResolveLine2 = [NSString stringWithFormat:@"cam: %@  roots: %d  skelOff: 0x%x  c2w: 0x%x  reloff: 0x%x  lvl: 0x%x",
@@ -3636,6 +3725,78 @@ static void engineEspFrame(void *cv) {
         }
     }
 
+    if (gOptCannonFarm && gOptChest && lp && looks_like_uobject(pc)) {
+        static CFTimeInterval cfTp = 0, cfFire = 0, cfSince = 0;
+        static double cfKey = 0;
+        static NSMutableSet<NSNumber *> *cfSkip = nil;
+        if (!cfSkip) cfSkip = [NSMutableSet set];
+        DV3 pl;
+        NSArray<EchoLoot *> *lootNow = gLoot;
+        EchoLoot *cannon = nil, *chest = nil;
+        if (actorLocation(lp, &pl)) {
+            double cd = 1e30, chd = 1e30;
+            for (EchoLoot *lo in lootNow) {
+                double dx = lo.x - pl.x, dy = lo.y - pl.y, dz = lo.z - pl.z;
+                double d = sqrt(dx * dx + dy * dy + dz * dz);
+                if (lo.tier == -5 && lo.actor && d < cd) { cd = d; cannon = lo; }
+            }
+            if (cannon && cd < 1200.0) {
+                for (EchoLoot *lo in lootNow) {
+                    if (lo.tier != -2) continue;
+                    if ([cfSkip containsObject:@((long long)(lo.x * 0.5) ^ ((long long)(lo.y * 0.5) << 20))]) continue;
+                    double dx = lo.x - cannon.x, dy = lo.y - cannon.y, dz = lo.z - cannon.z;
+                    double d = sqrt(dx * dx + dy * dy + dz * dz);
+                    if (d < chd && d < 60000.0) { chd = d; chest = lo; }
+                }
+            }
+        }
+        if (cannon && chest) {
+            double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
+            if (key != cfKey) { cfKey = key; cfSince = now; }
+            if (now - cfSince > 7.0) {
+                [cfSkip addObject:@((long long)(chest.x * 0.5) ^ ((long long)(chest.y * 0.5) << 20))];
+                cfKey = 0;
+                metalNote(@"farm: skipping a chest after 7 s");
+            } else {
+                double wantX = chest.x - 700.0, wantY = chest.y, wantZ = chest.z + 120.0;
+                double ddx = wantX - cannon.x, ddy = wantY - cannon.y, ddz = wantZ - cannon.z;
+                if (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.35) {
+                    uintptr_t croot = rd_ptr(cannon.actor + (uintptr_t)O_ACTOR_ROOT);
+                    if (croot > 0x100000000ULL && O_SCENE_RELLOC >= 0) {
+                        DV3 np = { wantX, wantY, wantZ };
+                        memcpy((void *)(croot + (uintptr_t)O_SCENE_RELLOC), &np, sizeof np);
+                        cfTp = now;
+                        static int tpN = 0;
+                        if (++tpN <= 5 || tpN % 50 == 0) metalNote([NSString stringWithFormat:@"farm: teleported cannon #%d", tpN]);
+                    }
+                }
+                double tdx = chest.x - cam.x, tdy = chest.y - cam.y, tdz = chest.z + 60.0 - cam.z;
+                double fy = atan2(tdy, tdx) * 180.0 / M_PI;
+                double fp = atan2(tdz, sqrt(tdx * tdx + tdy * tdy)) * 180.0 / M_PI;
+                double ep = wrap180(fp - wrap180(rot.x)), ey = wrap180(fy - wrap180(rot.y));
+                float yawScale = 1.0f, pitchScale = 1.0f;
+                safe_read(pc + 0x4c0, &yawScale, 4); safe_read(pc + 0x4c4, &pitchScale, 4);
+                if (!(fabsf(yawScale) > 1e-4f) || !isfinite(yawScale)) yawScale = 1.0f;
+                if (!(fabsf(pitchScale) > 1e-4f) || !isfinite(pitchScale)) pitchScale = 1.0f;
+                void **vt = (void **)rd_ptr(pc);
+                uintptr_t fPitch = vt ? rd_ptr((uintptr_t)&vt[420]) : 0, fYaw = vt ? rd_ptr((uintptr_t)&vt[421]) : 0;
+                if (fPitch >= gImgBase && fPitch < gImgEnd && fYaw >= gImgBase && fYaw < gImgEnd) {
+                    ((void (*)(void *, float))fPitch)((void *)pc, (float)(ep / 2.0 / pitchScale));
+                    ((void (*)(void *, float))fYaw)((void *)pc, (float)(ey / 2.0 / yawScale));
+                }
+                if (fabs(ep) < 6.0 && fabs(ey) < 6.0 && now - cfFire > 0.18) {
+                    void **lvt = (void **)rd_ptr(lp);
+                    uintptr_t fStart = lvt ? rd_ptr((uintptr_t)&lvt[233]) : 0, fStop = lvt ? rd_ptr((uintptr_t)&lvt[477]) : 0;
+                    if (fStart >= gImgBase && fStart < gImgEnd && fStop >= gImgBase && fStop < gImgEnd) {
+                        ((void (*)(void *, uint8_t))fStart)((void *)lp, 0);
+                        ((void (*)(void *, uint8_t))fStop)((void *)lp, 0);
+                        cfFire = now;
+                    }
+                }
+            }
+        }
+    }
+
     gEngDrawLast = now;
 }
 
@@ -3837,6 +3998,7 @@ static void saveOptions(void) {
     [d setBool:gOptNoSpread forKey:@"echo.nospread"];
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
     [d setBool:gOptChest forKey:@"echo.chest"];
+    [d setBool:gOptCannonFarm forKey:@"echo.cfarm"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
@@ -3864,6 +4026,7 @@ static void loadOptions(void) {
     gOptNoSpread = [d boolForKey:@"echo.nospread"];
     gOptTrigger = [d boolForKey:@"echo.trigger"];
     if ([d objectForKey:@"echo.chest"]) gOptChest = [d boolForKey:@"echo.chest"];
+    gOptCannonFarm = [d boolForKey:@"echo.cfarm"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
@@ -3909,6 +4072,7 @@ static void loadOptions(void) {
         case 19: gOptAutoWeapons = on; break;
         case 23: gOptLoot = on; break;
         case 34: gOptChest = on; break;
+        case 35: gOptCannonFarm = on; break;
         case 24: gOptWeaponEsp = on; break;
         case 25: gOptEngineDraw = on; break;
     }
@@ -4040,6 +4204,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
+        addSwitch(panel, &y, @"Cannon chest-farm (sit in a cannon)", gOptCannonFarm, 35);
         addSegment(panel, &y, @"Loot min rarity", @[ @"Rare+", @"Epic+", @"Legendary+" ], gOptLootMin, 32);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
