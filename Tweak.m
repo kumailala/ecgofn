@@ -3456,7 +3456,7 @@ static void engineEspFrame(void *cv) {
     static double aimSign = 1.0, lastRP = 0, lastRY = 0, lastNP = 0, lastNY = 0;
     static double accNom = 0, accObs = 0;
     static int accN = 0, weakWin = 0;
-    static BOOL directMode = YES, lastApplied = NO;
+    static BOOL directMode = NO, lastApplied = NO;
     BOOL appliedNow = NO;
     if (useTarget && targeting && looks_like_uobject(pc)) {
         BOOL inDead = (tPix <= dzDeg * ppd);
@@ -3473,7 +3473,7 @@ static void engineEspFrame(void *cv) {
                         aimSign = -aimSign; weakWin = 0;
                         metalNote(@"aim: response was inverted, flipped input sign");
                     } else if (ratio < 0.12) {
-                        if (++weakWin >= 2) { directMode = YES; metalNote(@"aim: input path had no effect, writing ControlRotation directly"); }
+                        if (++weakWin == 2) metalNote(@"aim: input response looks weak (not switching)");
                     } else weakWin = 0;
                     accNom = accObs = 0; accN = 0;
                 }
