@@ -81,7 +81,7 @@ static BOOL gRetAlive;
 static BOOL gOptSilent = NO, gOptSilentFlick = NO, gOptBulletTp = YES;
 static BOOL gOptDmg = NO, gOptAutoWeapons = NO;
 static float gOptDmgMul = 0.1f;
-static BOOL gOptLoot = YES, gOptWeaponEsp = YES;
+static BOOL gOptLoot = YES, gOptWeaponEsp = YES, gOptChest = YES;
 static int gOptLootMin = 2;
 static BOOL gSilHave = NO;
 static float gSilPos[3];
@@ -1688,7 +1688,7 @@ static void scanPawns(void) {
     gDiagPawns = (int)out.count;
 
     NSMutableArray<EchoLoot *> *lootOut = [NSMutableArray array];
-    if (gOptLoot && O_PICKUP_DEF >= 0) {
+    if ((gOptLoot && O_PICKUP_DEF >= 0) || gOptChest) {
         uintptr_t level = O_WORLD_LEVEL >= 0 ? rd_ptr(world + (uintptr_t)O_WORLD_LEVEL) : 0;
         if (looks_like_uobject(level)) {
             if (gLevelActorsOff < 0) gLevelActorsOff = probeLevelActors(level);
@@ -1698,13 +1698,15 @@ static void scanPawns(void) {
                 static NSMutableDictionary<NSNumber *, NSNumber *> *lootClassCache = nil;
                 if (!lootClassCache) lootClassCache = [NSMutableDictionary dictionary];
                 uintptr_t chunk[2048];
-                int nLoot = 0;
+                int nLoot = 0, nChest = 0;
+                static NSMutableDictionary<NSNumber *, NSNumber *> *searchedCache = nil;
+                if (!searchedCache) searchedCache = [NSMutableDictionary dictionary];
                 if (aData && aNum > 0 && aNum < 500000) {
                     gDiagActors = aNum;
-                    for (int32_t base = 0; base < aNum && nLoot < 400; base += 2048) {
+                    for (int32_t base = 0; base < aNum && (nLoot < 400 || nChest < 400); base += 2048) {
                         int32_t cnt = aNum - base > 2048 ? 2048 : aNum - base;
                         if (!safe_read(aData + (uintptr_t)base * 8, chunk, (size_t)cnt * 8)) continue;
-                        for (int32_t k = 0; k < cnt && nLoot < 400; k++) {
+                        for (int32_t k = 0; k < cnt && (nLoot < 400 || nChest < 400); k++) {
                             uintptr_t a = chunk[k];
                             if (a < 0x100000000ULL || (a & 7)) continue;
                             uintptr_t cls = rd_ptr(a + (uintptr_t)gOffClass);
@@ -1713,10 +1715,36 @@ static void scanPawns(void) {
                             NSNumber *cv = lootClassCache[ck];
                             if (!cv) {
                                 NSString *cn = fname_string(fnidx(cls + (uintptr_t)gOffName));
-                                cv = @([cn hasPrefix:@"FortPickup"]);
+                                NSString *lcn = cn.lowercaseString;
+                                int kind = 0;
+                                if ([cn hasPrefix:@"FortPickup"]) kind = 1;
+                                else if ([lcn containsString:@"tiered_chest"]) kind = 2;
+                                else if ([lcn containsString:@"tiered_ammo"]) kind = 3;
+                                else if ([lcn containsString:@"llama"] || [lcn containsString:@"supplydrop"]) kind = 4;
+                                cv = @(kind);
                                 lootClassCache[ck] = cv;
                             }
-                            if (!cv.boolValue) continue;
+                            int kind = cv.intValue;
+                            if (!kind) continue;
+                            if (kind != 1) {
+                                if (!gOptChest || nChest >= 400) continue;
+                                NSNumber *sv = searchedCache[ck];
+                                if (!sv) {
+                                    int so = -1; uint8_t sm = 1;
+                                    sv = boolMask(cls, "bAlreadySearched", &so, &sm) ? @((so << 8) | sm) : @(-1);
+                                    searchedCache[ck] = sv;
+                                }
+                                if (sv.intValue >= 0 && (rd_u8(a + (uintptr_t)(sv.intValue >> 8)) & (uint8_t)(sv.intValue & 0xff))) continue;
+                                DV3 cl;
+                                if (!actorLocation(a, &cl)) continue;
+                                EchoLoot *co = [[EchoLoot alloc] init];
+                                co.x = cl.x; co.y = cl.y; co.z = cl.z; co.tier = -kind;
+                                co.text = kind == 2 ? @"CHEST" : (kind == 3 ? @"AMMO" : @"LLAMA");
+                                [lootOut addObject:co];
+                                nChest++;
+                                continue;
+                            }
+                            if (!(gOptLoot && O_PICKUP_DEF >= 0) || nLoot >= 400) continue;
                             uintptr_t def = rd_ptr(a + (uintptr_t)O_PICKUP_DEF);
                             if (!looks_like_uobject(def)) continue;
                             int tier = O_ITEM_RARITY >= 0 ? rd_u8(def + (uintptr_t)O_ITEM_RARITY) + 1 : 0;
@@ -3451,6 +3479,34 @@ static void engineEspFrame(void *cv) {
         (void)bestDead; (void)bestDist;
     }
 
+    if (gOptLoot || gOptChest) {
+        NSArray<EchoLoot *> *lootNow = gLoot;
+        int drawnLoot = 0;
+        for (EchoLoot *lo in lootNow) {
+            if (drawnLoot >= 140) break;
+            BOOL isChest = lo.tier < 0;
+            if (isChest ? !gOptChest : !gOptLoot) continue;
+            double ddx = lo.x - cam.x, ddy = lo.y - cam.y, ddz = lo.z - cam.z;
+            double dm = sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / 100.0;
+            if (dm > (isChest ? 250.0 : 150.0) || dm < 0.5) continue;
+            CGFloat nx, ny; float dp;
+            if (!project(&view, (DV3){ lo.x, lo.y, lo.z }, &nx, &ny, &dp)) continue;
+            double px = nx * sx, py = ny * sy;
+            if (px < 0 || px > sx || py < 0 || py > sy) continue;
+            float col[4] = { 1, 1, 1, 1 };
+            if (lo.tier == -2) { col[0] = 1.0f; col[1] = 0.85f; col[2] = 0.2f; }
+            else if (lo.tier == -3) { col[0] = 0.7f; col[1] = 0.7f; col[2] = 0.7f; }
+            else if (lo.tier == -4) { col[0] = 0.3f; col[1] = 1.0f; col[2] = 1.0f; }
+            else { CGFloat r = 1, g = 1, b = 1, a2 = 1; [tierColor(lo.tier) getRed:&r green:&g blue:&b alpha:&a2]; col[0] = (float)r; col[1] = (float)g; col[2] = (float)b; }
+            double arm = 4.0 * sc;
+            engLine(cv, px - arm, py, px + arm, py, (float)(1.5 * sc), col);
+            engLine(cv, px, py - arm, px, py + arm, (float)(1.5 * sc), col);
+            NSString *lt = [NSString stringWithFormat:@"%@ %dm", lo.text, (int)dm];
+            engText(cv, lt, px, py - arm - 1.0, 2.2 * sc, 1.0 * sc, col);
+            drawnLoot++;
+        }
+    }
+
     if (gOptAimbot && gOptShowFov) {
         float white[4] = { 1, 1, 1, 1 }, red[4] = { 1, 0, 0, 1 };
         engCircle(cv, cx0, cy0, fovDeg * ppd, 64, 1.0 * sc, white);
@@ -3778,6 +3834,7 @@ static void saveOptions(void) {
     [d setBool:gOptNoRecoil forKey:@"echo.norecoil"];
     [d setBool:gOptNoSpread forKey:@"echo.nospread"];
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
+    [d setBool:gOptChest forKey:@"echo.chest"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
@@ -3804,6 +3861,7 @@ static void loadOptions(void) {
     gOptNoRecoil = [d boolForKey:@"echo.norecoil"];
     gOptNoSpread = [d boolForKey:@"echo.nospread"];
     gOptTrigger = [d boolForKey:@"echo.trigger"];
+    if ([d objectForKey:@"echo.chest"]) gOptChest = [d boolForKey:@"echo.chest"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
@@ -3848,6 +3906,7 @@ static void loadOptions(void) {
         case 18: gOptDmg = on; break;
         case 19: gOptAutoWeapons = on; break;
         case 23: gOptLoot = on; break;
+        case 34: gOptChest = on; break;
         case 24: gOptWeaponEsp = on; break;
         case 25: gOptEngineDraw = on; break;
     }
@@ -3978,6 +4037,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
+        addSwitch(panel, &y, @"Chest / ammo box / llama ESP", gOptChest, 34);
         addSegment(panel, &y, @"Loot min rarity", @[ @"Rare+", @"Epic+", @"Legendary+" ], gOptLootMin, 32);
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
