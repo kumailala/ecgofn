@@ -167,6 +167,7 @@ static void attachScene(UIWindow *w) {
     }
 }
 
+static void RLOG(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void installOverlay(void) {
     if (gOverlay) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -187,7 +188,8 @@ static void installOverlay(void) {
         l.shadowColor  = [UIColor blackColor];
         l.shadowOffset = CGSizeMake(1.0, 1.0);
         l.font         = [UIFont boldSystemFontOfSize:15.0];
-        l.text         = @"FPS: --";
+        l.text         = @"";
+        l.hidden       = YES;
         [vc.view addSubview:l];
 
         w.hidden = NO; // NOT makeKeyAndVisible — never steal the game's key window
@@ -217,8 +219,8 @@ static void installOverlay(void) {
             int fps = cur - last;
             if (fps < 0) fps = 0;
             last = cur;
-            gFpsLabel.text = [NSString stringWithFormat:@"FPS: %d%@", fps,
-                              gUseDisplay ? @" (disp)" : @""];
+            static int fpsTick = 0;
+            if (++fpsTick % 30 == 0) RLOG(@"fps: %d%@", fps, gUseDisplay ? @" (disp)" : @"");
         });
         gFpsTimer = timer;          // keep alive (see note at top)
         dispatch_resume(timer);
@@ -232,7 +234,11 @@ static void installOverlay(void) {
 static void setPlatLines(NSArray<NSString *> *lines) {
     if (!gPlatLabel) return;
     NSString *s = [lines componentsJoinedByString:@"\n"];
-    gPlatLabel.text = s;
+    static int platTick = 0;
+    if (++platTick % 40 == 1) RLOG(@"status: %@", [s stringByReplacingOccurrencesOfString:@"\n" withString:@" | "]);
+    gPlatLabel.text = @"";
+    gPlatLabel.hidden = YES;
+    return;
 
     CGSize max = CGSizeMake(gPlatWidth, CGFLOAT_MAX);
     CGRect r = [s boundingRectWithSize:max
@@ -363,6 +369,8 @@ static BOOL  gOptBoxes = YES, gOptSkeleton = YES, gOptTags = YES;
 static BOOL  gOptAimbot = YES, gOptAdsOnly = YES, gOptShowFov = YES;
 static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
+static float gOptTrigDelay = 0.15f;
+static int   gTrigFires = 0, gTrigCand = 0, gTrigLos = 0;
 static BOOL  gOptHudLayout = NO;
 static BOOL  gOptLowGfx = NO;
 static BOOL  gOptVisOnly = NO;
@@ -3311,6 +3319,8 @@ static void engineEspFrame(void *cv) {
     DV3 curPos = {0, 0, 0};
 
     CGFloat cx0 = sx * 0.5, cy0 = sy * 0.5;
+    uintptr_t trigCand = 0;
+    double trigBest = 1e30;
 
     for (EchoPawn *ep in pawns) {
         if (pawnFlag(ep.pawn, O_DYING, M_DYING)) continue;
@@ -3363,6 +3373,13 @@ static void engineEspFrame(void *cv) {
         double bw = bx1 - bx0, bh = by1 - by0;
         if (onScreen && bw > 2.0 && bh > 2.0 && bw < sx * 4.0 && bh < sy * 4.0) {
             gDrawnPlayers++;
+            if (gOptTrigger && !downed) {
+                double mx = bw * 0.14, my = bh * 0.10;
+                if (cx0 >= bx0 + mx && cx0 <= bx1 - mx && cy0 >= by0 + my && cy0 <= by1 - my) {
+                    double dd = distM;
+                    if (dd < trigBest) { trigBest = dd; trigCand = ep.pawn; }
+                }
+            }
             if (gOptBoxes) {
                 engCornerBox(cv, bx0, by0, bx1, by1, 2.0 * sc, cPrimary);
             }
@@ -3529,6 +3546,37 @@ static void engineEspFrame(void *cv) {
         gDiagLock = NO;
     }
     lastApplied = appliedNow;
+
+    {
+        static uintptr_t trigPawn = 0;
+        static CFTimeInterval trigSeen = 0, trigLast = 0;
+        static BOOL losWarned = NO;
+        if (gOptTrigger && trigCand && lp && looks_like_uobject(pc)) {
+            gTrigCand++;
+            if (trigPawn != trigCand) { trigPawn = trigCand; trigSeen = now; }
+            BOOL los = NO;
+            void **pvt = (void **)rd_ptr(pc);
+            uintptr_t fLos = pvt ? rd_ptr((uintptr_t)&pvt[237]) : 0;
+            if (fLos >= gImgBase && fLos < gImgEnd) {
+                los = (((BOOL (*)(void *, void *, double, double, double, BOOL))fLos)((void *)pc, (void *)trigCand, 0.0, 0.0, 0.0, YES) & 1) != 0;
+            } else if (!losWarned) { losWarned = YES; metalNote(@"trigger: line-of-sight function not found, trigger disabled"); }
+            if (los) gTrigLos++;
+            if (los && (now - trigSeen) >= (double)gOptTrigDelay * 0.3 && (now - trigLast) >= 0.035) {
+                void **lvt = (void **)rd_ptr(lp);
+                uintptr_t fStart = lvt ? rd_ptr((uintptr_t)&lvt[233]) : 0;
+                uintptr_t fStop = lvt ? rd_ptr((uintptr_t)&lvt[477]) : 0;
+                if (fStart >= gImgBase && fStart < gImgEnd && fStop >= gImgBase && fStop < gImgEnd) {
+                    ((void (*)(void *, uint8_t))fStart)((void *)lp, 0);
+                    ((void (*)(void *, uint8_t))fStop)((void *)lp, 0);
+                    trigLast = now;
+                    gTrigFires++;
+                    if (gTrigFires <= 3 || gTrigFires % 100 == 0) metalNote([NSString stringWithFormat:@"trigger: fire #%d (cand %d, los %d)", gTrigFires, gTrigCand, gTrigLos]);
+                }
+            }
+        } else {
+            trigPawn = 0;
+        }
+    }
 
     gEngDrawLast = now;
 }
@@ -3730,6 +3778,7 @@ static void saveOptions(void) {
     [d setBool:gOptNoRecoil forKey:@"echo.norecoil"];
     [d setBool:gOptNoSpread forKey:@"echo.nospread"];
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
+    [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
     [d setBool:gOptVisOnly forKey:@"echo.vis"];
@@ -3755,6 +3804,7 @@ static void loadOptions(void) {
     gOptNoRecoil = [d boolForKey:@"echo.norecoil"];
     gOptNoSpread = [d boolForKey:@"echo.nospread"];
     gOptTrigger = [d boolForKey:@"echo.trigger"];
+    if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
     if ([d objectForKey:@"echo.vis"]) gOptVisOnly = [d boolForKey:@"echo.vis"];
@@ -3772,6 +3822,7 @@ static void loadOptions(void) {
 @property (nonatomic, strong) UILabel *fovLabel;
 @property (nonatomic, strong) UILabel *dmgLabel;
 @property (nonatomic, strong) UILabel *lagLabel;
+@property (nonatomic, strong) UILabel *trigLabel;
 @end
 @implementation EchoMenuHandler
 - (void)toggled:(UISwitch *)s {
@@ -3806,6 +3857,7 @@ static void loadOptions(void) {
     if (s.tag == 20) { gOptSmooth = s.value; self.smoothLabel.text = [NSString stringWithFormat:@"Smoothness  %.0f%%", s.value * 100]; }
     if (s.tag == 22) { gOptDmgMul = s.value; self.dmgLabel.text = [NSString stringWithFormat:@"Damage x%d", 1 + (int)(s.value * 49.0f)]; }
     if (s.tag == 23) { gOptLagF = s.value * 3.0f; self.lagLabel.text = [NSString stringWithFormat:@"ESP lag  %.2f game ticks", gOptLagF]; }
+    if (s.tag == 33) { gOptTrigDelay = s.value; self.trigLabel.text = [NSString stringWithFormat:@"Trigger delay  %.0f ms", s.value * 300.0f]; }
     if (s.tag == 21) { gOptFov = s.value; self.fovLabel.text = [NSString stringWithFormat:@"Aim FOV  %.0f%%", s.value * 100]; }
     saveOptions();
 }
@@ -3922,6 +3974,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Aimbot", gOptAimbot, 4);
         addSwitch(panel, &y, @"Only while aiming (ADS)", gOptAdsOnly, 5);
         addSwitch(panel, &y, @"Show aim FOV circle", gOptShowFov, 6);
+        addSwitch(panel, &y, @"Trigger bot (fires on enemy in crosshair)", gOptTrigger, 9);
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
@@ -3929,6 +3982,8 @@ static void installMenu(void) {
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
+        gMenuHandler.trigLabel = addSlider(panel, &y, @"Trigger delay", gOptTrigDelay, 33);
+        gMenuHandler.trigLabel.text = [NSString stringWithFormat:@"Trigger delay  %.0f ms", gOptTrigDelay * 300.0f];
         gMenuHandler.lagLabel = addSlider(panel, &y, @"ESP lag", gOptLagF / 3.0f, 23);
         gMenuHandler.lagLabel.text = [NSString stringWithFormat:@"ESP lag  %.2f game ticks", gOptLagF];
 
