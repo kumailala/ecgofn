@@ -1404,14 +1404,15 @@ static int gRefBonesOff = -1;
 
 static void metalNote(NSString *s);
 static int gRefStride = 0;
+static int gRefParentOff = 8;
 static int gBmFail[4];
 
 static BOOL refBonesAt(uintptr_t asset, int off, uintptr_t *data, int32_t *n) {
     uintptr_t a = rd_ptr(asset + (uintptr_t)off);
     int32_t c = rd_i32(asset + (uintptr_t)off + 8), m = rd_i32(asset + (uintptr_t)off + 12);
     if (a < 0x100000000ULL || (a & 3) || c < 20 || c > kMaxBones || m < c || m > c * 4 + 64) return NO;
-    static const int strides[] = { 12, 16, 20, 24, 28, 32, 36, 40 };
-    for (int si = 0; si < 8; si++) {
+    static const int strides[] = { 8, 12, 16, 20, 24, 28, 32, 36, 40 };
+    for (int si = 0; si < 9; si++) {
         int st = gRefStride ? gRefStride : strides[si];
         uint8_t raw[40 * 16];
         if (safe_read(a, raw, (size_t)st * 16)) {
@@ -1419,7 +1420,7 @@ static BOOL refBonesAt(uintptr_t asset, int off, uintptr_t *data, int32_t *n) {
             for (int i = 0; i < 16 && good; i++) {
                 int32_t nm, par;
                 memcpy(&nm, raw + (size_t)i * (size_t)st, 4);
-                memcpy(&par, raw + (size_t)i * (size_t)st + 8, 4);
+                memcpy(&par, raw + (size_t)i * (size_t)st + (size_t)(st == 8 ? 4 : 8), 4);
                 if (i == 0 && par != -1) good = NO;
                 else if (i > 0 && (par < 0 || par >= i)) good = NO;
                 else if (!fname_string(nm)) good = NO;
@@ -1427,6 +1428,7 @@ static BOOL refBonesAt(uintptr_t asset, int off, uintptr_t *data, int32_t *n) {
             if (good) {
                 if (!gRefStride) metalNote([NSString stringWithFormat:@"bones: reference skeleton at asset+0x%x, %d bones, entry stride %d", off, c, st]);
                 gRefStride = st;
+                gRefParentOff = (st == 8 ? 4 : 8);
                 *data = a; *n = c;
                 return YES;
             }
@@ -1468,8 +1470,15 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
     BOOL ok = NO;
     if (gRefBonesOff >= 0) ok = refBonesAt(asset, gRefBonesOff, &refData, &N);
     if (!ok) {
-        for (int off = 0x30; off < 0x600 && !ok; off += 8) {
-            if (refBonesAt(asset, off, &refData, &N)) { gRefBonesOff = off; ok = YES; RLOG(@"bones: RefSkeleton array at asset+0x%x (%d bones)", off, N); }
+        int bestOff = -1, bestN = 0;
+        uintptr_t bestData = 0;
+        for (int off = 0x30; off < 0x600; off += 8) {
+            uintptr_t d = 0; int32_t cn = 0;
+            if (refBonesAt(asset, off, &d, &cn) && cn > bestN) { bestN = cn; bestOff = off; bestData = d; }
+        }
+        if (bestOff >= 0) {
+            ok = YES; refData = bestData; N = bestN; gRefBonesOff = bestOff;
+            metalNote([NSString stringWithFormat:@"bones: using skeleton array at asset+0x%x with %d bones", bestOff, bestN]);
         }
     }
     if (!ok) { gBmFail[0]++; bonesDiag(asset); }
@@ -1483,7 +1492,7 @@ static EchoBoneMap *buildBoneMap(uintptr_t mesh) {
         if (info && rawb && gRefStride && safe_read(refData, rawb, (size_t)N * (size_t)gRefStride)) {
             for (int q = 0; q < N; q++) {
                 memcpy(&info[q * 4], rawb + (size_t)q * (size_t)gRefStride, 4);
-                memcpy(&info[q * 4 + 2], rawb + (size_t)q * (size_t)gRefStride + 8, 4);
+                memcpy(&info[q * 4 + 2], rawb + (size_t)q * (size_t)gRefStride + (size_t)gRefParentOff, 4);
             }
             rd = YES;
         }
