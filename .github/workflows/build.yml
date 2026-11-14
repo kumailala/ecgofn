@@ -1,0 +1,42 @@
+name: Build NEWLIB.dylib
+
+on:
+  push:
+  workflow_dispatch:        # lets you hit "Run workflow" manually
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14        # ships Xcode; needed for the iOS SDK + arm64e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: Build fat dylib
+        run: |
+          chmod +x build.sh
+          ./build.sh NEWLIB.dylib
+
+      - name: Verify
+        run: |
+          set -e
+          echo "== architectures =="
+          lipo -info NEWLIB.dylib
+          echo "== install name =="
+          otool -D NEWLIB.dylib
+          echo "== sha256 =="
+          shasum -a 256 NEWLIB.dylib
+
+      - name: Upload NEWLIB.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEWLIB.dylib
+          path: NEWLIB.dylib
+          if-no-files-found: error
