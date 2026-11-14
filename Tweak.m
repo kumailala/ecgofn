@@ -3162,7 +3162,8 @@ static void engCircle(void *cv, double cx, double cy, double r, int seg, double 
 }
 
 static uintptr_t gAimPawn = 0;
-static int gAimApplied = 0, gAimTargetFrames = 0, gDrawnPlayers = 0;
+static int gAimApplied = 0, gAimTargetFrames = 0, gDrawnPlayers = 0, gDbgAds = 0, gDbgAdsFlag = 0;
+static double gDbgFov = 0, gDbgBase = 0;
 static double gAimScreenX = 0, gAimScreenY = 0;
 
 static void engineEspFrame(void *cv) {
@@ -3190,9 +3191,9 @@ static void engineEspFrame(void *cv) {
     const float cSecondary[4] = { 0.0f, 0.47f, 1.0f, 1.0f };
     double fovRad = fov * M_PI / 180.0;
     double ppd = sx / ((2.0 * tan(0.5 * fovRad)) * 180.0 / M_PI);
-    double fovDeg = gOptFov * 33.0;
+    double fovDeg = gOptFov * 60.0;
     double dzDeg = fovDeg * 0.2;
-    double smoothS = 1.0 + gOptSmooth * 14.0;
+    double smoothS = 1.0 + gOptSmooth * 8.0;
     static CFTimeInterval lastT = 0;
     double elapsed = lastT > 0 ? now - lastT : 1.0 / 60.0;
     lastT = now;
@@ -3200,7 +3201,13 @@ static void engineEspFrame(void *cv) {
     if (elapsed > 0.1) elapsed = 0.1;
     double effSmooth = smoothS <= 1.0 ? smoothS : fmax(1.0, smoothS * ((1.0 / 120.0) / elapsed));
 
-    BOOL ads = (O_ADS < 0) ? YES : (lp && pawnFlag(lp, O_ADS, M_ADS));
+    static double fovBase = 0;
+    if (fov > fovBase) fovBase = fov; else fovBase -= 0.4 * elapsed;
+    if (fovBase < fov) fovBase = fov;
+    BOOL adsFlag = (O_ADS >= 0) && lp && pawnFlag(lp, O_ADS, M_ADS);
+    BOOL adsFov = fov < fovBase - 3.0;
+    BOOL ads = adsFlag || adsFov;
+    gDbgAds = ads; gDbgAdsFlag = adsFlag; gDbgFov = fov; gDbgBase = fovBase;
     BOOL targeting = gOptAimbot && (ads || !gOptAdsOnly);
     int aimSlot = gOptAimBody ? 15 : 0;
 
@@ -3257,8 +3264,7 @@ static void engineEspFrame(void *cv) {
             if (px < bx0) bx0 = px; if (px > bx1) bx1 = px;
             if (py < by0) by0 = py; if (py > by1) by1 = py;
         }
-        if (!cornersOk) continue;
-        BOOL onScreen = !(bx1 < 0 || bx0 > sx || by1 < 0 || by0 > sy);
+        BOOL onScreen = cornersOk && !(bx1 < 0 || bx0 > sx || by1 < 0 || by0 > sy);
         double bw = bx1 - bx0, bh = by1 - by0;
         if (onScreen && bw > 2.0 && bh > 2.0 && bw < sx * 4.0 && bh < sy * 4.0) {
             gDrawnPlayers++;
@@ -3296,8 +3302,8 @@ static void engineEspFrame(void *cv) {
             }
         }
 
-        if (targeting && haveB && !downed) {
-            DV3 tp = rb.w[aimSlot];
+        if (targeting && !downed) {
+            DV3 tp = haveB ? rb.w[aimSlot] : (DV3){ root.x, root.y, root.z + (gOptAimBody ? 25.0 : 70.0) };
             CGFloat nx, ny; float dp;
             BOOL pOk = project(&view, tp, &nx, &ny, &dp);
             double scx = pOk ? nx * sx : -1.0, scy = pOk ? ny * sy : -1.0;
@@ -3349,24 +3355,51 @@ static void engineEspFrame(void *cv) {
     }
 
     if (useTarget) gAimTargetFrames++;
+    static double aimSign = 1.0, lastRP = 0, lastRY = 0, lastNP = 0, lastNY = 0;
+    static int negC = 0, weakC = 0;
+    static BOOL directMode = NO, lastApplied = NO;
+    BOOL appliedNow = NO;
     if (useTarget && targeting && looks_like_uobject(pc)) {
         BOOL inDead = (tPix <= dzDeg * ppd);
+        if (lastApplied) {
+            double obsP = wrap180(rot.x - lastRP), obsY = wrap180(rot.y - lastRY);
+            BOOL useYaw = fabs(lastNY) > fabs(lastNP);
+            double nomV = useYaw ? lastNY : lastNP, obsV = useYaw ? obsY : obsP;
+            if (fabs(nomV) > 0.4) {
+                double ratio = obsV / nomV;
+                if (ratio < -0.25) {
+                    if (++negC >= 4) { aimSign = -aimSign; negC = 0; metalNote(@"aim: response was inverted, flipped input sign"); }
+                } else negC = 0;
+                if (fabs(ratio) < 0.12) {
+                    if (++weakC >= 30 && !directMode) { directMode = YES; metalNote(@"aim: input path had no effect, writing ControlRotation directly"); }
+                } else weakC = 0;
+            }
+        }
         if (!inDead) {
             double dP = wrap180(aP - wrap180(rot.x)), dY = wrap180(aY - wrap180(rot.y));
             dP /= effSmooth; dY /= effSmooth;
-            float yawScale = 0, pitchScale = 0;
-            safe_read(pc + 0x4c0, &yawScale, 4);
-            safe_read(pc + 0x4c4, &pitchScale, 4);
-            if (!(fabsf(yawScale) > 1e-4f) || !isfinite(yawScale)) yawScale = 1.0f;
-            if (!(fabsf(pitchScale) > 1e-4f) || !isfinite(pitchScale)) pitchScale = 1.0f;
-            void **vt = (void **)rd_ptr(pc);
-            uintptr_t fPitch = vt ? rd_ptr((uintptr_t)&vt[420]) : 0;
-            uintptr_t fYaw = vt ? rd_ptr((uintptr_t)&vt[421]) : 0;
-            if (fPitch >= gImgBase && fPitch < gImgEnd && fYaw >= gImgBase && fYaw < gImgEnd) {
-                ((void (*)(void *, float))fPitch)((void *)pc, (float)(dP / pitchScale));
-                ((void (*)(void *, float))fYaw)((void *)pc, (float)(dY / yawScale));
-                gDiagLock = YES;
-                gAimApplied++;
+            lastRP = rot.x; lastRY = rot.y; lastNP = dP; lastNY = dY;
+            if (directMode && O_CTRL_ROT >= 0) {
+                DV3 cur;
+                if (safe_read(pc + (uintptr_t)O_CTRL_ROT, &cur, sizeof cur) && sane_dv(cur)) {
+                    DV3 nr = { cur.x + dP, cur.y + dY, cur.z };
+                    memcpy((void *)(pc + (uintptr_t)O_CTRL_ROT), &nr, sizeof nr);
+                    appliedNow = YES; gAimApplied++; gDiagLock = YES;
+                }
+            } else {
+                float yawScale = 0, pitchScale = 0;
+                safe_read(pc + 0x4c0, &yawScale, 4);
+                safe_read(pc + 0x4c4, &pitchScale, 4);
+                if (!(fabsf(yawScale) > 1e-4f) || !isfinite(yawScale)) yawScale = 1.0f;
+                if (!(fabsf(pitchScale) > 1e-4f) || !isfinite(pitchScale)) pitchScale = 1.0f;
+                void **vt = (void **)rd_ptr(pc);
+                uintptr_t fPitch = vt ? rd_ptr((uintptr_t)&vt[420]) : 0;
+                uintptr_t fYaw = vt ? rd_ptr((uintptr_t)&vt[421]) : 0;
+                if (fPitch >= gImgBase && fPitch < gImgEnd && fYaw >= gImgBase && fYaw < gImgEnd) {
+                    ((void (*)(void *, float))fPitch)((void *)pc, (float)(aimSign * dP / pitchScale));
+                    ((void (*)(void *, float))fYaw)((void *)pc, (float)(aimSign * dY / yawScale));
+                    appliedNow = YES; gAimApplied++; gDiagLock = YES;
+                }
             }
         } else {
             gDiagLock = NO;
@@ -3374,6 +3407,7 @@ static void engineEspFrame(void *cv) {
     } else {
         gDiagLock = NO;
     }
+    lastApplied = appliedNow;
 
     gEngDrawLast = now;
 }
@@ -3396,7 +3430,7 @@ static void h_DrawTransition(void *self, void *canvas) {
         }
         gDTFrames++;
         if (gDTFrames == 1 || gDTFrames % 900 == 0)
-            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p players drawn %d aim target frames %d applied %d vp %d", gDTFrames, canvas, gDrawnPlayers, gAimTargetFrames, gAimApplied, gVPOff]);
+            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p players drawn %d aim target frames %d applied %d vp %d ads %d (flag %d) fov %.1f base %.1f", gDTFrames, canvas, gDrawnPlayers, gAimTargetFrames, gAimApplied, gVPOff, gDbgAds, gDbgAdsFlag, gDbgFov, gDbgBase]);
     } else if (++gDTBad > 40 && gDTSlot) {
         *gDTSlot = (void *)gDTOrig;
         gDTSlot = NULL;
