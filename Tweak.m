@@ -471,9 +471,9 @@ static BOOL fname_read(int32_t idx, char *out, int cap) {
     if (!blk) return NO;
     uintptr_t e = blk + (uintptr_t)gNameStride * (uintptr_t)((uint32_t)idx & 0xFFFF);
     uint16_t h = 0;
-    if (!safe_read(e + (uintptr_t)gNameTextOff - 2, &h, 2)) return NO;
-    if (h & 1) return NO;
-    int len = h >> gNameShift;
+    if (!safe_read(e, &h, 2)) return NO;
+    if (h & (gNameShift == 5 ? 0x8000 : 1)) return NO;
+    int len = (h >> gNameShift) & 0x3FF;
     if (len <= 0) return NO;
     if (len >= cap) len = cap - 1;
     if (!safe_read(e + (uintptr_t)gNameTextOff, out, (size_t)len)) return NO;
@@ -561,9 +561,8 @@ static BOOL poolTestBlock(uintptr_t v, uintptr_t slotForBi0, const int32_t *idxs
             if (!safe_read(v + (uintptr_t)strides[si] * (uintptr_t)((uint32_t)idxs[k] & 0xFFFF), b, sizeof b)) continue;
             for (int t = 2; t <= 12; t += 2) {
                 if (memcmp(b + t, "Class", 5) != 0) continue;
-                uint16_t h; memcpy(&h, b + t - 2, 2);
-                if (h & 1) continue;
-                int sh = ((h >> 6) == 5) ? 6 : (((h >> 1) == 5) ? 1 : 0);
+                uint16_t h; memcpy(&h, b, 2);
+                int sh = (((h >> 5) & 0x3FF) == 5 && !(h & 0x8000)) ? 5 : ((((h >> 6) & 0x3FF) == 5 && !(h & 1)) ? 6 : 0);
                 if (!sh) continue;
                 gNameShift = sh; gNameStride = strides[si]; gNameTextOff = t;
                 gNameBlocks = slotForBi0 - 8 * (uintptr_t)bi;
@@ -619,8 +618,8 @@ static BOOL poolStatic(uintptr_t cc, int classOff) {
         if (nk == classOff) continue;
         int32_t idx = rd_i32(cc + (uintptr_t)nk);
         if (idx <= 0) continue;
-        for (int sh = 6; sh >= 1; sh -= 5) {
-            for (int t = 2; t <= 8; t += 2) {
+        for (int sh = 5; sh <= 6; sh++) {
+            for (int t = 2; t <= 12; t += 2) {
                 gNameShift = sh; gNameStride = 2; gNameTextOff = t;
                 if (name_is(idx, "Class")) { RLOG(@"namepool: static slot %p ok (shift %d textoff %d, Class name at obj+0x%x)", (void *)gNameBlocks, sh, t, nk); return YES; }
             }
