@@ -372,6 +372,9 @@ static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
 static float gOptLagF = 1.0f;
+static BOOL  gOptEngineDraw = YES;
+static volatile CFTimeInterval gEngDrawLast = 0;
+static void installEngineHook(void);
 static _Atomic int gCapCount = 0;
 
 typedef struct { double x, y, z; } DV3;
@@ -1515,6 +1518,7 @@ static void scanPawns(void) {
         gResolving = YES; gLastResolveTry = now;
         gResolved = resolveAll();
         gResolving = NO;
+        if (gResolved) installEngineHook();
         if (!gResolved) { publishPawns(nil, 0, 0); return; }
     }
     if (!gBoneCache) gBoneCache = [NSMutableDictionary dictionary];
@@ -2029,6 +2033,7 @@ static void samplerMain(void) {
     for (;;) {
         @autoreleasepool {
             if (!gResolved) { usleep(100000); continue; }
+            if (CACurrentMediaTime() - gEngDrawLast < 0.5) { usleep(20000); continue; }
             NSArray<EchoPawn *> *pawns; uintptr_t pc, lp;
             @synchronized ([NSProcessInfo processInfo]) { pawns = gPawns; pc = gLocalPC; lp = gLocalPawn; }
             if (!pc || !pawns.count) {
@@ -2247,7 +2252,7 @@ static void drawTick(CADisplayLink *link) {
     gScreenSz = sz;
     CFTimeInterval now = CACurrentMediaTime();
     EchoFrame *frame;
-    if (now - gMetalLastDraw < 0.5) {
+    if (now - gMetalLastDraw < 0.5 || now - gEngDrawLast < 0.5) {
         frame = emptyFrame();
     } else {
         CFTimeInterval shown = (link.targetTimestamp > 0 ? link.targetTimestamp : now) + (link.duration > 0 ? link.duration : 1.0 / 60.0);
@@ -2666,6 +2671,7 @@ static BOOL camMoving(void) {
 }
 
 static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
+    if (CACurrentMediaTime() - gEngDrawLast < 0.5) return;
     id<MTLTexture> tex = dr.texture;
     if (!tex || !(tex.usage & MTLTextureUsageRenderTarget) || tex.sampleCount != 1) return;
     if (!ensureMetal(tex)) return;
@@ -2888,6 +2894,234 @@ static void installMetalHooks(void) {
     }
 }
 
+#pragma mark 6.5 engine canvas draw (same method as Raax: hook the viewport's DrawTransition, draw with the game's own canvas)
+
+typedef struct { float r, g, b, a; } FLC;
+typedef void (*DrawLineFn)(void *, double, double, double, double, float, float, float, float, FLC);
+typedef void (*DTFn)(void *, void *);
+
+static void **gDTSlot = NULL;
+static DTFn gDTOrig = NULL;
+static int gDTBad = 0;
+static int gDTFrames = 0;
+static uintptr_t gCanvasCls = 0;
+static BOOL gDTHooked = NO;
+
+static inline void engLine(void *cv, double ax, double ay, double bx, double by, float th, const float *c) {
+    ((DrawLineFn)SYM(0x105672764ULL))(cv, ax, ay, bx, by, th, 0.0f, 0.0f, 0.0f, (FLC){ c[0], c[1], c[2], c[3] });
+}
+
+static const char *strokeGlyph(int ch) {
+    if (ch >= 'a' && ch <= 'z') ch -= 32;
+    switch (ch) {
+        case '0': return "00 20 24 04 00";
+        case '1': return "01 10 14 / 04 24";
+        case '2': return "00 20 22 02 04 24";
+        case '3': return "00 20 24 04 / 02 22";
+        case '4': return "00 02 22 / 20 24";
+        case '5': return "20 00 02 22 24 04";
+        case '6': return "20 00 04 24 22 02";
+        case '7': return "00 20 14";
+        case '8': return "00 20 24 04 00 / 02 22";
+        case '9': return "22 02 00 20 24 04";
+        case 'A': return "04 00 20 24 / 02 22";
+        case 'B': return "00 04 24 22 02 / 00 20 22";
+        case 'C': return "20 00 04 24";
+        case 'D': return "00 04 23 21 10 00";
+        case 'E': return "20 00 04 24 / 02 12";
+        case 'F': return "20 00 04 / 02 12";
+        case 'G': return "20 00 04 24 22 12";
+        case 'H': return "00 04 / 20 24 / 02 22";
+        case 'I': return "00 20 / 10 14 / 04 24";
+        case 'J': return "20 24 04 02";
+        case 'K': return "00 04 / 20 02 24";
+        case 'L': return "00 04 24";
+        case 'M': return "04 00 12 20 24";
+        case 'N': return "04 00 24 20";
+        case 'O': return "00 20 24 04 00";
+        case 'P': return "04 00 20 22 02";
+        case 'Q': return "00 20 24 04 00 / 12 24";
+        case 'R': return "04 00 20 22 02 / 12 24";
+        case 'S': return "20 00 02 22 24 04";
+        case 'T': return "00 20 / 10 14";
+        case 'U': return "00 04 24 20";
+        case 'V': return "00 14 20";
+        case 'W': return "00 04 12 24 20";
+        case 'X': return "00 24 / 20 04";
+        case 'Y': return "00 12 20 / 12 14";
+        case 'Z': return "00 20 04 24";
+        case '.': return "13 14";
+        case '-': return "02 22";
+        case '_': return "04 24";
+        case ':': return "11 12 / 13 14";
+        case '[': return "20 10 14 24";
+        case ']': return "00 10 14 04";
+        case '/': return "24 00";
+        case '%': return "00 11 / 13 24";
+        default: return NULL;
+    }
+}
+
+static void engText(void *cv, NSString *s, double cx, double bottom, double u, double th, const float *col) {
+    const char *t = s.UTF8String;
+    if (!t) return;
+    int n = (int)strlen(t);
+    if (n > 40) n = 40;
+    double adv = 3.6 * u, total = n * adv;
+    double x0 = cx - total * 0.5, y0 = bottom - 4.0 * u - 3.0;
+    for (int i = 0; i < n; i++) {
+        const char *g = strokeGlyph((unsigned char)t[i]);
+        if (!g) continue;
+        double gx = x0 + i * adv;
+        double px = 0, py = 0;
+        BOOL pen = NO;
+        const char *p = g;
+        while (*p) {
+            if (*p == ' ') { p++; continue; }
+            if (*p == '/') { pen = NO; p++; continue; }
+            if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
+                double x = gx + (p[0] - '0') * u, y = y0 + (p[1] - '0') * u;
+                if (pen) engLine(cv, px, py, x, y, (float)th, col);
+                px = x; py = y; pen = YES;
+                p += 2;
+                continue;
+            }
+            p++;
+        }
+    }
+}
+
+typedef struct { void *cv; double th; float col[4]; } EngPathCtx;
+typedef struct { void *cv; double th; float col[4]; CGPoint cur, start; } EngPath;
+
+static void engPathApplier(void *info, const CGPathElement *e) {
+    EngPath *p = (EngPath *)info;
+    switch (e->type) {
+        case kCGPathElementMoveToPoint: p->cur = p->start = e->points[0]; break;
+        case kCGPathElementAddLineToPoint:
+            engLine(p->cv, p->cur.x, p->cur.y, e->points[0].x, e->points[0].y, (float)p->th, p->col);
+            p->cur = e->points[0];
+            break;
+        case kCGPathElementCloseSubpath:
+            engLine(p->cv, p->cur.x, p->cur.y, p->start.x, p->start.y, (float)p->th, p->col);
+            p->cur = p->start;
+            break;
+        default: break;
+    }
+}
+
+static void engPath(void *cv, UIBezierPath *bp, double th, float r, float g, float b, float a) {
+    EngPath p; p.cv = cv; p.th = th; p.cur = p.start = CGPointZero;
+    p.col[0] = r; p.col[1] = g; p.col[2] = b; p.col[3] = a;
+    CGPathApply(bp.CGPath, &p, engPathApplier);
+}
+
+static void engineEspFrame(void *cv) {
+    int sx = rd_i32((uintptr_t)cv + 0x40), sy = rd_i32((uintptr_t)cv + 0x44);
+    if (sx < 200 || sy < 200 || sx > 8000 || sy > 8000) return;
+    NSArray<EchoPawn *> *pawns; uintptr_t pc, lp;
+    @synchronized ([NSProcessInfo processInfo]) { pawns = gPawns; pc = gLocalPC; lp = gLocalPawn; }
+    if (!pc || !pawns.count) return;
+    CGSize sz = CGSizeMake(sx, sy);
+    gScreenSz = sz;
+    DV3 cam, rot; float fov, ts;
+    if (!readCameraStable(pc, &cam, &rot, &fov, &ts)) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    EchoSnap *s = captureSnap(pawns, cam, rot, fov, now);
+    aimStep(s, pc, lp);
+    EchoFrame *f = emptyFrame();
+    renderSnap(f, s, s, 1.0, sz);
+    double sc = sx / 1000.0;
+    if (sc < 1.0) sc = 1.0;
+    if (gOptBoxes) {
+        engPath(cv, f.tb, 1.5 * sc, 0.2f, 1.0f, 0.4f, 1.0f);
+        engPath(cv, f.eb, 1.5 * sc, 1.0f, 0.2f, 0.2f, 1.0f);
+    }
+    if (gOptSkeleton) {
+        engPath(cv, f.tbn, 1.2 * sc, 0.4f, 1.0f, 1.0f, 1.0f);
+        engPath(cv, f.ebn, 1.2 * sc, 1.0f, 0.9f, 0.2f, 1.0f);
+    }
+    if (gOptAimbot && gOptShowFov) {
+        double r = gOptFov * sz.height, ccx = sz.width * 0.5, ccy = sz.height * 0.5;
+        float col[4] = { 1, 1, 1, 0.5f };
+        for (int i = 0; i < 48; i++) {
+            double a0 = i * 2.0 * M_PI / 48.0, a1 = (i + 1) * 2.0 * M_PI / 48.0;
+            engLine(cv, ccx + cos(a0) * r, ccy + sin(a0) * r, ccx + cos(a1) * r, ccy + sin(a1) * r, 1.0f * (float)sc, col);
+        }
+    }
+    for (EchoTag *t in f.tags) {
+        CGFloat r = 1, g = 1, b = 1, a = 1;
+        if (t.color) [t.color getRed:&r green:&g blue:&b alpha:&a];
+        float col[4] = { (float)r, (float)g, (float)b, 1.0f };
+        engText(cv, t.text, t.c.x, t.c.y, 2.6 * sc, 1.1 * sc, col);
+    }
+    gEngDrawLast = now;
+    gDiagDrawn = (int)f.tags.count;
+}
+
+static BOOL looksCanvas(void *cv) {
+    uintptr_t o = (uintptr_t)cv;
+    if (!looks_like_uobject(o)) return NO;
+    uintptr_t cls = rd_ptr(o + (uintptr_t)gOffClass);
+    if (cls && cls == gCanvasCls) return YES;
+    NSString *n = fname_string(fnidx(cls + (uintptr_t)gOffName));
+    if (n && [n.lowercaseString containsString:@"canvas"]) { gCanvasCls = cls; return YES; }
+    return NO;
+}
+
+static void h_DrawTransition(void *self, void *canvas) {
+    if (looksCanvas(canvas)) {
+        gDTBad = 0;
+        if (gOptEngineDraw) {
+            @autoreleasepool { engineEspFrame(canvas); }
+        }
+        gDTFrames++;
+        if (gDTFrames == 1 || gDTFrames % 900 == 0)
+            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p", gDTFrames, canvas]);
+    } else if (++gDTBad > 40 && gDTSlot) {
+        *gDTSlot = (void *)gDTOrig;
+        gDTSlot = NULL;
+        metalNote(@"engine draw: slot was not DrawTransition, restored");
+    }
+    gDTOrig(self, canvas);
+}
+
+static void installEngineHook(void) {
+    if (gDTHooked) return;
+    gDTHooked = YES;
+    uintptr_t vp = gEngineObj ? rd_ptr(gEngineObj + (uintptr_t)O_ENGINE_VIEWPORT) : 0;
+    if (!looks_like_uobject(vp)) { metalNote(@"engine hook: no viewport object"); return; }
+    void **vt = (void **)rd_ptr(vp);
+    if (!vt) { metalNote(@"engine hook: no vtable"); return; }
+    int giOff = propOff(gCls[C_VIEWPORT], "GameInstance");
+    int supOff = giOff >= 0 ? giOff + 8 : 0x80;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"engine hook: viewport %p vtable %p (image+0x%lx) flag offset 0x%x", (void *)vp, vt, (unsigned long)((uintptr_t)vt - gSlide), supOff];
+    int pick = -1;
+    for (int i = 0x20; i < 0xA0; i++) {
+        uintptr_t fn = rd_ptr((uintptr_t)&vt[i]);
+        if (fn < gImgBase || fn >= gImgEnd) break;
+        uint32_t code[48];
+        if (!safe_read(fn, code, sizeof code)) continue;
+        for (int k = 0; k < 48; k++) {
+            uint32_t w = code[k];
+            if ((w & 0xFFC00000u) == 0x39400000u && (int)((w >> 10) & 0xFFF) == supOff) {
+                [m appendFormat:@"\n  candidate slot %d fn image+0x%lx", i, (unsigned long)(fn - gSlide)];
+                if (pick < 0) pick = i;
+                break;
+            }
+        }
+    }
+    if (pick < 0) { metalNote([m stringByAppendingString:@"\n  no DrawTransition candidate"]); return; }
+    vm_address_t page = (vm_address_t)((uintptr_t)&vt[pick] & ~(uintptr_t)0x3FFF);
+    kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { metalNote([m stringByAppendingFormat:@"\n  vm_protect failed %d", kr]); return; }
+    gDTOrig = (DTFn)vt[pick];
+    gDTSlot = &vt[pick];
+    vt[pick] = (void *)h_DrawTransition;
+    [m appendFormat:@"\n  hooked slot %d", pick];
+    metalNote(m);
+}
+
 static void applyFrame(EchoFrame *f, CGSize sz) {
     for (NSUInteger i = 0; i < gTagPool.count; i++) gTagPool[i].hidden = YES;
     {
@@ -3090,6 +3324,7 @@ static void loadOptions(void) {
         case 19: gOptAutoWeapons = on; break;
         case 23: gOptLoot = on; break;
         case 24: gOptWeaponEsp = on; break;
+        case 25: gOptEngineDraw = on; break;
     }
     saveOptions();
 }
@@ -3206,6 +3441,7 @@ static void installMenu(void) {
         [panel addSubview:title];
         y += 32;
 
+        addSwitch(panel, &y, @"Engine draw (exact lock, no delay)", gOptEngineDraw, 25);
         addSwitch(panel, &y, @"Box ESP", gOptBoxes, 1);
         addSwitch(panel, &y, @"Skeleton ESP", gOptSkeleton, 2);
         addSwitch(panel, &y, @"Name / distance", gOptTags, 3);
