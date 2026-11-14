@@ -370,6 +370,8 @@ static BOOL  gOptPeek = NO;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
 static int   gOptDelay = 1;
+static float gOptLagF = 1.0f;
+static _Atomic int gCapCount = 0;
 
 typedef struct { double x, y, z; } DV3;
 typedef struct { double q[4]; double t[3]; double tp; double s[3]; double sp; } DXf;
@@ -2040,6 +2042,7 @@ static void samplerMain(void) {
                 lastTsTime = now;
             }
             lastCam = cam; lastRot = rot; lastTs = ts; lastCap = now; lastPawns = pawns;
+            atomic_fetch_add(&gCapCount, 1);
             EchoSnap *s = captureSnap(pawns, cam, rot, fov, now);
             @synchronized (gSnapLock) {
                 [gSnaps addObject:s];
@@ -2201,17 +2204,20 @@ static EchoFrame *frameForTime(double T, CFTimeInterval ref, CGSize sz) {
     return frame;
 }
 
-static EchoFrame *frameForTicks(int lagTicks, CFTimeInterval ref, CGSize sz) {
+static EchoFrame *frameForTicks(float lagTicks, CFTimeInterval ref, CGSize sz) {
     EchoFrame *frame = emptyFrame();
     NSArray<EchoSnap *> *snaps;
     @synchronized (gSnapLock) { snaps = [gSnaps copy]; }
     if (!snaps.count) return frame;
     EchoSnap *newest = snaps.lastObject;
     if (ref - newest->t > 0.6) return frame;
-    NSInteger idx = (NSInteger)snaps.count - 1 - lagTicks;
-    if (idx < 0) idx = 0;
-    EchoSnap *S = snaps[(NSUInteger)idx];
-    renderSnap(frame, S, S, 1.0, sz);
+    double pos = (double)snaps.count - 1.0 - (double)lagTicks;
+    if (pos < 0.0) pos = 0.0;
+    NSInteger i0 = (NSInteger)floor(pos);
+    double a = pos - (double)i0;
+    EchoSnap *S0 = snaps[(NSUInteger)i0];
+    EchoSnap *S1 = (NSUInteger)(i0 + 1) < snaps.count ? snaps[(NSUInteger)(i0 + 1)] : S0;
+    renderSnap(frame, S0, S1, a, sz);
     return frame;
 }
 
@@ -2444,7 +2450,7 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     CGSize sz = gScreenSz;
     if (sz.width < 10 || sz.height < 10) return;
     CFTimeInterval now = CACurrentMediaTime();
-    int li = gOptDelay < 0 ? 0 : (gOptDelay > 3 ? 3 : gOptDelay);
+    float li = gOptLagF < 0.0f ? 0.0f : (gOptLagF > 3.0f ? 3.0f : gOptLagF);
     EchoFrame *f = frameForTicks(li, now, sz);
     gMBufIdx = (gMBufIdx + 1) % kRing;
     id<MTLBuffer> buf = gMBufs[gMBufIdx];
@@ -2465,7 +2471,7 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     [enc endEncoding];
     gMDraws++;
     if (gMDraws == 1 || gMDraws % 600 == 0)
-        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %d ticks dt %.1fms sawPresentSel %d", gMDraws, n, (int)f.tags.count, li, gFrameDt * 1000.0, (int)gSawPresentSel]);
+        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %.2f ticks caps %d sawPresentSel %d", gMDraws, n, (int)f.tags.count, li, atomic_load(&gCapCount), (int)gSawPresentSel]);
 }
 
 static void metalMark(id cb, id drawable) {
@@ -2699,7 +2705,7 @@ static void saveOptions(void) {
     [d setFloat:gOptDmgMul forKey:@"echo.dmgmul"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
-    [d setInteger:gOptDelay forKey:@"echo.lag2"];
+    [d setFloat:gOptLagF forKey:@"echo.lagf"];
 }
 
 static void loadOptions(void) {
@@ -2724,13 +2730,14 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.dmgmul"]) gOptDmgMul = [d floatForKey:@"echo.dmgmul"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
-    if ([d objectForKey:@"echo.lag2"]) gOptDelay = (int)[d integerForKey:@"echo.lag2"];
+    if ([d objectForKey:@"echo.lagf"]) gOptLagF = [d floatForKey:@"echo.lagf"];
 }
 
 @interface EchoMenuHandler : NSObject
 @property (nonatomic, strong) UILabel *smoothLabel;
 @property (nonatomic, strong) UILabel *fovLabel;
 @property (nonatomic, strong) UILabel *dmgLabel;
+@property (nonatomic, strong) UILabel *lagLabel;
 @end
 @implementation EchoMenuHandler
 - (void)toggled:(UISwitch *)s {
@@ -2763,6 +2770,7 @@ static void loadOptions(void) {
 - (void)slid:(UISlider *)s {
     if (s.tag == 20) { gOptSmooth = s.value; self.smoothLabel.text = [NSString stringWithFormat:@"Smoothness  %.0f%%", s.value * 100]; }
     if (s.tag == 22) { gOptDmgMul = s.value; self.dmgLabel.text = [NSString stringWithFormat:@"Damage x%d", 1 + (int)(s.value * 49.0f)]; }
+    if (s.tag == 23) { gOptLagF = s.value * 3.0f; self.lagLabel.text = [NSString stringWithFormat:@"ESP lag  %.2f game ticks", gOptLagF]; }
     if (s.tag == 21) { gOptFov = s.value; self.fovLabel.text = [NSString stringWithFormat:@"Aim FOV  %.0f%%", s.value * 100]; }
     saveOptions();
 }
@@ -2885,7 +2893,8 @@ static void installMenu(void) {
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
-        addSegment(panel, &y, @"ESP lag (game ticks)", @[ @"0", @"1", @"2", @"3" ], gOptDelay, 31);
+        gMenuHandler.lagLabel = addSlider(panel, &y, @"ESP lag", gOptLagF / 3.0f, 23);
+        gMenuHandler.lagLabel.text = [NSString stringWithFormat:@"ESP lag  %.2f game ticks", gOptLagF];
 
         panel.contentSize = CGSizeMake(pw, y + 8);
         CGFloat ph = MIN(y + 8, ss.height - 40);
