@@ -31,6 +31,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -117,10 +118,13 @@ static void hook_setPreferredFPS(id self, SEL _cmd, NSInteger v) {
 
 #pragma mark - 2) real render counter
 
+static __weak id gCurDrawable = nil;
 static id (*orig_nextDrawable)(id, SEL);
 static id hook_nextDrawable(id self, SEL _cmd) {
     atomic_fetch_add(&gMetalFrames, 1);
-    return orig_nextDrawable(self, _cmd);
+    id d = orig_nextDrawable(self, _cmd);
+    gCurDrawable = d;
+    return d;
 }
 
 #pragma mark - overlay
@@ -365,7 +369,7 @@ static BOOL  gOptAutoSprint = NO;
 static BOOL  gOptPeek = NO;
 static float gOptSmooth = 0.35f;
 static float gOptFov = 0.30f;
-static int   gOptDelay = 2;
+static int   gOptDelay = 3;
 
 typedef struct { double x, y, z; } DV3;
 typedef struct { double q[4]; double t[3]; double tp; double s[3]; double sp; } DXf;
@@ -1838,6 +1842,7 @@ static void applyFrame(EchoFrame *f, CGSize sz);
 @implementation EchoSnap
 @end
 
+static double gFrameDt = 1.0 / 60.0;
 static NSMutableArray<EchoSnap *> *gSnaps = nil;
 static NSObject *gSnapLock = nil;
 static CGSize gScreenSz = {0, 0};
@@ -2011,7 +2016,7 @@ static void samplerMain(void) {
     [NSThread setThreadPriority:1.0];
     DV3 lastCam = {0,0,0}, lastRot = {0,0,0};
     float lastTs = -1.0f;
-    CFTimeInterval lastCap = 0;
+    CFTimeInterval lastCap = 0, lastTsTime = 0;
     NSArray<EchoPawn *> *lastPawns = nil;
     for (;;) {
         @autoreleasepool {
@@ -2029,6 +2034,11 @@ static void samplerMain(void) {
             CFTimeInterval now = CACurrentMediaTime();
             BOOL changed = ts != lastTs || memcmp(&cam, &lastCam, sizeof cam) != 0 || memcmp(&rot, &lastRot, sizeof rot) != 0;
             if (!changed && pawns == lastPawns && now - lastCap < 0.1) { usleep(1000); continue; }
+            if (ts != lastTs) {
+                double dtf = now - lastTsTime;
+                if (lastTsTime > 0 && dtf > 0.004 && dtf < 0.06) gFrameDt = gFrameDt * 0.9 + dtf * 0.1;
+                lastTsTime = now;
+            }
             lastCam = cam; lastRot = rot; lastTs = ts; lastCap = now; lastPawns = pawns;
             EchoSnap *s = captureSnap(pawns, cam, rot, fov, now);
             @synchronized (gSnapLock) {
@@ -2138,48 +2148,400 @@ static void renderSnap(EchoFrame *frame, EchoSnap *A, EchoSnap *B, double alpha,
     }
 }
 
-static void drawTick(CADisplayLink *link) {
-    if (!gLabelRoot) return;
-    attachScene(gLabelWindow);
-    CGSize sz = gLabelRoot.bounds.size;
-    gScreenSz = sz;
-
+static EchoFrame *emptyFrame(void) {
     EchoFrame *frame = [[EchoFrame alloc] init];
     frame.eb = [UIBezierPath bezierPath];
     frame.tb = [UIBezierPath bezierPath];
     frame.ebn = [UIBezierPath bezierPath];
     frame.tbn = [UIBezierPath bezierPath];
     frame.tags = [NSMutableArray array];
+    return frame;
+}
 
+static EchoFrame *frameForTime(double T, CFTimeInterval ref, CGSize sz) {
+    EchoFrame *frame = emptyFrame();
     NSArray<EchoSnap *> *snaps;
     @synchronized (gSnapLock) { snaps = [gSnaps copy]; }
-    if (snaps.count) {
-        static const double kMs[6] = { -33, -16, 0, 16, 33, 50 };
-        int di = gOptDelay < 0 ? 0 : (gOptDelay > 5 ? 5 : gOptDelay);
-        CFTimeInterval now = CACurrentMediaTime();
-        CFTimeInterval shown = (link.targetTimestamp > 0 ? link.targetTimestamp : now) + (link.duration > 0 ? link.duration : 1.0 / 60.0);
-        double T = shown + kMs[di] / 1000.0;
-        EchoSnap *B = snaps.lastObject;
-        if (shown - B->t < 0.6) {
-            EchoSnap *A = B;
-            for (NSInteger i = (NSInteger)snaps.count - 2; i >= 0; i--) {
-                A = snaps[(NSUInteger)i];
-                if (A->t <= B->t - 0.030) break;
+    if (!snaps.count) return frame;
+    EchoSnap *newest = snaps.lastObject;
+    if (ref - newest->t > 0.6) return frame;
+    EchoSnap *A = newest, *B = newest;
+    double alpha = 1.0;
+    if (T >= newest->t) {
+        for (NSInteger i = (NSInteger)snaps.count - 2; i >= 0; i--) {
+            A = snaps[(NSUInteger)i];
+            if (A->t <= newest->t - 0.030) break;
+        }
+        double span = newest->t - A->t;
+        if (A != newest && span > 0.004 && span < 0.25) {
+            double tt = T > newest->t + 0.07 ? newest->t + 0.07 : T;
+            alpha = (tt - A->t) / span;
+        } else {
+            A = newest; alpha = 1.0;
+        }
+    } else {
+        EchoSnap *oldest = snaps.firstObject;
+        if (T <= oldest->t) {
+            A = B = oldest;
+        } else {
+            for (NSInteger i = (NSInteger)snaps.count - 1; i >= 1; i--) {
+                if (snaps[(NSUInteger)i - 1]->t <= T) {
+                    A = snaps[(NSUInteger)i - 1]; B = snaps[(NSUInteger)i];
+                    double span = B->t - A->t;
+                    alpha = span > 1e-6 ? (T - A->t) / span : 1.0;
+                    if (alpha < 0.0) alpha = 0.0;
+                    if (alpha > 1.0) alpha = 1.0;
+                    if (span > 0.25) alpha = 1.0;
+                    break;
+                }
             }
-            double alpha = 1.0;
-            double span = B->t - A->t;
-            if (A != B && span > 0.004 && span < 0.25) {
-                double tt = T > B->t + 0.07 ? B->t + 0.07 : T;
-                alpha = (tt - A->t) / span;
-                if (alpha < 0.0) alpha = 0.0;
-            } else {
-                A = B;
-            }
-            renderSnap(frame, A, B, alpha, sz);
         }
     }
-    gDiagDrawn = (int)frame.tags.count;
+    renderSnap(frame, A, B, alpha, sz);
+    return frame;
+}
+
+static CFTimeInterval gMetalLastDraw = 0;
+
+static void drawTick(CADisplayLink *link) {
+    if (!gLabelRoot) return;
+    attachScene(gLabelWindow);
+    CGSize sz = gLabelRoot.bounds.size;
+    gScreenSz = sz;
+    CFTimeInterval now = CACurrentMediaTime();
+    EchoFrame *frame;
+    if (now - gMetalLastDraw < 0.5) {
+        frame = emptyFrame();
+    } else {
+        CFTimeInterval shown = (link.targetTimestamp > 0 ? link.targetTimestamp : now) + (link.duration > 0 ? link.duration : 1.0 / 60.0);
+        frame = frameForTime(shown, shown, sz);
+        gDiagDrawn = (int)frame.tags.count;
+    }
     applyFrame(frame, sz);
+}
+
+#pragma mark 6.3 in-frame Metal overlay
+
+typedef struct { float p[2]; float uv[2]; float c[4]; } EVert;
+
+enum { kGlyphW = 14, kGlyphH = 26, kGlyphCols = 18, kAtlasW = 256, kAtlasH = 160, kMaxVerts = 24000, kRing = 6 };
+
+static id<MTLDevice> gMDev = nil;
+static id<MTLRenderPipelineState> gMPSO = nil;
+static id<MTLTexture> gMAtlas = nil;
+static id<MTLBuffer> gMBufs[kRing];
+static int gMBufIdx = 0;
+static MTLPixelFormat gMFmt = MTLPixelFormatInvalid;
+static int gMFailures = 0;
+static BOOL gMReady = NO;
+static BOOL gSawPresentSel = NO;
+static int gMDraws = 0;
+static NSObject *gMNoteLock = nil;
+static char kMarkKey;
+
+static void metalNote(NSString *s) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!dir) return;
+    if (!gMNoteLock) gMNoteLock = [[NSObject alloc] init];
+    static NSMutableString *log = nil;
+    @synchronized (gMNoteLock) {
+        if (!log) log = [NSMutableString string];
+        [log appendFormat:@"%@\n", s];
+        [log writeToFile:[dir stringByAppendingPathComponent:@"EchoMod43_metal.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+static id<MTLTexture> buildAtlas(id<MTLDevice> dev) {
+    size_t W = kAtlasW, H = kAtlasH;
+    uint8_t *px = (uint8_t *)calloc(W * H * 4, 1);
+    if (!px) return nil;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(px); return nil; }
+    CGContextTranslateCTM(ctx, 0, (CGFloat)H);
+    CGContextScaleCTM(ctx, 1, -1);
+    UIGraphicsPushContext(ctx);
+    CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
+    CGContextFillRect(ctx, CGRectMake((CGFloat)W - 8, (CGFloat)H - 8, 8, 8));
+    UIFont *font = nil;
+    if (@available(iOS 13.0, *)) font = [UIFont monospacedSystemFontOfSize:20 weight:UIFontWeightBold];
+    if (!font) font = [UIFont boldSystemFontOfSize:20];
+    NSDictionary *attrs = @{ NSFontAttributeName: font, NSForegroundColorAttributeName: [UIColor whiteColor] };
+    for (int ch = 32; ch < 127; ch++) {
+        int i = ch - 32, col = i % kGlyphCols, row = i / kGlyphCols;
+        NSString *s = [NSString stringWithFormat:@"%c", ch];
+        [s drawAtPoint:CGPointMake(col * kGlyphW + 0.5, row * kGlyphH) withAttributes:attrs];
+    }
+    UIGraphicsPopContext();
+    CGContextRelease(ctx);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:H mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    [t replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:px bytesPerRow:W * 4];
+    free(px);
+    return t;
+}
+
+static BOOL ensureMetal(id<MTLTexture> tex) {
+    if (gMReady && gMFmt == tex.pixelFormat) return YES;
+    if (gMFailures >= 3) return NO;
+    id<MTLDevice> dev = tex.device;
+    NSString *src =
+        @"#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct VIn { float2 p; float2 uv; float4 c; };\n"
+        "struct VOut { float4 pos [[position]]; float2 uv; float4 c; };\n"
+        "vertex VOut vmain(uint vid [[vertex_id]], constant VIn *v [[buffer(0)]]) {\n"
+        "  VOut o; o.pos = float4(v[vid].p, 0.0, 1.0); o.uv = v[vid].uv; o.c = v[vid].c; return o; }\n"
+        "fragment float4 fmain(VOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+        "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+        "  float a = t.sample(s, in.uv).a;\n"
+        "  return float4(in.c.rgb, in.c.a * a); }\n";
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
+    if (!lib) { gMFailures++; metalNote([NSString stringWithFormat:@"library failed: %@", err]); return NO; }
+    MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = [lib newFunctionWithName:@"vmain"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"fmain"];
+    pd.colorAttachments[0].pixelFormat = tex.pixelFormat;
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!pso) { gMFailures++; metalNote([NSString stringWithFormat:@"pipeline failed (fmt %d): %@", (int)tex.pixelFormat, err]); return NO; }
+    if (!gMAtlas || gMDev != dev) {
+        gMAtlas = buildAtlas(dev);
+        for (int i = 0; i < kRing; i++) gMBufs[i] = [dev newBufferWithLength:(NSUInteger)kMaxVerts * sizeof(EVert) options:MTLResourceStorageModeShared];
+    }
+    if (!gMAtlas || !gMBufs[0]) { gMFailures++; metalNote(@"atlas/buffer failed"); return NO; }
+    gMDev = dev; gMPSO = pso; gMFmt = tex.pixelFormat; gMReady = YES;
+    metalNote([NSString stringWithFormat:@"pipeline ready fmt %d tex %lux%lu", (int)gMFmt, (unsigned long)tex.width, (unsigned long)tex.height]);
+    return YES;
+}
+
+typedef struct { EVert *v; int n; CGSize sz; } VCtx;
+
+static inline void vtx(VCtx *c, double x, double y, float u, float vv, const float *col) {
+    if (c->n >= kMaxVerts) return;
+    EVert *e = &c->v[c->n++];
+    e->p[0] = (float)(x / c->sz.width * 2.0 - 1.0);
+    e->p[1] = (float)(1.0 - y / c->sz.height * 2.0);
+    e->uv[0] = u; e->uv[1] = vv;
+    memcpy(e->c, col, sizeof e->c);
+}
+
+static void vquad(VCtx *c, double x0, double y0, double x1, double y1, double x2, double y2, double x3, double y3,
+                  float u0, float v0, float u1, float v1, const float *col) {
+    vtx(c, x0, y0, u0, v0, col); vtx(c, x1, y1, u1, v0, col); vtx(c, x2, y2, u1, v1, col);
+    vtx(c, x0, y0, u0, v0, col); vtx(c, x2, y2, u1, v1, col); vtx(c, x3, y3, u0, v1, col);
+}
+
+static void vline(VCtx *c, double ax, double ay, double bx, double by, double w, const float *col) {
+    double dx = bx - ax, dy = by - ay, len = sqrt(dx * dx + dy * dy);
+    if (len < 0.01) return;
+    double px = -dy / len * w * 0.5, py = dx / len * w * 0.5;
+    float uS = (float)(kAtlasW - 4) / kAtlasW, vS = (float)(kAtlasH - 4) / kAtlasH;
+    vquad(c, ax + px, ay + py, bx + px, by + py, bx - px, by - py, ax - px, ay - py, uS, vS, uS, vS, col);
+}
+
+static void vrect(VCtx *c, double x, double y, double w, double h, const float *col) {
+    float uS = (float)(kAtlasW - 4) / kAtlasW, vS = (float)(kAtlasH - 4) / kAtlasH;
+    vquad(c, x, y, x + w, y, x + w, y + h, x, y + h, uS, vS, uS, vS, col);
+}
+
+typedef struct { VCtx *c; CGPoint cur, start; double w; float col[4]; } PathCtx;
+
+static void pathApplier(void *info, const CGPathElement *e) {
+    PathCtx *p = (PathCtx *)info;
+    switch (e->type) {
+        case kCGPathElementMoveToPoint: p->cur = p->start = e->points[0]; break;
+        case kCGPathElementAddLineToPoint:
+            vline(p->c, p->cur.x, p->cur.y, e->points[0].x, e->points[0].y, p->w, p->col);
+            p->cur = e->points[0];
+            break;
+        case kCGPathElementCloseSubpath:
+            vline(p->c, p->cur.x, p->cur.y, p->start.x, p->start.y, p->w, p->col);
+            p->cur = p->start;
+            break;
+        default: break;
+    }
+}
+
+static void vpath(VCtx *c, UIBezierPath *bp, double w, float r, float g, float b, float a) {
+    PathCtx p; p.c = c; p.cur = p.start = CGPointZero; p.w = w;
+    p.col[0] = r; p.col[1] = g; p.col[2] = b; p.col[3] = a;
+    CGPathApply(bp.CGPath, &p, pathApplier);
+}
+
+static void vtext(VCtx *c, NSString *s, double cx, double bottom, UIColor *color) {
+    const char *u = s.UTF8String;
+    if (!u) return;
+    int n = (int)strlen(u);
+    if (n > 48) n = 48;
+    if (!n) return;
+    const double cw = 7.0, ch = 13.0;
+    double total = n * cw, x0 = cx - total * 0.5, top = bottom - ch - 2.0;
+    float bg[4] = { 0, 0, 0, 0.5f };
+    vrect(c, x0 - 4.0, top - 1.0, total + 8.0, ch + 3.0, bg);
+    CGFloat r = 1, g = 1, b = 1, a = 1;
+    if (color) [color getRed:&r green:&g blue:&b alpha:&a];
+    float col[4] = { (float)r, (float)g, (float)b, (float)a };
+    for (int i = 0; i < n; i++) {
+        int chv = (unsigned char)u[i];
+        if (chv < 32 || chv > 126) chv = '?';
+        int idx = chv - 32, cc = idx % kGlyphCols, rr = idx / kGlyphCols;
+        float u0 = (float)(cc * kGlyphW) / kAtlasW, v0 = (float)(rr * kGlyphH) / kAtlasH;
+        float u1 = u0 + (float)kGlyphW / kAtlasW, v1 = v0 + (float)kGlyphH / kAtlasH;
+        double x = x0 + i * cw;
+        vquad(c, x, top, x + cw, top, x + cw, top + ch, x, top + ch, u0, v0, u1, v1, col);
+    }
+}
+
+static int buildVerts(EchoFrame *f, CGSize sz, EVert *out) {
+    VCtx c; c.v = out; c.n = 0; c.sz = sz;
+    if (gOptBoxes) {
+        vpath(&c, f.tb, 1.5, 0.2f, 1.0f, 0.4f, 1.0f);
+        vpath(&c, f.eb, 1.5, 1.0f, 0.2f, 0.2f, 1.0f);
+    }
+    if (gOptSkeleton) {
+        vpath(&c, f.tbn, 1.2, 0.4f, 1.0f, 1.0f, 1.0f);
+        vpath(&c, f.ebn, 1.2, 1.0f, 0.9f, 0.2f, 1.0f);
+    }
+    if (gOptAimbot && gOptShowFov) {
+        double r = gOptFov * sz.height, cx = sz.width * 0.5, cy = sz.height * 0.5;
+        float col[4] = { 1, 1, 1, 0.5f };
+        for (int i = 0; i < 64; i++) {
+            double a0 = i * 2.0 * M_PI / 64.0, a1 = (i + 1) * 2.0 * M_PI / 64.0;
+            vline(&c, cx + cos(a0) * r, cy + sin(a0) * r, cx + cos(a1) * r, cy + sin(a1) * r, 1.0, col);
+        }
+    }
+    for (EchoTag *t in f.tags) vtext(&c, t.text, t.c.x, t.c.y, t.color);
+    return c.n;
+}
+
+static const double kLagFrames[7] = { 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 };
+
+static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
+    id<MTLTexture> tex = dr.texture;
+    if (!tex || !(tex.usage & MTLTextureUsageRenderTarget) || tex.sampleCount != 1) return;
+    if (!ensureMetal(tex)) return;
+    CGSize sz = gScreenSz;
+    if (sz.width < 10 || sz.height < 10) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    int li = gOptDelay < 0 ? 0 : (gOptDelay > 6 ? 6 : gOptDelay);
+    double T = now - kLagFrames[li] * gFrameDt;
+    EchoFrame *f = frameForTime(T, now, sz);
+    gMBufIdx = (gMBufIdx + 1) % kRing;
+    id<MTLBuffer> buf = gMBufs[gMBufIdx];
+    int n = buildVerts(f, sz, (EVert *)buf.contents);
+    gDiagDrawn = (int)f.tags.count;
+    gMetalLastDraw = now;
+    if (n <= 0) return;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = tex;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!enc) return;
+    [enc setRenderPipelineState:gMPSO];
+    [enc setVertexBuffer:buf offset:0 atIndex:0];
+    [enc setFragmentTexture:gMAtlas atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)n];
+    [enc endEncoding];
+    gMDraws++;
+    if (gMDraws == 1 || gMDraws % 600 == 0)
+        metalNote([NSString stringWithFormat:@"draw #%d verts %d tags %d lag %.1f frames dt %.1fms sawPresentSel %d", gMDraws, n, (int)f.tags.count, kLagFrames[li], gFrameDt * 1000.0, (int)gSawPresentSel]);
+}
+
+static void metalMark(id cb, id drawable) {
+    objc_setAssociatedObject(cb, &kMarkKey, drawable ?: (id)[NSNull null], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void metalOnCommit(id cb) {
+    id mk = objc_getAssociatedObject(cb, &kMarkKey);
+    if (!mk) return;
+    objc_setAssociatedObject(cb, &kMarkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    id dr = [mk conformsToProtocol:@protocol(CAMetalDrawable)] ? mk : gCurDrawable;
+    if (!dr) return;
+    if (gMFailures >= 3) return;
+    @try {
+        metalDraw((id<MTLCommandBuffer>)cb, (id<CAMetalDrawable>)dr);
+    } @catch (NSException *ex) {
+        gMFailures++;
+        metalNote([NSString stringWithFormat:@"exception: %@", ex]);
+    }
+}
+
+static void hookMetalClass(Class c) {
+    static NSMutableSet *done = nil;
+    if (!done) done = [NSMutableSet set];
+    NSString *cn = NSStringFromClass(c);
+    if ([done containsObject:cn]) return;
+    [done addObject:cn];
+
+    Method mc = class_getInstanceMethod(c, @selector(commit));
+    if (mc) {
+        IMP o = method_getImplementation(mc);
+        IMP n = imp_implementationWithBlock(^(id s) {
+            metalOnCommit(s);
+            ((void (*)(id, SEL))o)(s, @selector(commit));
+        });
+        class_replaceMethod(c, @selector(commit), n, method_getTypeEncoding(mc));
+    }
+    Method m1 = class_getInstanceMethod(c, @selector(presentDrawable:));
+    if (m1) {
+        IMP o = method_getImplementation(m1);
+        IMP n = imp_implementationWithBlock(^(id s, id d) {
+            gSawPresentSel = YES; metalMark(s, d);
+            ((void (*)(id, SEL, id))o)(s, @selector(presentDrawable:), d);
+        });
+        class_replaceMethod(c, @selector(presentDrawable:), n, method_getTypeEncoding(m1));
+    }
+    Method m2 = class_getInstanceMethod(c, @selector(presentDrawable:atTime:));
+    if (m2) {
+        IMP o = method_getImplementation(m2);
+        IMP n = imp_implementationWithBlock(^(id s, id d, CFTimeInterval t) {
+            gSawPresentSel = YES; metalMark(s, d);
+            ((void (*)(id, SEL, id, CFTimeInterval))o)(s, @selector(presentDrawable:atTime:), d, t);
+        });
+        class_replaceMethod(c, @selector(presentDrawable:atTime:), n, method_getTypeEncoding(m2));
+    }
+    Method m3 = class_getInstanceMethod(c, @selector(presentDrawable:afterMinimumDuration:));
+    if (m3) {
+        IMP o = method_getImplementation(m3);
+        IMP n = imp_implementationWithBlock(^(id s, id d, CFTimeInterval t) {
+            gSawPresentSel = YES; metalMark(s, d);
+            ((void (*)(id, SEL, id, CFTimeInterval))o)(s, @selector(presentDrawable:afterMinimumDuration:), d, t);
+        });
+        class_replaceMethod(c, @selector(presentDrawable:afterMinimumDuration:), n, method_getTypeEncoding(m3));
+    }
+    Method m4 = class_getInstanceMethod(c, @selector(addScheduledHandler:));
+    if (m4) {
+        IMP o = method_getImplementation(m4);
+        IMP n = imp_implementationWithBlock(^(id s, id blk) {
+            if (!gSawPresentSel && gCurDrawable) metalMark(s, nil);
+            ((void (*)(id, SEL, id))o)(s, @selector(addScheduledHandler:), blk);
+        });
+        class_replaceMethod(c, @selector(addScheduledHandler:), n, method_getTypeEncoding(m4));
+    }
+}
+
+static void installMetalHooks(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if (!dev) return;
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb1 = [q commandBuffer];
+    id<MTLCommandBuffer> cb2 = [q commandBufferWithUnretainedReferences];
+    Class c1 = object_getClass(cb1), c2 = object_getClass(cb2);
+    hookMetalClass(c1);
+    if (c2 != c1 && class_getSuperclass(c2) != c1) hookMetalClass(c2);
+    metalNote([NSString stringWithFormat:@"hooked command buffer classes: %@ %@", NSStringFromClass(c1), NSStringFromClass(c2)]);
 }
 
 static void applyFrame(EchoFrame *f, CGSize sz) {
@@ -2269,6 +2631,7 @@ static void installLabelLayer(void) {
         }
         [gLabelLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
+        installMetalHooks();
         gSnapLock = [[NSObject alloc] init];
         gSnaps = [NSMutableArray array];
         gScreenSz = [UIScreen mainScreen].bounds.size;
@@ -2324,7 +2687,7 @@ static void saveOptions(void) {
     [d setFloat:gOptDmgMul forKey:@"echo.dmgmul"];
     [d setFloat:gOptSmooth forKey:@"echo.smooth"];
     [d setFloat:gOptFov forKey:@"echo.fov"];
-    [d setInteger:gOptDelay forKey:@"echo.sync3"];
+    [d setInteger:gOptDelay forKey:@"echo.lag1"];
 }
 
 static void loadOptions(void) {
@@ -2349,7 +2712,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.dmgmul"]) gOptDmgMul = [d floatForKey:@"echo.dmgmul"];
     gOptSmooth = [d floatForKey:@"echo.smooth"];
     gOptFov = [d floatForKey:@"echo.fov"];
-    if ([d objectForKey:@"echo.sync3"]) gOptDelay = (int)[d integerForKey:@"echo.sync3"];
+    if ([d objectForKey:@"echo.lag1"]) gOptDelay = (int)[d integerForKey:@"echo.lag1"];
 }
 
 @interface EchoMenuHandler : NSObject
@@ -2510,7 +2873,7 @@ static void installMenu(void) {
         addSegment(panel, &y, @"Aim at", @[ @"Head", @"Body" ], gOptAimBody ? 1 : 0, 30);
         gMenuHandler.smoothLabel = addSlider(panel, &y, @"Smoothness", gOptSmooth, 20);
         gMenuHandler.fovLabel = addSlider(panel, &y, @"Aim FOV", gOptFov, 21);
-        addSegment(panel, &y, @"ESP lead (ms)", @[ @"-33", @"-16", @"0", @"+16", @"+33", @"+50" ], gOptDelay, 31);
+        addSegment(panel, &y, @"ESP lag (frames)", @[ @"0", @"0.5", @"1", @"1.5", @"2", @"2.5", @"3" ], gOptDelay, 31);
 
         panel.contentSize = CGSizeMake(pw, y + 8);
         CGFloat ph = MIN(y + 8, ss.height - 40);
