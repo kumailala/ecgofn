@@ -467,6 +467,7 @@ static int gNameStride = 2, gNameTextOff = 2, gNameIdxAdd = 0;
 static uintptr_t gNameBlobs = 0;
 static intptr_t gNameBlobDelta = 0;
 static uintptr_t gNameBlobAbs = 0;
+static uintptr_t gNameBlobTab = 0;
 static int32_t rd_i32(uintptr_t a);
 static int32_t fnidx(uintptr_t a) { return rd_i32(a + (uintptr_t)gNameIdxAdd); }
 
@@ -488,10 +489,14 @@ static BOOL fname_read(int32_t idx, char *out, int cap) {
         }
         if (h & (gNameShift == 5 ? 0x8000 : 1)) return NO;
         if (len >= cap) len = cap - 1;
-        if (gNameBlobs || gNameBlobDelta || gNameBlobAbs) {
+        if (gNameBlobTab || gNameBlobs || gNameBlobDelta || gNameBlobAbs) {
             uint16_t hi16 = 0, lo16 = 0;
             if (!safe_read(e + 2, &hi16, 2) || !safe_read(e + 4, &lo16, 2)) return NO;
-            uintptr_t blob = gNameBlobAbs ? gNameBlobAbs
+            uintptr_t blob;
+            if (gNameBlobTab) {
+                uintptr_t st = rd_ptr(gNameBlobTab + 8 * (uintptr_t)hi16);
+                blob = st ? (rd_ptr(st) & 0xff00ffffffffffffULL) : 0;
+            } else blob = gNameBlobAbs ? gNameBlobAbs
                                 : (gNameBlobDelta ? (uintptr_t)((intptr_t)blk + gNameBlobDelta)
                                                   : rd_ptr(gNameBlobs + 8 * (uintptr_t)((uint32_t)idx >> 16)));
             if (!blob) return NO;
@@ -767,6 +772,10 @@ static BOOL poolStatic(uintptr_t cc, int classOff) {
         if (!findBlobSlot(pool, pool + 0x27000)) findBlobSlot(SYM(0x112d7f9c0ULL), SYM(0x113214000ULL));
         RLOG(@"namepool: text blob table slot %p (image+0x%lx), blob0 %p, entries blk0 %p", (void *)gNameBlobs, gNameBlobs ? (unsigned long)(gNameBlobs - gSlide) : 0UL, (void *)(gNameBlobs ? rd_ptr(gNameBlobs) : 0), (void *)rd_ptr(gNameBlocks));
     }
+    gNameBlobTab = SYM(0x10ebfb318ULL);
+    if (classNameOK(cc, classOff)) { RLOG(@"namepool: text blob table at %p ok", (void *)gNameBlobTab); return YES; }
+    RLOG(@"namepool: blob table %p slot0 %p did not resolve Class", (void *)gNameBlobTab, (void *)rd_ptr(gNameBlobTab));
+    gNameBlobTab = 0;
     if (classNameOK(cc, classOff)) return YES;
     if (!gNameBlobs && !gBlobScanned) findBlobByRegions(rd_ptr(gNameBlocks));
     for (int ci = 0; ci < gBlobCandN; ci++) {
@@ -1035,13 +1044,20 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
     uintptr_t f = findProp(cls, prop, NULL);
     if (!f) return NO;
     int32_t o = rd_i32(f + (uintptr_t)OFF_POFF);
+    if (o < 0 || o > 0x100000) return NO;
     uint8_t m = rd_u8(f + (uintptr_t)(0x7A + gPropShift)), fm = rd_u8(f + (uintptr_t)(0x7B + gPropShift)), bo = rd_u8(f + (uintptr_t)(0x79 + gPropShift));
     if (m == 0 || (m & (m - 1))) m = fm;
-    if (m == 0 || (m & (m - 1))) return NO;
-    if (o < 0 || o > 0x100000) return NO;
-    *off = o + bo;
-    *mask = m;
-    return YES;
+    if (rd_u8(f + (uintptr_t)(0x78 + gPropShift)) == 1 && m != 0 && !(m & (m - 1))) {
+        *off = o + bo; *mask = m; return YES;
+    }
+    for (int pos = 0x60; pos <= 0xA0; pos++) {
+        uint8_t b4[4];
+        if (!safe_read(f + (uintptr_t)pos, b4, 4)) continue;
+        if (b4[0] == 1 && b4[1] < 8 && b4[2] && !(b4[2] & (b4[2] - 1)) && (b4[3] == b4[2] || b4[3] == 0xFF)) {
+            *off = o + b4[1]; *mask = b4[2]; return YES;
+        }
+    }
+    return NO;
 }
 
 static BOOL probeReflection(void) {
@@ -1049,7 +1065,7 @@ static BOOL probeReflection(void) {
     uintptr_t actor = gCls[C_ACTOR];
     if (!fpp || !actor) { RLOG(@"reflect: missing Actor/FortPlayerPawn class"); return NO; }
 
-    static const int sup[] = { 0x40, 0x38, 0x48, 0x30, 0x50, 0x58, 0x60 };
+    static const int sup[] = { 0x40, 0x38, 0x48, 0x30, 0x50, 0x58, 0x60, 0x28, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90 };
     for (size_t k = 0; k < sizeof sup / sizeof sup[0] && OFF_SUPER < 0; k++) {
         uintptr_t c = fpp;
         for (int d = 0; d < 24 && looks_like_uobject(c); d++) {
@@ -1060,9 +1076,9 @@ static BOOL probeReflection(void) {
     RLOG(@"reflect: SuperStruct +0x%x", OFF_SUPER);
     if (OFF_SUPER < 0) return NO;
 
-    static const int co[] = { 0x50, 0x48, 0x58, 0x60, 0x68, 0x70, 0x40 };
-    static const int nx[] = { 0x20, 0x18, 0x28, 0x30 };
-    static const int nm[] = { 0x28, 0x20, 0x30, 0x18 };
+    static const int co[] = { 0x50, 0x48, 0x58, 0x60, 0x68, 0x70, 0x40, 0x78, 0x80, 0x88, 0x90, 0x38, 0x30, 0x28 };
+    static const int nx[] = { 0x20, 0x18, 0x28, 0x30, 0x38, 0x40, 0x10, 0x08 };
+    static const int nm[] = { 0x28, 0x20, 0x30, 0x18, 0x38, 0x40, 0x10, 0x08 };
     int bestScore = 0;
     for (size_t a = 0; a < sizeof co / sizeof co[0]; a++)
     for (size_t b = 0; b < sizeof nx / sizeof nx[0]; b++)
@@ -1083,24 +1099,40 @@ static BOOL probeReflection(void) {
         if (score > bestScore) { bestScore = score; OFF_CHILD = co[a]; OFF_FNEXT = nx[b]; OFF_FNAME = nm[c]; }
     }
     RLOG(@"reflect: ChildProperties +0x%x Next +0x%x Name +0x%x score %d", OFF_CHILD, OFF_FNEXT, OFF_FNAME, bestScore);
-    if (bestScore < 1000) return NO;
+    if (bestScore < 1000) {
+        for (int off = 0x28; off <= 0x90; off += 8) RLOG(@"reflect: Actor +0x%x = %p", off, (void *)rd_ptr(actor + (uintptr_t)off));
+        uintptr_t f0 = rd_ptr(actor + 0x50);
+        if (f0 >= 0x100000000ULL) for (int off = 0; off <= 0x50; off += 8) RLOG(@"reflect: Actor.child0 +0x%x = %p", off, (void *)rd_ptr(f0 + (uintptr_t)off));
+        return NO;
+    }
 
-    static const int io[] = { 0x4C, 0x44, 0x48, 0x50, 0x54, 0x40 };
     int bestIo = 0x4C, bestOk = -1;
-    int32_t psz = rd_i32(actor + (uintptr_t)OFF_CHILD + 8);
-    for (size_t k = 0; k < sizeof io / sizeof io[0]; k++) {
+    int32_t psz = 0;
+    for (int po = 0x40; po <= 0x90; po += 4) {
+        int32_t v = rd_i32(actor + (uintptr_t)po);
+        if (v >= 0x200 && v <= 0x4000 && !(v & 7)) { psz = v; break; }
+    }
+    for (int io = 0x38; io <= 0x70; io += 4) {
         uintptr_t f = rd_ptr(actor + (uintptr_t)OFF_CHILD);
-        int ok = 0;
+        int okUp = 0, okDown = 0, total = 0, changes = 0;
+        int32_t prevUp = -1, prevDown = 0x7fffffff, last = -1;
         for (int n = 0; f && n < 300; n++) {
-            int32_t o = rd_i32(f + (uintptr_t)io[k]), sz = rd_i32(f + (uintptr_t)io[k] - 0x10);
-            if (o >= 0 && sz > 0 && sz < 0x10000 && (psz <= 0 || o + sz <= psz + 8)) ok++;
+            int32_t o = rd_i32(f + (uintptr_t)io);
+            total++;
+            BOOL inr = o >= 0 && o < 0x100000 && (psz <= 0 || o < psz);
+            if (inr && o >= prevUp) { okUp++; prevUp = o; }
+            if (inr && o <= prevDown) { okDown++; prevDown = o; }
+            if (o != last) changes++;
+            last = o;
             f = rd_ptr(f + (uintptr_t)OFF_FNEXT);
         }
-        if (ok > bestOk) { bestOk = ok; bestIo = io[k]; }
+        int ok = okUp > okDown ? okUp : okDown;
+        int score = (total && changes >= 8) ? (ok * 100 / total) * 1000 + (io == 0x4C ? 500 : 0) + changes : 0;
+        if (score > bestOk) { bestOk = score; bestIo = io; }
     }
     OFF_POFF = bestIo;
     gPropShift = OFF_POFF - 0x4C;
-    RLOG(@"reflect: Offset_Internal +0x%x (ok=%d, Actor PropertiesSize=0x%x)", OFF_POFF, bestOk, psz);
+    RLOG(@"reflect: Offset_Internal +0x%x (score=%d, Actor PropertiesSize=0x%x)", OFF_POFF, bestOk, psz);
     return YES;
 }
 
