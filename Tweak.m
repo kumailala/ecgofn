@@ -2303,24 +2303,38 @@ static void gpuDiscover(int stage, int index, const void *data, size_t len) {
     if (nf < 12) return;
     const float *f = (const float *)data;
     int head = gCamSeq_load();
-    for (int back = 0; back < 4; back++) {
+    const int NB = 4;
+    CamRec *recs[NB];
+    int ok = 0;
+    for (int back = 0; back < NB; back++) {
         int sq = head - back;
-        if (sq <= 0) break;
+        recs[back] = NULL;
+        if (sq <= 0) continue;
         CamRec *r = &gCamRing[sq & 31];
-        if (r->seq != sq) continue;
+        if (r->seq == sq) { recs[back] = r; ok++; }
+    }
+    if (ok < NB) return;
+    for (size_t p = 0; p + 2 < nf; p++) {
+        float a = f[p];
+        if (!(a > -1.0001f && a < 1.0001f)) continue;
+        float b = f[p + 1], c = f[p + 2];
+        BOOL haveS = (p + 8 < nf);
+        float b2 = haveS ? f[p + 4] : 0.0f, c2 = haveS ? f[p + 8] : 0.0f;
         for (int kind = 0; kind < 3; kind++) {
-            const float *v = &r->v[kind * 3];
-            for (size_t p = 0; p + 2 < nf; p++) {
-                float a = f[p];
-                if (!(a > -1.0001f && a < 1.0001f)) continue;
-                float b = f[p + 1], c = f[p + 2];
-                if (near3(a, b, c, v, 1.0f)) gpuVote(stage, index, (int)p, 0, kind, 0, back);
-                else if (near3(a, b, c, v, -1.0f)) gpuVote(stage, index, (int)p, 0, kind, 1, back);
-                if (p + 8 < nf) {
-                    float b2 = f[p + 4], c2 = f[p + 8];
-                    if (near3(a, b2, c2, v, 1.0f)) gpuVote(stage, index, (int)p, 1, kind, 0, back);
-                    else if (near3(a, b2, c2, v, -1.0f)) gpuVote(stage, index, (int)p, 1, kind, 1, back);
+            int hitsC[2] = { 0, 0 }, hitsS[2] = { 0, 0 };
+            int lastC[2] = { -1, -1 }, lastS[2] = { -1, -1 };
+            for (int back = 0; back < NB; back++) {
+                const float *v = &recs[back]->v[kind * 3];
+                if (near3(a, b, c, v, 1.0f)) { hitsC[0]++; lastC[0] = back; }
+                else if (near3(a, b, c, v, -1.0f)) { hitsC[1]++; lastC[1] = back; }
+                if (haveS) {
+                    if (near3(a, b2, c2, v, 1.0f)) { hitsS[0]++; lastS[0] = back; }
+                    else if (near3(a, b2, c2, v, -1.0f)) { hitsS[1]++; lastS[1] = back; }
                 }
+            }
+            for (int ng = 0; ng < 2; ng++) {
+                if (hitsC[ng] == 1) gpuVote(stage, index, (int)p, 0, kind, ng, lastC[ng]);
+                if (hitsS[ng] == 1) gpuVote(stage, index, (int)p, 1, kind, ng, lastS[ng]);
             }
         }
     }
@@ -2655,6 +2669,15 @@ static void metalDraw(id<MTLCommandBuffer> cb, id<CAMetalDrawable> dr) {
     float li = gOptLagF < 0.0f ? 0.0f : (gOptLagF > 3.0f ? 3.0f : gOptLagF);
     if (gGpuMode == 0 && gMDraws > 150 && camMoving()) { gGpuStart = now; gGpuMode = 1; metalNote(@"gpu view discovery started"); }
     if (gGpuMode == 1 && now - gGpuStart > 7.0) gpuFinalize();
+    if (gGpuMode == 2) {
+        static int sinceLock = 0, exactSince = 0;
+        sinceLock++;
+        if (gGpuSeq > 0 && now - gGpuStamp < 0.05) exactSince++;
+        if (sinceLock == 900) {
+            metalNote([NSString stringWithFormat:@"lock check: %d/%d draws had an exact match", exactSince, sinceLock]);
+            if (exactSince * 2 < sinceLock) { gGpuMode = 3; metalNote(@"lock rejected, using lag slider"); }
+        }
+    }
     EchoFrame *f = nil;
     BOOL exact = NO;
     if (gGpuMode == 2) {
