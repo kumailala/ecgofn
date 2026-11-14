@@ -923,6 +923,61 @@ static uint8_t M_DYING = 1, M_DBNO = 1, M_ADS = 1;
 
 static uintptr_t gEngineObj = 0;
 
+static void dumpSdk(uintptr_t classClass) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!dir) return;
+    NSString *path = [dir stringByAppendingPathComponent:@"EchoMod43_sdk.txt"];
+    FILE *f = fopen(path.UTF8String, "w");
+    if (!f) return;
+    uintptr_t scriptStruct = 0;
+    for (int32_t i = 0; i < gSnapN && !scriptStruct; i++) {
+        if (gSnapObj[i] && gSnapCls[i] == classClass && name_is(rd_i32(gSnapObj[i] + (uintptr_t)gOffName), "ScriptStruct")) scriptStruct = gSnapObj[i];
+    }
+    fprintf(f, "# Fortnite 43.10 SDK dump by EchoMod43
+# image slide %lx, GUObjectArray image+0x%llx
+# offsets: ClassPrivate obj+0x%x Name obj+0x%x Outer obj+0x%x; SuperStruct +0x%x ChildProperties +0x%x FField Next +0x%x Name +0x%x; Offset_Internal +0x%x
+
+",
+            (long)gSlide, (unsigned long long)A_GUOBJECTARRAY, gOffClass, gOffName, gOffOuter, OFF_SUPER, OFF_CHILD, OFF_FNEXT, OFF_FNAME, OFF_POFF);
+    int structs = 0, props = 0;
+    for (int32_t i = 0; i < gSnapN; i++) {
+        uintptr_t o = gSnapObj[i];
+        if (!o) continue;
+        BOOL isClass = gSnapCls[i] == classClass;
+        BOOL isStruct = scriptStruct && gSnapCls[i] == scriptStruct;
+        if (!isClass && !isStruct) continue;
+        char nm[160], sup[160], pk[160];
+        if (!fname_read(rd_i32(o + (uintptr_t)gOffName), nm, sizeof nm)) continue;
+        sup[0] = 0; pk[0] = 0;
+        uintptr_t su = rd_ptr(o + (uintptr_t)OFF_SUPER);
+        if (looks_like_uobject(su)) fname_read(rd_i32(su + (uintptr_t)gOffName), sup, sizeof sup);
+        uintptr_t ou = rd_ptr(o + (uintptr_t)gOffOuter);
+        if (looks_like_uobject(ou)) fname_read(rd_i32(ou + (uintptr_t)gOffName), pk, sizeof pk);
+        fprintf(f, "%s %s%s%s : %s // size 0x%x obj %lx
+", isClass ? "class" : "struct", pk, pk[0] ? "." : "", nm, sup[0] ? sup : "-",
+                rd_i32(o + (uintptr_t)OFF_CHILD + 8), (unsigned long)(o - gSlide));
+        structs++;
+        uintptr_t p = rd_ptr(o + (uintptr_t)OFF_CHILD);
+        for (int n = 0; p && n < 3000; n++) {
+            char pn[160], tn[96];
+            if (!fname_read(rd_i32(p + (uintptr_t)OFF_FNAME), pn, sizeof pn)) break;
+            tn[0] = 0;
+            uintptr_t fc = rd_ptr(p + 0x8);
+            if (fc >= 0x100000000ULL) fname_read(rd_i32(fc), tn, sizeof tn);
+            fprintf(f, "  +0x%04x %-28s %s[%d] size %d
+", rd_i32(p + (uintptr_t)OFF_POFF), pn, tn[0] ? tn : "?", rd_i32(p + 0x38), rd_i32(p + 0x3C));
+            props++;
+            p = rd_ptr(p + (uintptr_t)OFF_FNEXT);
+        }
+        fprintf(f, "
+");
+    }
+    fprintf(f, "# %d structs/classes, %d properties
+", structs, props);
+    fclose(f);
+    RLOG(@"sdk dump: %d structs, %d properties -> EchoMod43_sdk.txt", structs, props);
+}
+
 static BOOL resolveAll(void) {
     if (!gSlide || !gImgBase) return NO;
     gResolveLine = @"resolve: objarray…";
@@ -1000,6 +1055,9 @@ static BOOL resolveAll(void) {
     if (!b3) O_ADS = -1;
     RLOG(@"  bools: dying=%d/0x%x dbno=%d/0x%x ads=%d/0x%x", O_DYING, M_DYING, O_DBNO, M_DBNO, O_ADS, M_ADS);
     #undef P
+
+    static BOOL dumped = NO;
+    if (!dumped) { dumped = YES; dumpSdk(classClass); }
 
     gEngineObj = 0;
     for (int32_t i = 0; i < gSnapN; i++) {
