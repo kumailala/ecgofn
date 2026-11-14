@@ -521,7 +521,15 @@ static BOOL scanForNamePool(uintptr_t lo, uintptr_t hi) {
     BOOL found = NO;
     for (uintptr_t a = lo; a < hi && !found; a += slab) {
         size_t n = hi - a < slab ? hi - a : slab;
-        if (!safe_read(a, buf, n)) continue;
+        if (!safe_read(a, buf, n)) {
+            size_t good = 0;
+            for (size_t off = 0; off < n; off += 16384) {
+                size_t m = n - off < 16384 ? n - off : 16384;
+                if (!safe_read(a + off, (uint8_t *)buf + off, m)) memset((uint8_t *)buf + off, 0, m);
+                else good += m;
+            }
+            if (!good) continue;
+        }
         for (size_t i = 0; i + 1 <= n / 8; i++) {
             uint64_t v = buf[i];
             if (v < 0x100000000ULL || v > 0x0000FFFFFFFFFFFFULL || (v & 7)) continue;
