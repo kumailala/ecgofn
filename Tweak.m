@@ -3400,7 +3400,14 @@ static void engineEspFrame(void *cv) {
         if (targeting && downedRaw && downed) gDbgDownedSkip++;
         if (targeting && !downed) {
             gDbgCand++;
-            DV3 tp = haveB ? rb.w[aimSlot] : (DV3){ root.x, root.y, root.z + (gOptAimBody ? 25.0 : 70.0) };
+            DV3 tp;
+            if (haveB) {
+                DV3 a0 = rb.w[aimSlot], a1 = gOptAimBody ? rb.w[2] : rb.w[1];
+                double lerpK = gOptAimBody ? 0.30 : 0.35;
+                tp = (DV3){ a0.x + (a1.x - a0.x) * lerpK, a0.y + (a1.y - a0.y) * lerpK, a0.z + (a1.z - a0.z) * lerpK };
+            } else {
+                tp = (DV3){ root.x, root.y, root.z + (gOptAimBody ? 25.0 : 62.0) };
+            }
             CGFloat nx, ny; float dp;
             BOOL pOk = project(&view, tp, &nx, &ny, &dp);
             double scx = pOk ? nx * sx : -1.0, scy = pOk ? ny * sy : -1.0;
@@ -3459,7 +3466,9 @@ static void engineEspFrame(void *cv) {
     static BOOL directMode = NO, lastApplied = NO;
     BOOL appliedNow = NO;
     if (useTarget && targeting && looks_like_uobject(pc)) {
-        BOOL inDead = (tPix <= dzDeg * ppd);
+        static BOOL wasDead = NO;
+        BOOL inDead = (tPix <= dzDeg * ppd * (wasDead ? 1.8 : 1.0));
+        wasDead = inDead;
         if (lastApplied) {
             double obsP = wrap180(rot.x - lastRP), obsY = wrap180(rot.y - lastRY);
             BOOL useYaw = fabs(lastNY) > fabs(lastNP);
@@ -3490,6 +3499,13 @@ static void engineEspFrame(void *cv) {
                     appliedNow = YES; gAimApplied++; gDiagLock = YES;
                 }
             } else {
+                if (lastApplied) {
+                    double obsP2 = wrap180(rot.x - lastRP), obsY2 = wrap180(rot.y - lastRY);
+                    double pendP = lastNP - obsP2, pendY = lastNY - obsY2;
+                    if (pendP * lastNP < 0) pendP = 0; else if (fabs(pendP) > fabs(lastNP)) pendP = lastNP;
+                    if (pendY * lastNY < 0) pendY = 0; else if (fabs(pendY) > fabs(lastNY)) pendY = lastNY;
+                    dP -= pendP; dY -= pendY;
+                }
                 dP /= effSmooth; dY /= effSmooth;
                 lastRP = rot.x; lastRY = rot.y; lastNP = dP; lastNY = dY;
                 float yawScale = 0, pitchScale = 0;
