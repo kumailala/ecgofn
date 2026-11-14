@@ -3240,6 +3240,7 @@ static void engCircle(void *cv, double cx, double cy, double r, int seg, double 
 
 static uintptr_t gAimPawn = 0;
 static int gAimApplied = 0, gAimTargetFrames = 0, gDrawnPlayers = 0, gDbgAds = 0, gDbgAdsFlag = 0;
+static int gDbgTargetingFrames = 0, gDbgCand = 0, gDbgInFov = 0, gDbgDownedSkip = 0, gDbnoSeen = 0, gDbnoSet = 0;
 static double gDbgFov = 0, gDbgBase = 0;
 static double gAimScreenX = 0, gAimScreenY = 0;
 
@@ -3286,6 +3287,7 @@ static void engineEspFrame(void *cv) {
     BOOL ads = adsFlag || adsFov;
     gDbgAds = ads; gDbgAdsFlag = adsFlag; gDbgFov = fov; gDbgBase = fovBase;
     BOOL targeting = gOptAimbot && (ads || !gOptAdsOnly);
+    if (targeting) gDbgTargetingFrames++;
     int aimSlot = gOptAimBody ? 15 : 0;
 
     uintptr_t bestPawn = 0;
@@ -3301,7 +3303,11 @@ static void engineEspFrame(void *cv) {
     for (EchoPawn *ep in pawns) {
         if (pawnFlag(ep.pawn, O_DYING, M_DYING)) continue;
         if (ep.team) continue;
-        BOOL downed = pawnFlag(ep.pawn, O_DBNO, M_DBNO);
+        BOOL downedRaw = pawnFlag(ep.pawn, O_DBNO, M_DBNO);
+        gDbnoSeen++; if (downedRaw) gDbnoSet++;
+        if (gDbnoSeen > 4000) { gDbnoSeen /= 2; gDbnoSet /= 2; }
+        BOOL dbnoInvalid = (gDbnoSeen > 60 && gDbnoSet * 2 > gDbnoSeen);
+        BOOL downed = downedRaw && !dbnoInvalid;
         DV3 root;
         if (!actorLocation(ep.pawn, &root)) continue;
         double ddx = root.x - cam.x, ddy = root.y - cam.y, ddz = root.z - cam.z;
@@ -3379,7 +3385,9 @@ static void engineEspFrame(void *cv) {
             }
         }
 
+        if (targeting && downedRaw && downed) gDbgDownedSkip++;
         if (targeting && !downed) {
+            gDbgCand++;
             DV3 tp = haveB ? rb.w[aimSlot] : (DV3){ root.x, root.y, root.z + (gOptAimBody ? 25.0 : 70.0) };
             CGFloat nx, ny; float dp;
             BOOL pOk = project(&view, tp, &nx, &ny, &dp);
@@ -3396,6 +3404,7 @@ static void engineEspFrame(void *cv) {
             BOOL onS = pOk && scx >= 0 && scx <= sx && scy >= 0 && scy <= sy;
             BOOL inFov = onS ? (pixDist <= fovDeg * ppd) : (degDist <= fovDeg);
             if (inFov) {
+                gDbgInFov++;
                 if (ep.pawn == curPawn) { curStillValid = YES; curMetric = metric; curPix = onS ? pixDist : 1e9; curDeg = degDist; curSX = scx; curSY = scy; curPos = (DV3){ aimYaw, aimPitch, onS ? 1.0 : 0.0 }; }
                 if (metric < bestMetric) {
                     bestMetric = metric; bestPawn = ep.pawn; bestPix = onS ? pixDist : 1e9; bestDeg = degDist; bestSX = scx; bestSY = scy;
@@ -3507,7 +3516,7 @@ static void h_DrawTransition(void *self, void *canvas) {
         }
         gDTFrames++;
         if (gDTFrames == 1 || gDTFrames % 900 == 0)
-            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p players drawn %d aim target frames %d applied %d vp %d ads %d (flag %d) fov %.1f base %.1f | bones ok %d fail nobones %d nomesh %d noloc %d c2w %d skel %d xform %d slot %d sane %d | skelOff %d direct %d", gDTFrames, canvas, gDrawnPlayers, gAimTargetFrames, gAimApplied, gVPOff, gDbgAds, gDbgAdsFlag, gDbgFov, gDbgBase, gRbOk, gRbFail[0], gRbFail[1], gRbFail[2], gRbFail[3], gRbFail[4], gRbFail[5], gRbFail[6], gRbFail[7], gSkelOff, (int)gSkelDirect]);
+            metalNote([NSString stringWithFormat:@"engine draw: frame %d canvas %p players drawn %d aim target frames %d applied %d vp %d ads %d (flag %d) fov %.1f base %.1f | bones ok %d fail nobones %d nomesh %d noloc %d c2w %d skel %d xform %d slot %d sane %d | aim: enabled %d targetingFrames %d candidates %d inFov %d downedSkips %d dbnoSet %d/%d fovDeg %.1f | skelOff %d direct %d", gDTFrames, canvas, gDrawnPlayers, gAimTargetFrames, gAimApplied, gVPOff, gDbgAds, gDbgAdsFlag, gDbgFov, gDbgBase, gRbOk, gRbFail[0], gRbFail[1], gRbFail[2], gRbFail[3], gRbFail[4], gRbFail[5], gRbFail[6], gRbFail[7], (int)gOptAimbot, gDbgTargetingFrames, gDbgCand, gDbgInFov, gDbgDownedSkip, gDbnoSet, gDbnoSeen, gOptFov * 60.0, gSkelOff, (int)gSkelDirect]);
     } else if (++gDTBad > 40 && gDTSlot) {
         *gDTSlot = (void *)gDTOrig;
         gDTSlot = NULL;
