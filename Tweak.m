@@ -3750,13 +3750,15 @@ static void engineEspFrame(void *cv) {
             for (EchoLoot *lo in lootNow) {
                 if (lo.tier == -5 && lo.actor) {
                     nCannons++;
-                    double dx = lo.x - cam.x, dy = lo.y - cam.y, dz = lo.z - cam.z;
+                    DV3 fp = { lo.x, lo.y, lo.z };
+                    if (!actorLocation(lo.actor, &fp)) continue;
+                    double dx = fp.x - cam.x, dy = fp.y - cam.y, dz = fp.z - cam.z;
                     double d = sqrt(dx * dx + dy * dy + dz * dz);
                     if (d < cd) { cd = d; cannon = lo; }
                 }
                 if (lo.tier == -2) nChests++;
             }
-            if (cd > 3000.0) cannon = nil;
+            if (cd > 4500.0) cannon = nil;
             uintptr_t mover = cannon ? cannon.actor : lp;
             DV3 mp = cam;
             if (cannon) mp = (DV3){ cannon.x, cannon.y, cannon.z };
@@ -3776,10 +3778,10 @@ static void engineEspFrame(void *cv) {
                 cfLog = now;
                 metalNote([NSString stringWithFormat:@"farm: on, cannons %d (nearest %.1f m), chests %d, mover %@, target %@", nCannons, cd / 100.0, nChests, cannon ? @"cannon" : @"pawn", chest ? @"yes" : @"no"]);
             }
-            if (chest) {
+            if (chest && (cannon || now < manualUntil)) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) { cfKey = key; cfSince = now; }
-                if (now - cfSince > (cannon ? 4.0 : 7.0)) {
+                if (now - cfSince > (cannon ? 2.5 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
                     metalNote(@"farm: skipping a chest after 7 s");
@@ -3790,7 +3792,7 @@ static void engineEspFrame(void *cv) {
                     double wantZ = cannon ? chest.z + 40.0 + ((ramFlip & 1) ? 45.0 : -5.0) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if ((cannon || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > 0.03) {
-                        static int tpMethod = 0, tpFail = 0, tpN = 0;
+                        static int tpMethod = 1, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
                         static const char *kTpNames[7] = { "TeleportTo", "SetActorLocation(physics)", "SetActorLocation(reset physics)", "SetActorLocation(sweep)", "AddActorWorldOffset", "TeleportTo+SetActorLocation", "LaunchCharacter" };
