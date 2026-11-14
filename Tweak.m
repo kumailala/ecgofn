@@ -1092,8 +1092,10 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
     NSMutableString *hx = [NSMutableString string];
     if (safe_read(f + 0x60, dump, sizeof dump)) for (int i = 0; i < 0x30; i++) [hx appendFormat:@"%02x", dump[i]];
     metalNote([NSString stringWithFormat:@"bool %s: off 0x%x inferred 0x%x/0x%x scan %d/0x%x @0x%x raw+0x60 %@", prop, o, infOff, infMask, scanOff, scanMask, scanPos, hx]);
-    if (scanOff >= 0) { *off = scanOff; *mask = scanMask; return YES; }
+    BOOL preferScan = (strcmp(prop, "bIsDBNO") == 0);
+    if (preferScan && scanOff >= 0) { *off = scanOff; *mask = scanMask; return YES; }
     if (infOff >= 0) { *off = infOff; *mask = infMask; return YES; }
+    if (scanOff >= 0) { *off = scanOff; *mask = scanMask; return YES; }
     return NO;
 }
 
