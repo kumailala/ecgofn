@@ -2259,6 +2259,7 @@ static void drawTick(CADisplayLink *link) {
 
 #pragma mark 6.3 in-frame Metal overlay
 
+static void metalNote(NSString *s);
 #pragma mark 6.4 GPU view matching (find the exact camera the renderer used)
 
 typedef struct { int stage, index, pos, strided, kind, neg, hits; int lagHist[8]; } GVote;
