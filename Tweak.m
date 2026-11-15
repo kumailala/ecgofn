@@ -411,7 +411,7 @@ static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
 static BOOL  gOptFreeze = NO, gOptLead = YES;
-static float gOptChestT = 0.385f;
+static float gOptChestT = 0.385f, gOptTravel = 0.21f;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
 static volatile BOOL gFarmActiveNow = NO;
@@ -4055,17 +4055,18 @@ static void engineEspFrame(void *cv) {
                     double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : (((int)(fmax(0.0, now - cfSince) / 0.16) & 1) ? 25.0 : 0.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     BOOL stepping = NO;
-                    if (cannon) {
+                    {
                         double stepD = sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
-                        if (stepD > 2400.0 && now >= cfHopAt) {
-                            double k = 2000.0 / stepD;
+                        double stepLen = fmax(100.0, (5.0 + gOptTravel * 95.0) * 100.0 * 0.1);
+                        if (stepD > stepLen * 1.5 && now >= cfHopAt) {
+                            double k = stepLen / stepD;
                             wantX = mp.x + ddx * k; wantY = mp.y + ddy * k; wantZ = mp.z + ddz * k;
                             ddx = wantX - mp.x; ddy = wantY - mp.y; ddz = wantZ - mp.z;
                             stepping = YES;
                             cfSince = now;
                         }
                     }
-                    if ((cannon && now >= cfHopAt && now - cfTp >= (stepping ? 0.12 : 0.08)) || (!cannon && sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
+                    if ((cannon && now >= cfHopAt && now - cfTp >= (stepping ? 0.1 : 0.08)) || (!cannon && (stepping || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > (stepping ? 0.1 : 0.03))) {
                         if (cannon && !cfHopped) { cfHopped = YES; cfLastHop = now; }
                         static int tpChain = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
@@ -4385,6 +4386,7 @@ static void saveOptions(void) {
     [d setBool:gOptFreeze forKey:@"echo.freeze2"];
     [d setBool:gOptLead forKey:@"echo.lead"];
     [d setFloat:gOptChestT forKey:@"echo.chesttime"];
+    [d setFloat:gOptTravel forKey:@"echo.travel"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
@@ -4416,6 +4418,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.freeze2"]) gOptFreeze = [d boolForKey:@"echo.freeze2"];
     if ([d objectForKey:@"echo.lead"]) gOptLead = [d boolForKey:@"echo.lead"];
     if ([d objectForKey:@"echo.chesttime"]) gOptChestT = [d floatForKey:@"echo.chesttime"];
+    if ([d objectForKey:@"echo.travel"]) gOptTravel = [d floatForKey:@"echo.travel"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
@@ -4436,6 +4439,7 @@ static void loadOptions(void) {
 @property (nonatomic, strong) UILabel *lagLabel;
 @property (nonatomic, strong) UILabel *trigLabel;
 @property (nonatomic, strong) UILabel *chestLabel;
+@property (nonatomic, strong) UILabel *travelLabel;
 @end
 @implementation EchoMenuHandler
 - (void)farmMethod:(UIButton *)b {
@@ -4484,6 +4488,7 @@ static void loadOptions(void) {
     if (s.tag == 23) { gOptLagF = s.value * 3.0f; self.lagLabel.text = [NSString stringWithFormat:@"ESP lag  %.2f game ticks", gOptLagF]; }
     if (s.tag == 33) { gOptTrigDelay = s.value; self.trigLabel.text = [NSString stringWithFormat:@"Trigger delay  %.0f ms", s.value * 300.0f]; }
     if (s.tag == 38) { gOptChestT = s.value; self.chestLabel.text = [NSString stringWithFormat:@"Chest time  %.2f s", 0.2 + s.value * 1.3]; }
+    if (s.tag == 39) { gOptTravel = s.value; self.travelLabel.text = [NSString stringWithFormat:@"Travel speed  %.0f m/s", 5.0 + s.value * 95.0]; }
     if (s.tag == 21) { gOptFov = s.value; self.fovLabel.text = [NSString stringWithFormat:@"Aim FOV  %.0f%%", s.value * 100]; }
     saveOptions();
 }
@@ -4635,6 +4640,8 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Stiff cannon (freeze physics, fewer chest hits)", gOptFreeze, 36);
         gMenuHandler.chestLabel = addSlider(panel, &y, @"Chest time", gOptChestT, 38);
         gMenuHandler.chestLabel.text = [NSString stringWithFormat:@"Chest time  %.2f s", 0.2 + gOptChestT * 1.3];
+        gMenuHandler.travelLabel = addSlider(panel, &y, @"Travel speed", gOptTravel, 39);
+        gMenuHandler.travelLabel.text = [NSString stringWithFormat:@"Travel speed  %.0f m/s", 5.0 + gOptTravel * 95.0];
         addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
         addButtonTag(panel, &y, @"TP + break chest: SetActorLocation + rotation (upright)", @selector(farmMethod:), 107);
         addButtonTag(panel, &y, @"TP + break chest: TeleportTo", @selector(farmMethod:), 100);
