@@ -371,6 +371,7 @@ static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
+static BOOL  gOptFreeze = YES;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
 static volatile BOOL gFarmActiveNow = NO;
@@ -1634,6 +1635,36 @@ static BOOL containerSearched(uintptr_t a, uintptr_t cls) {
     }
     if (sv.intValue < 0) return NO;
     return (rd_u8(a + (uintptr_t)(sv.intValue >> 8)) & (uint8_t)(sv.intValue & 0xff)) != 0;
+}
+
+static void freezeCannon(uintptr_t actor, BOOL freeze) {
+    uintptr_t root = rd_ptr(actor + (uintptr_t)O_ACTOR_ROOT);
+    if (!looks_like_uobject(root)) return;
+    static NSMutableDictionary<NSNumber *, NSNumber *> *primCache = nil;
+    if (!primCache) primCache = [NSMutableDictionary dictionary];
+    uintptr_t cls = rd_ptr(root + (uintptr_t)gOffClass);
+    NSNumber *pc = primCache[@(cls)];
+    if (!pc) {
+        BOOL prim = NO;
+        NSMutableString *chain = [NSMutableString string];
+        uintptr_t c = cls;
+        for (int d = 0; d < 14 && looks_like_uobject(c); d++) {
+            NSString *n = fname_string(fnidx(c + (uintptr_t)gOffName));
+            [chain appendFormat:@" %@", n];
+            if ([n isEqualToString:@"PrimitiveComponent"]) { prim = YES; break; }
+            c = rd_ptr(c + (uintptr_t)OFF_SUPER);
+        }
+        pc = @(prim);
+        primCache[@(cls)] = pc;
+        metalNote([NSString stringWithFormat:@"farm: cannon root component classes:%@ -> primitive=%d", chain, prim]);
+    }
+    if (!pc.boolValue) return;
+    void **vt = (void **)rd_ptr(root);
+    if (!vt) return;
+    uintptr_t fSim = rd_ptr((uintptr_t)&vt[230]), fGrav = rd_ptr((uintptr_t)&vt[304]);
+    if (fSim >= gImgBase && fSim < gImgEnd) ((void (*)(void *, BOOL))fSim)((void *)root, freeze ? NO : YES);
+    if (fGrav >= gImgBase && fGrav < gImgEnd) ((void (*)(void *, BOOL))fGrav)((void *)root, freeze ? NO : YES);
+    metalNote([NSString stringWithFormat:@"farm: cannon physics %@", freeze ? @"frozen" : @"released"]);
 }
 
 static void scanSublevelContainers(uintptr_t world, uintptr_t persistent, NSMutableArray<EchoLoot *> *out) {
@@ -3746,7 +3777,12 @@ static void engineEspFrame(void *cv) {
         static uintptr_t farmHomeActor = 0;
         static DV3 farmHome = {0, 0, 0};
         static double farmYaw = 0.0;
+        static uintptr_t farmFrozen = 0;
         gFarmActiveNow = farmOn;
+        if (!farmOn && farmFrozen) {
+            if (rd_ptr(farmFrozen + (uintptr_t)gOffClass) > 0x100000000ULL) freezeCannon(farmFrozen, NO);
+            farmFrozen = 0;
+        }
         if (!farmOn && farmHomeActor) {
             uintptr_t fSR = SYM(0x100d0b050);
             if (fSR >= gImgBase && fSR < gImgEnd && rd_ptr(farmHomeActor + (uintptr_t)gOffClass) > 0x100000000ULL) {
@@ -3778,9 +3814,19 @@ static void engineEspFrame(void *cv) {
             else if (!actorLocation(lp, &mp)) mp = cam;
             if (cannon) { DV3 fresh; if (actorLocation(cannon.actor, &fresh)) mp = fresh; }
             if (cannon && farmHomeActor != cannon.actor) { farmHomeActor = cannon.actor; farmHome = mp; farmYaw = rot.y; }
+            if (cannon && gOptFreeze && farmFrozen != cannon.actor) {
+                if (farmFrozen && rd_ptr(farmFrozen + (uintptr_t)gOffClass) > 0x100000000ULL) freezeCannon(farmFrozen, NO);
+                farmFrozen = cannon.actor;
+                freezeCannon(cannon.actor, YES);
+            }
+            if (cannon && !gOptFreeze && farmFrozen) {
+                if (rd_ptr(farmFrozen + (uintptr_t)gOffClass) > 0x100000000ULL) freezeCannon(farmFrozen, NO);
+                farmFrozen = 0;
+            }
             double bd = 1e30;
             for (EchoLoot *lo in lootNow) {
                 if (lo.tier != -2) continue;
+                if (lo.actor && (!looks_like_uobject(lo.actor) || containerSearched(lo.actor, rd_ptr(lo.actor + (uintptr_t)gOffClass)))) continue;
                 long long sk = (long long)(lo.x * 0.5) ^ ((long long)(lo.y * 0.5) << 20);
                 if ([cfSkip containsObject:@(sk)]) continue;
                 double dx = lo.x - mp.x, dy = lo.y - mp.y, dz = lo.z - mp.z;
@@ -3794,11 +3840,14 @@ static void engineEspFrame(void *cv) {
             }
             if (chest && (cannon || now < manualUntil)) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
-                if (key != cfKey) { cfKey = key; cfSince = now; }
-                if (now - cfSince > (cannon ? 1.0 : 7.0)) {
+                if (key != cfKey) {
+                    if (cfKey != 0) metalNote([NSString stringWithFormat:@"farm: next chest after %.2f s", now - cfSince]);
+                    cfKey = key; cfSince = now;
+                }
+                if (now - cfSince > (cannon ? 0.6 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
-                    metalNote(cannon ? @"farm: chest not broken after 1 s, next chest" : @"farm: skipping a chest after 7 s");
+                    metalNote(cannon ? @"farm: chest not broken after 0.6 s, next chest" : @"farm: skipping a chest after 7 s");
                 } else {
                     static int ramFlip = 0;
                     static double testKey = 0;
@@ -3818,8 +3867,8 @@ static void engineEspFrame(void *cv) {
                         }
                     }
                     static const double kShift[5][2] = { {0, 0}, {120, 0}, {-120, 0}, {0, 120}, {0, -120} };
-                    int shiftIdx = cannon ? (int)((now - cfSince) / 0.5) % 5 : 0;
-                    int zPhase = cannon ? ((int)((now - cfSince) / 0.5) & 1) : 0;
+                    int shiftIdx = cannon ? (int)((now - cfSince) / 0.3) % 5 : 0;
+                    int zPhase = cannon ? ((int)((now - cfSince) / 0.3) & 1) : 0;
                     double useYaw = cannon ? farmYaw : rot.y;
                     double wantX = cannon ? chest.x + kShift[shiftIdx][0] : chest.x - 700.0;
                     double wantY = cannon ? chest.y + kShift[shiftIdx][1] : chest.y;
@@ -4129,6 +4178,7 @@ static void saveOptions(void) {
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
     [d setBool:gOptChest forKey:@"echo.chest"];
     [d setBool:gOptCannonFarm forKey:@"echo.cfarm"];
+    [d setBool:gOptFreeze forKey:@"echo.freeze"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
@@ -4157,6 +4207,7 @@ static void loadOptions(void) {
     gOptTrigger = [d boolForKey:@"echo.trigger"];
     if ([d objectForKey:@"echo.chest"]) gOptChest = [d boolForKey:@"echo.chest"];
     gOptCannonFarm = [d boolForKey:@"echo.cfarm"];
+    if ([d objectForKey:@"echo.freeze"]) gOptFreeze = [d boolForKey:@"echo.freeze"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
@@ -4211,6 +4262,7 @@ static void loadOptions(void) {
         case 23: gOptLoot = on; break;
         case 34: gOptChest = on; break;
         case 35: gOptCannonFarm = on; break;
+        case 36: gOptFreeze = on; break;
         case 24: gOptWeaponEsp = on; break;
         case 25: gOptEngineDraw = on; break;
     }
@@ -4369,6 +4421,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
+        addSwitch(panel, &y, @"Freeze cannon while farming (no physics)", gOptFreeze, 36);
         addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
         addButtonTag(panel, &y, @"TP + break chest: SetActorLocation + rotation (upright)", @selector(farmMethod:), 107);
         addButtonTag(panel, &y, @"TP + break chest: TeleportTo", @selector(farmMethod:), 100);
