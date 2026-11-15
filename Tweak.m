@@ -4055,17 +4055,38 @@ static void engineEspFrame(void *cv) {
                     double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : (((int)(fmax(0.0, now - cfSince) / 0.16) & 1) ? 25.0 : 0.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     BOOL stepping = NO;
+                    static double detourZ = 0.0;
                     {
                         double stepD = sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
                         double stepLen = fmax(100.0, (5.0 + gOptTravel * 95.0) * 100.0 * 0.1);
                         if (stepD > stepLen * 1.5 && now >= cfHopAt) {
                             double k = stepLen / stepD;
                             wantX = mp.x + ddx * k; wantY = mp.y + ddy * k; wantZ = mp.z + ddz * k;
-                            ddx = wantX - mp.x; ddy = wantY - mp.y; ddz = wantZ - mp.z;
                             stepping = YES;
                             cfSince = now;
+                            void **tvt = (void **)rd_ptr(mover);
+                            uintptr_t fT = tvt ? rd_ptr((uintptr_t)&tvt[181]) : 0;
+                            if (fT >= gImgBase && fT < gImgEnd) {
+                                DV3 trot = { 0.0, useYaw, 0.0 };
+                                int tries = 0;
+                                BOOL clear = NO;
+                                while (tries < 6) {
+                                    DV3 tpos = { wantX, wantY, wantZ + detourZ };
+                                    clear = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fT)((void *)mover, &tpos, &trot, YES, NO) & 1) != 0;
+                                    if (clear) break;
+                                    detourZ += 400.0;
+                                    tries++;
+                                }
+                                if (detourZ > 4800.0) detourZ = 4800.0;
+                                if (clear && tries == 0 && detourZ > 0.0) detourZ = fmax(0.0, detourZ - 80.0);
+                                static int detLog = 0;
+                                if (tries && detLog++ < 40) metalNote([NSString stringWithFormat:@"farm: path blocked, climbing to +%.0f units (%d tests, clear=%d)", detourZ, tries, clear]);
+                            }
+                            wantZ += detourZ;
+                            ddx = wantX - mp.x; ddy = wantY - mp.y; ddz = wantZ - mp.z;
                         }
                     }
+                    if (!stepping) detourZ = 0.0;
                     if ((cannon && now >= cfHopAt && now - cfTp >= (stepping ? 0.1 : 0.08)) || (!cannon && (stepping || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && now - cfTp > (stepping ? 0.1 : 0.03))) {
                         if (cannon && !cfHopped) { cfHopped = YES; cfLastHop = now; }
                         static int tpChain = 0, tpFail = 0, tpN = 0;
