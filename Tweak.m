@@ -4004,7 +4004,7 @@ static void engineEspFrame(void *cv) {
                     double hx = chest.x - mp.x, hy = chest.y - mp.y, hz = chest.z - mp.z;
                     double hd = sqrt(hx * hx + hy * hy + hz * hz);
                     double chestSecs = 0.2 + gOptChestT * 1.3;
-                    double wait = cannon ? fmax(chestSecs * 0.5, hd / 7000.0) : 0.0;
+                    double wait = cannon ? chestSecs * 0.5 : 0.0; (void)hd;
                     cfHopAt = fmax(now, cfLastHop + wait);
                     cfHopped = NO;
                     cfKey = key; cfSince = cfHopAt;
@@ -4054,7 +4054,18 @@ static void engineEspFrame(void *cv) {
                     double wantY = usePlan ? chest.y + plan[pi].dy : chest.y;
                     double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : (((int)(fmax(0.0, now - cfSince) / 0.16) & 1) ? 25.0 : 0.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
-                    if ((cannon && now >= cfHopAt && now - cfTp >= 0.08) || (!cannon && sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
+                    BOOL stepping = NO;
+                    if (cannon) {
+                        double stepD = sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                        if (stepD > 2400.0 && now >= cfHopAt) {
+                            double k = 2000.0 / stepD;
+                            wantX = mp.x + ddx * k; wantY = mp.y + ddy * k; wantZ = mp.z + ddz * k;
+                            ddx = wantX - mp.x; ddy = wantY - mp.y; ddz = wantZ - mp.z;
+                            stepping = YES;
+                            cfSince = now;
+                        }
+                    }
+                    if ((cannon && now >= cfHopAt && now - cfTp >= (stepping ? 0.12 : 0.08)) || (!cannon && sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
                         if (cannon && !cfHopped) { cfHopped = YES; cfLastHop = now; }
                         static int tpChain = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
