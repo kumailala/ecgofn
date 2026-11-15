@@ -4055,41 +4055,38 @@ static void engineEspFrame(void *cv) {
                     double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : (((int)(fmax(0.0, now - cfSince) / 0.16) & 1) ? 25.0 : 0.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     BOOL stepping = NO;
-                    static double cruiseMin = -1e9;
+                    static CFTimeInterval stuckT = 0;
+                    static DV3 stuckPos = {0, 0, 0};
+                    static BOOL forceDirect = NO;
+                    static double lastKeyF = 0;
+                    if (lastKeyF != key) { lastKeyF = key; forceDirect = NO; stuckT = 0; }
                     {
                         double stepD = sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
                         double dtS = fmax(0.008, fmin(0.05, now - cfTp));
                         double base = (5.0 + gOptTravel * 45.0) * 100.0 * dtS;
                         double ease = fmax(0.4, fmin(1.0, stepD / 1500.0));
                         double stepLen = fmax(30.0, base * ease);
-                        if (stepD > stepLen * 1.5 && now >= cfHopAt) {
+                        if (!forceDirect && stepD > stepLen * 1.5 && now >= cfHopAt) {
                             stepping = YES;
                             cfSince = now;
+                            double mvx = mp.x - stuckPos.x, mvy = mp.y - stuckPos.y, mvz = mp.z - stuckPos.z;
+                            if (stuckT == 0 || sqrt(mvx * mvx + mvy * mvy + mvz * mvz) > 60.0) { stuckPos = mp; stuckT = now; }
+                            else if (now - stuckT > 0.8) {
+                                forceDirect = YES; stepping = NO;
+                                metalNote(@"farm: travel steps are not moving the cannon, jumping straight to the chest instead");
+                            }
+                        }
+                        if (stepping) {
                             double hd2 = hypot(ddx, ddy);
-                            double kh = hd2 > 1e-3 ? fmin(1.0, stepLen / hd2) : 0.0;
-                            double nx = mp.x + ddx * kh, ny = mp.y + ddy * kh;
-                            double tz = fmax(wantZ, cruiseMin);
-                            double nz = mp.z + fmax(-base, fmin(base, tz - mp.z));
-                            BOOL clear = YES;
-                            void **tvt = (void **)rd_ptr(mover);
-                            uintptr_t fT = tvt ? rd_ptr((uintptr_t)&tvt[181]) : 0;
-                            if (fT >= gImgBase && fT < gImgEnd) {
-                                DV3 trot = { 0.0, useYaw, 0.0 };
-                                DV3 tpos = { nx, ny, nz };
-                                clear = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fT)((void *)mover, &tpos, &trot, YES, NO) & 1) != 0;
-                            }
-                            static int detLog = 0;
-                            if (clear) {
-                                wantX = nx; wantY = ny; wantZ = nz;
-                            } else {
-                                wantX = mp.x; wantY = mp.y; wantZ = mp.z + base;
-                                cruiseMin = wantZ + 400.0;
-                                if (detLog++ < 40) metalNote([NSString stringWithFormat:@"farm: path blocked, climbing (cruise height now %.0f)", cruiseMin]);
-                            }
+                            double lift = fmin(3000.0, 400.0 + hd2 * 0.25);
+                            double tzAlt = wantZ + (hd2 > 1500.0 ? lift : lift * hd2 / 1500.0);
+                            double dzMove = fmax(-base, fmin(base, tzAlt - mp.z));
+                            double canH = (hd2 > 1500.0 && mp.z < tzAlt - 250.0) ? 0.0 : 1.0;
+                            double kh = hd2 > 1e-3 ? fmin(1.0, stepLen / hd2) * canH : 0.0;
+                            wantX = mp.x + ddx * kh; wantY = mp.y + ddy * kh; wantZ = mp.z + dzMove;
                             ddx = wantX - mp.x; ddy = wantY - mp.y; ddz = wantZ - mp.z;
                         }
                     }
-                    if (!stepping) cruiseMin = -1e9;
                     if ((cannon && now >= cfHopAt && (stepping || now - cfTp >= 0.08)) || (!cannon && (stepping || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && (stepping || now - cfTp > 0.03))) {
                         if (cannon && !cfHopped) { cfHopped = YES; cfLastHop = now; }
                         static int tpChain = 0, tpFail = 0, tpN = 0;
