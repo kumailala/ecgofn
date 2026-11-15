@@ -371,7 +371,7 @@ static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
-static BOOL  gOptFreeze = YES;
+static BOOL  gOptFreeze = YES, gOptLead = YES;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
 static volatile BOOL gFarmActiveNow = NO;
@@ -3404,6 +3404,14 @@ static void engCircle(void *cv, double cx, double cy, double r, int seg, double 
     }
 }
 
+static double segDist(double px, double py, double ax, double ay, double bx, double by) {
+    double vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+    double l2 = vx * vx + vy * vy;
+    double t = l2 > 1e-9 ? (wx * vx + wy * vy) / l2 : 0.0;
+    if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+    return hypot(px - (ax + vx * t), py - (ay + vy * t));
+}
+
 static uintptr_t gAimPawn = 0;
 static int gAimApplied = 0, gAimTargetFrames = 0, gDrawnPlayers = 0, gDbgAds = 0, gDbgAdsFlag = 0;
 static int gDbgTargetingFrames = 0, gDbgCand = 0, gDbgInFov = 0, gDbgDownedSkip = 0, gDbnoSeen = 0, gDbnoSet = 0;
@@ -3526,8 +3534,29 @@ static void engineEspFrame(void *cv) {
         if (onScreen && bw > 2.0 && bh > 2.0 && bw < sx * 4.0 && bh < sy * 4.0) {
             gDrawnPlayers++;
             if (gOptTrigger && !downed) {
-                double mx = bw * 0.14, my = bh * 0.10;
-                if (cx0 >= bx0 + mx && cx0 <= bx1 - mx && cy0 >= by0 + my && cy0 <= by1 - my) {
+                BOOL tHit = NO;
+                if (haveB) {
+                    CGPoint tsp[16]; BOOL tok[16];
+                    for (int i = 0; i < 16; i++) {
+                        CGFloat nx, ny; float dp;
+                        tok[i] = project(&view, rb.w[i], &nx, &ny, &dp);
+                        if (tok[i]) tsp[i] = CGPointMake(nx * sx, ny * sy);
+                    }
+                    double thr = fmax(3.0 * sc, bh * 0.055), bestSeg = 1e30;
+                    for (int i = 0; i < 15; i++) {
+                        int a = kRaaxPairs[i][0], b = kRaaxPairs[i][1];
+                        if (tok[a] && tok[b]) {
+                            double dd2 = segDist(cx0, cy0, tsp[a].x, tsp[a].y, tsp[b].x, tsp[b].y);
+                            if (dd2 < bestSeg) bestSeg = dd2;
+                        }
+                    }
+                    if (tok[0]) { double dh = hypot(cx0 - tsp[0].x, cy0 - tsp[0].y) - bh * 0.03; if (dh < bestSeg) bestSeg = dh; }
+                    tHit = bestSeg <= thr;
+                } else {
+                    double mx = bw * 0.14, my = bh * 0.10;
+                    tHit = cx0 >= bx0 + mx && cx0 <= bx1 - mx && cy0 >= by0 + my && cy0 <= by1 - my;
+                }
+                if (tHit) {
                     double dd = distM;
                     if (dd < trigBest) { trigBest = dd; trigCand = ep.pawn; }
                 }
@@ -3576,6 +3605,24 @@ static void engineEspFrame(void *cv) {
                 tp = (DV3){ a0.x + (a1.x - a0.x) * lerpK, a0.y + (a1.y - a0.y) * lerpK, a0.z + (a1.z - a0.z) * lerpK };
             } else {
                 tp = (DV3){ root.x, root.y, root.z + (gOptAimBody ? 25.0 : 62.0) };
+            }
+            if (gOptLead) {
+                static struct { uintptr_t p; DV3 pos; CFTimeInterval t; double vx, vy; } trk[64];
+                int ti = (int)((ep.pawn >> 4) & 63);
+                if (trk[ti].p != ep.pawn) {
+                    trk[ti].p = ep.pawn; trk[ti].pos = tp; trk[ti].t = now; trk[ti].vx = trk[ti].vy = 0.0;
+                } else {
+                    double tdt = now - trk[ti].t;
+                    if (tdt > 0.004) {
+                        if (tdt < 0.2) {
+                            double vx = (tp.x - trk[ti].pos.x) / tdt, vy = (tp.y - trk[ti].pos.y) / tdt;
+                            if (hypot(vx, vy) < 1500.0) { trk[ti].vx = 0.65 * trk[ti].vx + 0.35 * vx; trk[ti].vy = 0.65 * trk[ti].vy + 0.35 * vy; }
+                            else { trk[ti].vx = trk[ti].vy = 0.0; }
+                        } else { trk[ti].vx = trk[ti].vy = 0.0; }
+                        trk[ti].pos = tp; trk[ti].t = now;
+                    }
+                }
+                tp.x += trk[ti].vx * 0.05; tp.y += trk[ti].vy * 0.05;
             }
             CGFloat nx, ny; float dp;
             BOOL pOk = project(&view, tp, &nx, &ny, &dp);
@@ -4179,6 +4226,7 @@ static void saveOptions(void) {
     [d setBool:gOptChest forKey:@"echo.chest"];
     [d setBool:gOptCannonFarm forKey:@"echo.cfarm"];
     [d setBool:gOptFreeze forKey:@"echo.freeze"];
+    [d setBool:gOptLead forKey:@"echo.lead"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
@@ -4208,6 +4256,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.chest"]) gOptChest = [d boolForKey:@"echo.chest"];
     gOptCannonFarm = [d boolForKey:@"echo.cfarm"];
     if ([d objectForKey:@"echo.freeze"]) gOptFreeze = [d boolForKey:@"echo.freeze"];
+    if ([d objectForKey:@"echo.lead"]) gOptLead = [d boolForKey:@"echo.lead"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
@@ -4263,6 +4312,7 @@ static void loadOptions(void) {
         case 34: gOptChest = on; break;
         case 35: gOptCannonFarm = on; break;
         case 36: gOptFreeze = on; break;
+        case 37: gOptLead = on; break;
         case 24: gOptWeaponEsp = on; break;
         case 25: gOptEngineDraw = on; break;
     }
@@ -4416,6 +4466,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Only while aiming (ADS)", gOptAdsOnly, 5);
         addSwitch(panel, &y, @"Show aim FOV circle", gOptShowFov, 6);
         addSwitch(panel, &y, @"Trigger bot (fires on enemy in crosshair)", gOptTrigger, 9);
+        addSwitch(panel, &y, @"Aimbot: lead moving targets", gOptLead, 37);
         addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
