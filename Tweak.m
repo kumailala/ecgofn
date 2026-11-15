@@ -120,6 +120,11 @@ static void hook_setPreferredFPS(id self, SEL _cmd, NSInteger v) {
     orig_setPreferredFPS(self, _cmd, 60);
 }
 
+static NSInteger (*orig_maxFPS)(id, SEL);
+static NSInteger hook_maxFPS(id self, SEL _cmd) {
+    return 60;
+}
+
 static void (*orig_setFRR)(id, SEL, EchoFRR);
 static void hook_setFRR(id self, SEL _cmd, EchoFRR r) {
     EchoFRR f = { 60.0f, 60.0f, 60.0f };
@@ -4659,6 +4664,8 @@ __attribute__((constructor)) static void EchoModInit(void) {
     }
 
     gLinks = [NSHashTable weakObjectsHashTable];
+    Class sc = objc_getClass("UIScreen");
+    if (sc) exchange(sc, @selector(maximumFramesPerSecond), (IMP)hook_maxFPS, (IMP *)&orig_maxFPS);
     Class dl = objc_getClass("CADisplayLink");
     if (dl) {
         exchange(dl, @selector(setPreferredFramesPerSecond:),
