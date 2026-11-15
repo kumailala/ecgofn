@@ -3626,6 +3626,7 @@ static void engineEspFrame(void *cv) {
         double bw = bx1 - bx0, bh = by1 - by0;
         if (onScreen && bw > 2.0 && bh > 2.0 && bw < sx * 4.0 && bh < sy * 4.0) {
             gDrawnPlayers++;
+            BOOL onSkelHit = NO;
             if (gOptTrigger && !downed) {
                 BOOL tHit = NO;
                 if (haveB) {
@@ -3635,7 +3636,7 @@ static void engineEspFrame(void *cv) {
                         tok[i] = project(&view, rb.w[i], &nx, &ny, &dp);
                         if (tok[i]) tsp[i] = CGPointMake(nx * sx, ny * sy);
                     }
-                    double thr = fmax(3.0 * sc, bh * 0.055), bestSeg = 1e30;
+                    double thr = fmax(2.5 * sc, bh * 0.04), bestSeg = 1e30;
                     for (int i = 0; i < 15; i++) {
                         int a = kRaaxPairs[i][0], b = kRaaxPairs[i][1];
                         if (tok[a] && tok[b]) {
@@ -3649,6 +3650,7 @@ static void engineEspFrame(void *cv) {
                     double mx = bw * 0.14, my = bh * 0.10;
                     tHit = cx0 >= bx0 + mx && cx0 <= bx1 - mx && cy0 >= by0 + my && cy0 <= by1 - my;
                 }
+                onSkelHit = tHit;
                 if (tHit) {
                     double dd = distM;
                     if (dd < trigBest) { trigBest = dd; trigCand = ep.pawn; }
@@ -3666,7 +3668,7 @@ static void engineEspFrame(void *cv) {
                 }
                 for (int i = 0; i < 15; i++) {
                     int a = kRaaxPairs[i][0], b = kRaaxPairs[i][1];
-                    if (sok[a] && sok[b]) engLine(cv, scr[a].x, scr[a].y, scr[b].x, scr[b].y, (float)(1.0 * sc), cSecondary);
+                    if (sok[a] && sok[b]) engLine(cv, scr[a].x, scr[a].y, scr[b].x, scr[b].y, (float)(1.0 * sc), onSkelHit ? cPrimary : cSecondary);
                 }
             }
             double midX = (bx0 + bx1) * 0.5;
