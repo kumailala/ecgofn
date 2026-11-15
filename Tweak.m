@@ -3533,7 +3533,7 @@ static void engineEspFrame(void *cv) {
     double sc = sx / 1000.0;
     if (sc < 1.0) sc = 1.0;
     const float cPrimary[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
-    const float cSecondary[4] = { 0.0f, 0.47f, 1.0f, 1.0f };
+    const float cSecondary[4] = { 0.1f, 0.9f, 1.0f, 1.0f };
     double fovRad = fov * M_PI / 180.0;
     double ppd = sx / ((2.0 * tan(0.5 * fovRad)) * 180.0 / M_PI);
     double fovDeg = gOptFov * 60.0;
@@ -3668,7 +3668,7 @@ static void engineEspFrame(void *cv) {
                 }
                 for (int i = 0; i < 15; i++) {
                     int a = kRaaxPairs[i][0], b = kRaaxPairs[i][1];
-                    if (sok[a] && sok[b]) engLine(cv, scr[a].x, scr[a].y, scr[b].x, scr[b].y, (float)(1.0 * sc), onSkelHit ? cPrimary : cSecondary);
+                    if (sok[a] && sok[b]) engLine(cv, scr[a].x, scr[a].y, scr[b].x, scr[b].y, (float)(1.8 * sc), onSkelHit ? cPrimary : cSecondary);
                 }
             }
             double midX = (bx0 + bx1) * 0.5;
