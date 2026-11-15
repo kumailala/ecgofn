@@ -410,7 +410,7 @@ static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
-static BOOL  gOptFreeze = YES, gOptLead = YES;
+static BOOL  gOptFreeze = NO, gOptLead = YES;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
 static volatile BOOL gFarmActiveNow = NO;
@@ -3988,9 +3988,9 @@ static void engineEspFrame(void *cv) {
                 if ([cfSkip containsObject:@(sk)]) continue;
                 double dx = lo.x - mp.x, dy = lo.y - mp.y, dz = lo.z - mp.z;
                 double d = sqrt(dx * dx + dy * dy + dz * dz);
-                if (d < bd && d < 80000.0) { bd = d; chest = lo; cfCur = sk; }
+                if (d < bd) { bd = d; chest = lo; cfCur = sk; }
             }
-            if (!chest && cfSkip.count && now - cfClear > 3.0) { cfClear = now; [cfSkip removeAllObjects]; }
+            if (!chest && cfSkip.count && now - cfClear > 0.3) { cfClear = now; [cfSkip removeAllObjects]; }
             if (now - cfLog > 4.0) {
                 cfLog = now;
                 metalNote([NSString stringWithFormat:@"farm: on, cannons %d (nearest %.1f m), chests %d, mover %@, target %@", nCannons, cd / 100.0, nChests, cannon ? @"cannon" : @"pawn", chest ? @"yes" : @"no"]);
@@ -4001,10 +4001,10 @@ static void engineEspFrame(void *cv) {
                     if (cfKey != 0) metalNote([NSString stringWithFormat:@"farm: next chest after %.2f s", now - cfSince]);
                     cfKey = key; cfSince = now;
                 }
-                if (now - cfSince > (cannon ? 0.5 : 7.0)) {
+                if (now - cfSince > (cannon ? 0.4 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
-                    metalNote(cannon ? @"farm: chest not broken after 0.5 s, next chest" : @"farm: skipping a chest after 7 s");
+                    metalNote(cannon ? @"farm: chest not broken after 0.4 s, next chest" : @"farm: skipping a chest after 7 s");
                 } else {
                     static int ramFlip = 0;
                     static double testKey = 0;
@@ -4043,7 +4043,7 @@ static void engineEspFrame(void *cv) {
                     double useYaw = usePlan ? plan[pi].yaw : rot.y;
                     double wantX = usePlan ? chest.x + plan[pi].dx : chest.x - 700.0;
                     double wantY = usePlan ? chest.y + plan[pi].dy : chest.y;
-                    double wantZ = usePlan ? chest.z + plan[pi].dz : chest.z + 220.0;
+                    double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : ((ramFlip & 1) ? 45.0 : -5.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if (cannon || (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
                         static int tpChain = 0, tpFail = 0, tpN = 0;
@@ -4361,7 +4361,7 @@ static void saveOptions(void) {
     [d setBool:gOptTrigger forKey:@"echo.trigger"];
     [d setBool:gOptChest forKey:@"echo.chest"];
     [d setBool:gOptCannonFarm forKey:@"echo.cfarm"];
-    [d setBool:gOptFreeze forKey:@"echo.freeze"];
+    [d setBool:gOptFreeze forKey:@"echo.freeze2"];
     [d setBool:gOptLead forKey:@"echo.lead"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
@@ -4391,7 +4391,7 @@ static void loadOptions(void) {
     gOptTrigger = [d boolForKey:@"echo.trigger"];
     if ([d objectForKey:@"echo.chest"]) gOptChest = [d boolForKey:@"echo.chest"];
     gOptCannonFarm = [d boolForKey:@"echo.cfarm"];
-    if ([d objectForKey:@"echo.freeze"]) gOptFreeze = [d boolForKey:@"echo.freeze"];
+    if ([d objectForKey:@"echo.freeze2"]) gOptFreeze = [d boolForKey:@"echo.freeze2"];
     if ([d objectForKey:@"echo.lead"]) gOptLead = [d boolForKey:@"echo.lead"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
@@ -4607,7 +4607,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
-        addSwitch(panel, &y, @"Freeze cannon while farming (no physics)", gOptFreeze, 36);
+        addSwitch(panel, &y, @"Stiff cannon (freeze physics, fewer chest hits)", gOptFreeze, 36);
         addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
         addButtonTag(panel, &y, @"TP + break chest: SetActorLocation + rotation (upright)", @selector(farmMethod:), 107);
         addButtonTag(panel, &y, @"TP + break chest: TeleportTo", @selector(farmMethod:), 100);
