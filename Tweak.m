@@ -4019,10 +4019,10 @@ static void engineEspFrame(void *cv) {
                         int tests = 0;
                         if (fTest >= gImgBase && fTest < gImgEnd) {
                             static const double kRing[9][2] = { {0, 0}, {150, 0}, {-150, 0}, {0, 150}, {0, -150}, {110, 110}, {-110, 110}, {110, -110}, {-110, -110} };
-                            static const double kZ[3] = { 40.0, 140.0, 260.0 };
+                            static const double kZ[3] = { 40.0, 90.0, 140.0 };
                             static const double kYawAdd[4] = { 0.0, 90.0, 180.0, 270.0 };
                             for (int zi = 0; zi < 3 && planN < 3 && tests < 60; zi++)
-                                for (int ri = 0; ri < 9 && planN < 3 && tests < 60; ri++)
+                                for (int ri = 0; ri < 1 && planN < 3 && tests < 60; ri++)
                                     for (int yi = 0; yi < 4 && planN < 3 && tests < 60; yi++) {
                                         DV3 tpos = { chest.x + kRing[ri][0], chest.y + kRing[ri][1], chest.z + kZ[zi] };
                                         DV3 trot = { 0.0, farmYaw + kYawAdd[yi], 0.0 };
