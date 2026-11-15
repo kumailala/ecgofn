@@ -411,6 +411,7 @@ static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
 static BOOL  gOptFreeze = NO, gOptLead = YES;
+static float gOptChestT = 0.385f;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
 static volatile BOOL gFarmActiveNow = NO;
@@ -3900,7 +3901,8 @@ static void engineEspFrame(void *cv) {
 
     {
         static int lastClick = 0;
-        static CFTimeInterval manualUntil = 0, cfTp = 0, cfFire = 0, cfSince = 0, cfLog = 0, cfClear = 0;
+        static CFTimeInterval manualUntil = 0, cfTp = 0, cfFire = 0, cfSince = 0, cfLog = 0, cfClear = 0, cfHopAt = 0, cfLastHop = 0;
+        static BOOL cfHopped = NO;
         static double cfKey = 0;
         static long long cfCur = 0;
         static NSMutableSet<NSNumber *> *cfSkip = nil;
@@ -3999,18 +4001,25 @@ static void engineEspFrame(void *cv) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) {
                     if (cfKey != 0) metalNote([NSString stringWithFormat:@"farm: next chest after %.2f s", now - cfSince]);
-                    cfKey = key; cfSince = now;
+                    double hx = chest.x - mp.x, hy = chest.y - mp.y, hz = chest.z - mp.z;
+                    double hd = sqrt(hx * hx + hy * hy + hz * hz);
+                    double chestSecs = 0.2 + gOptChestT * 1.3;
+                    double wait = cannon ? fmax(chestSecs * 0.5, hd / 7000.0) : 0.0;
+                    cfHopAt = fmax(now, cfLastHop + wait);
+                    cfHopped = NO;
+                    cfKey = key; cfSince = cfHopAt;
                 }
-                if (now - cfSince > (cannon ? 0.4 : 7.0)) {
+                if (now - cfSince > (cannon ? 0.2 + gOptChestT * 1.3 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
-                    metalNote(cannon ? @"farm: chest not broken after 0.4 s, next chest" : @"farm: skipping a chest after 7 s");
+                    metalNote(cannon ? @"farm: chest not broken in time, next chest" : @"farm: skipping a chest after 7 s");
                 } else {
                     static int ramFlip = 0;
                     static double testKey = 0;
                     static struct { double dx, dy, dz, yaw; } plan[4];
                     static int planN = 0;
                     ramFlip++;
+                    { DV3 cpf; if (chest.actor && actorLocation(chest.actor, &cpf)) { chest.x = cpf.x; chest.y = cpf.y; chest.z = cpf.z; } }
                     if (cannon && testKey != key) {
                         testKey = key;
                         planN = 0;
@@ -4019,7 +4028,7 @@ static void engineEspFrame(void *cv) {
                         int tests = 0;
                         if (fTest >= gImgBase && fTest < gImgEnd) {
                             static const double kRing[9][2] = { {0, 0}, {150, 0}, {-150, 0}, {0, 150}, {0, -150}, {110, 110}, {-110, 110}, {110, -110}, {-110, -110} };
-                            static const double kZ[3] = { 5.0, 30.0, 60.0 };
+                            static const double kZ[3] = { 25.0, 55.0, 85.0 };
                             static const double kYawAdd[4] = { 0.0, 90.0, 180.0, 270.0 };
                             for (int zi = 0; zi < 3 && planN < 3 && tests < 60; zi++)
                                 for (int ri = 0; ri < 1 && planN < 3 && tests < 60; ri++)
@@ -4035,7 +4044,7 @@ static void engineEspFrame(void *cv) {
                                     }
                         }
                         static int planLog = 0;
-                        if (planN == 0) { plan[0].dx = 0; plan[0].dy = 0; plan[0].dz = 5.0; plan[0].yaw = farmYaw; planN = 1; if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: no free spot found after %d tests, using the chest centre", tests]); }
+                        if (planN == 0) { plan[0].dx = 0; plan[0].dy = 0; plan[0].dz = 25.0; plan[0].yaw = farmYaw; planN = 1; if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: no free spot found after %d tests, using the chest centre", tests]); }
                         else if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: %d free spots after %d tests, first offset (%.0f, %.0f, %.0f) yaw %+.0f", planN, tests, plan[0].dx, plan[0].dy, plan[0].dz, plan[0].yaw - farmYaw]);
                     }
                     int pi = (cannon && planN > 1 && now - cfSince > 0.25) ? 1 : 0;
@@ -4043,9 +4052,10 @@ static void engineEspFrame(void *cv) {
                     double useYaw = usePlan ? plan[pi].yaw : rot.y;
                     double wantX = usePlan ? chest.x + plan[pi].dx : chest.x - 700.0;
                     double wantY = usePlan ? chest.y + plan[pi].dy : chest.y;
-                    double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : ((ramFlip & 1) ? 12.0 : -5.0)) : chest.z + 220.0;
+                    double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : (((int)(fmax(0.0, now - cfSince) / 0.16) & 1) ? 25.0 : 0.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
-                    if (cannon || (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
+                    if ((cannon && now >= cfHopAt && now - cfTp >= 0.08) || (!cannon && sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
+                        if (cannon && !cfHopped) { cfHopped = YES; cfLastHop = now; }
                         static int tpChain = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
@@ -4363,6 +4373,7 @@ static void saveOptions(void) {
     [d setBool:gOptCannonFarm forKey:@"echo.cfarm"];
     [d setBool:gOptFreeze forKey:@"echo.freeze2"];
     [d setBool:gOptLead forKey:@"echo.lead"];
+    [d setFloat:gOptChestT forKey:@"echo.chesttime"];
     [d setFloat:gOptTrigDelay forKey:@"echo.trigdelay"];
     [d setBool:gOptHudLayout forKey:@"echo.hudlayout"];
     [d setBool:gOptLowGfx forKey:@"echo.lowgfx"];
@@ -4393,6 +4404,7 @@ static void loadOptions(void) {
     gOptCannonFarm = [d boolForKey:@"echo.cfarm"];
     if ([d objectForKey:@"echo.freeze2"]) gOptFreeze = [d boolForKey:@"echo.freeze2"];
     if ([d objectForKey:@"echo.lead"]) gOptLead = [d boolForKey:@"echo.lead"];
+    if ([d objectForKey:@"echo.chesttime"]) gOptChestT = [d floatForKey:@"echo.chesttime"];
     if ([d objectForKey:@"echo.trigdelay"]) gOptTrigDelay = [d floatForKey:@"echo.trigdelay"];
     if ([d objectForKey:@"echo.hudlayout"]) gOptHudLayout = [d boolForKey:@"echo.hudlayout"];
     if ([d objectForKey:@"echo.lowgfx"]) gOptLowGfx = [d boolForKey:@"echo.lowgfx"];
@@ -4412,6 +4424,7 @@ static void loadOptions(void) {
 @property (nonatomic, strong) UILabel *dmgLabel;
 @property (nonatomic, strong) UILabel *lagLabel;
 @property (nonatomic, strong) UILabel *trigLabel;
+@property (nonatomic, strong) UILabel *chestLabel;
 @end
 @implementation EchoMenuHandler
 - (void)farmMethod:(UIButton *)b {
@@ -4459,6 +4472,7 @@ static void loadOptions(void) {
     if (s.tag == 22) { gOptDmgMul = s.value; self.dmgLabel.text = [NSString stringWithFormat:@"Damage x%d", 1 + (int)(s.value * 49.0f)]; }
     if (s.tag == 23) { gOptLagF = s.value * 3.0f; self.lagLabel.text = [NSString stringWithFormat:@"ESP lag  %.2f game ticks", gOptLagF]; }
     if (s.tag == 33) { gOptTrigDelay = s.value; self.trigLabel.text = [NSString stringWithFormat:@"Trigger delay  %.0f ms", s.value * 300.0f]; }
+    if (s.tag == 38) { gOptChestT = s.value; self.chestLabel.text = [NSString stringWithFormat:@"Chest time  %.2f s", 0.2 + s.value * 1.3]; }
     if (s.tag == 21) { gOptFov = s.value; self.fovLabel.text = [NSString stringWithFormat:@"Aim FOV  %.0f%%", s.value * 100]; }
     saveOptions();
 }
@@ -4608,6 +4622,8 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
         addSwitch(panel, &y, @"Stiff cannon (freeze physics, fewer chest hits)", gOptFreeze, 36);
+        gMenuHandler.chestLabel = addSlider(panel, &y, @"Chest time", gOptChestT, 38);
+        gMenuHandler.chestLabel.text = [NSString stringWithFormat:@"Chest time  %.2f s", 0.2 + gOptChestT * 1.3];
         addButton(panel, &y, @"Teleport to next chest", @selector(farmClicked:));
         addButtonTag(panel, &y, @"TP + break chest: SetActorLocation + rotation (upright)", @selector(farmMethod:), 107);
         addButtonTag(panel, &y, @"TP + break chest: TeleportTo", @selector(farmMethod:), 100);
