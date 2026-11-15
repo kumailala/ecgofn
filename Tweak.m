@@ -4019,7 +4019,7 @@ static void engineEspFrame(void *cv) {
                         int tests = 0;
                         if (fTest >= gImgBase && fTest < gImgEnd) {
                             static const double kRing[9][2] = { {0, 0}, {150, 0}, {-150, 0}, {0, 150}, {0, -150}, {110, 110}, {-110, 110}, {110, -110}, {-110, -110} };
-                            static const double kZ[3] = { 40.0, 90.0, 140.0 };
+                            static const double kZ[3] = { 5.0, 30.0, 60.0 };
                             static const double kYawAdd[4] = { 0.0, 90.0, 180.0, 270.0 };
                             for (int zi = 0; zi < 3 && planN < 3 && tests < 60; zi++)
                                 for (int ri = 0; ri < 1 && planN < 3 && tests < 60; ri++)
@@ -4035,7 +4035,7 @@ static void engineEspFrame(void *cv) {
                                     }
                         }
                         static int planLog = 0;
-                        if (planN == 0) { plan[0].dx = 0; plan[0].dy = 0; plan[0].dz = 40.0; plan[0].yaw = farmYaw; planN = 1; if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: no free spot found after %d tests, using the chest centre", tests]); }
+                        if (planN == 0) { plan[0].dx = 0; plan[0].dy = 0; plan[0].dz = 5.0; plan[0].yaw = farmYaw; planN = 1; if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: no free spot found after %d tests, using the chest centre", tests]); }
                         else if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: %d free spots after %d tests, first offset (%.0f, %.0f, %.0f) yaw %+.0f", planN, tests, plan[0].dx, plan[0].dy, plan[0].dz, plan[0].yaw - farmYaw]);
                     }
                     int pi = (cannon && planN > 1 && now - cfSince > 0.25) ? 1 : 0;
@@ -4043,7 +4043,7 @@ static void engineEspFrame(void *cv) {
                     double useYaw = usePlan ? plan[pi].yaw : rot.y;
                     double wantX = usePlan ? chest.x + plan[pi].dx : chest.x - 700.0;
                     double wantY = usePlan ? chest.y + plan[pi].dy : chest.y;
-                    double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : ((ramFlip & 1) ? 45.0 : -5.0)) : chest.z + 220.0;
+                    double wantZ = usePlan ? chest.z + plan[pi].dz + (gOptFreeze ? 0.0 : ((ramFlip & 1) ? 12.0 : -5.0)) : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if (cannon || (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
                         static int tpChain = 0, tpFail = 0, tpN = 0;
