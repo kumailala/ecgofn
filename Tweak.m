@@ -3947,6 +3947,24 @@ static void engineEspFrame(void *cv) {
                 if (lo.tier == -2) nChests++;
             }
             if (cd > 4500.0) cannon = nil;
+            {
+                static int cvOff = -2;
+                static BOOL vehSeen = NO, vehPrev = NO;
+                static CFTimeInterval vehLog = 0;
+                if (cvOff == -2) {
+                    cvOff = gCls[C_FPLAYERPAWN] ? propOff(gCls[C_FPLAYERPAWN], "CurrentVehicle") : -1;
+                    metalNote([NSString stringWithFormat:@"farm: CurrentVehicle offset 0x%x", cvOff]);
+                }
+                uintptr_t curVeh = cvOff >= 0 ? rd_ptr(lp + (uintptr_t)cvOff) : 0;
+                BOOL inVeh = curVeh > 0x100000000ULL;
+                if (inVeh && !vehSeen) { vehSeen = YES; metalNote(@"farm: pawn is in a vehicle, farm will pause if it gets ejected"); }
+                if (vehSeen && inVeh != vehPrev) {
+                    metalNote(inVeh ? @"farm: back in the vehicle, farm resumed" : [NSString stringWithFormat:@"farm: ejected from the vehicle after %.1f s on this chest, farm paused until you get back in", now - cfSince]);
+                }
+                vehPrev = inVeh;
+                if (vehSeen && !inVeh && now >= manualUntil) cannon = nil;
+                (void)vehLog;
+            }
             uintptr_t mover = cannon ? cannon.actor : lp;
             DV3 mp = cam;
             if (cannon) mp = (DV3){ cannon.x, cannon.y, cannon.z };
