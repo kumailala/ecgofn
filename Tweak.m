@@ -4008,28 +4008,42 @@ static void engineEspFrame(void *cv) {
                 } else {
                     static int ramFlip = 0;
                     static double testKey = 0;
+                    static struct { double dx, dy, dz, yaw; } plan[4];
+                    static int planN = 0;
                     ramFlip++;
                     if (cannon && testKey != key) {
                         testKey = key;
+                        planN = 0;
                         void **svt = (void **)rd_ptr(cannon.actor);
                         uintptr_t fTest = svt ? rd_ptr((uintptr_t)&svt[181]) : 0;
-                        static int testLog = 0;
-                        if (fTest >= gImgBase && fTest < gImgEnd && testLog < 30) {
-                            testLog++;
-                            DV3 trot = { 0.0, rot.y, 0.0 };
-                            DV3 c0 = { chest.x, chest.y, chest.z + 40.0 }, c1 = { chest.x, chest.y, chest.z + 220.0 };
-                            BOOL r0 = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTest)((void *)cannon.actor, &c0, &trot, YES, NO) & 1) != 0;
-                            BOOL r1 = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTest)((void *)cannon.actor, &c1, &trot, YES, NO) & 1) != 0;
-                            metalNote([NSString stringWithFormat:@"farm: placement test at chest ok=%d, above chest ok=%d", r0, r1]);
+                        int tests = 0;
+                        if (fTest >= gImgBase && fTest < gImgEnd) {
+                            static const double kRing[9][2] = { {0, 0}, {150, 0}, {-150, 0}, {0, 150}, {0, -150}, {110, 110}, {-110, 110}, {110, -110}, {-110, -110} };
+                            static const double kZ[3] = { 40.0, 140.0, 260.0 };
+                            static const double kYawAdd[4] = { 0.0, 90.0, 180.0, 270.0 };
+                            for (int zi = 0; zi < 3 && planN < 3 && tests < 60; zi++)
+                                for (int ri = 0; ri < 9 && planN < 3 && tests < 60; ri++)
+                                    for (int yi = 0; yi < 4 && planN < 3 && tests < 60; yi++) {
+                                        DV3 tpos = { chest.x + kRing[ri][0], chest.y + kRing[ri][1], chest.z + kZ[zi] };
+                                        DV3 trot = { 0.0, farmYaw + kYawAdd[yi], 0.0 };
+                                        tests++;
+                                        if ((((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTest)((void *)cannon.actor, &tpos, &trot, YES, NO) & 1) != 0) {
+                                            plan[planN].dx = kRing[ri][0]; plan[planN].dy = kRing[ri][1];
+                                            plan[planN].dz = kZ[zi]; plan[planN].yaw = trot.y;
+                                            planN++;
+                                        }
+                                    }
                         }
+                        static int planLog = 0;
+                        if (planN == 0) { plan[0].dx = 0; plan[0].dy = 0; plan[0].dz = 40.0; plan[0].yaw = farmYaw; planN = 1; if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: no free spot found after %d tests, using the chest centre", tests]); }
+                        else if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: %d free spots after %d tests, first offset (%.0f, %.0f, %.0f) yaw %+.0f", planN, tests, plan[0].dx, plan[0].dy, plan[0].dz, plan[0].yaw - farmYaw]);
                     }
-                    static const double kShift[5][2] = { {0, 0}, {120, 0}, {-120, 0}, {0, 120}, {0, -120} };
-                    int shiftIdx = cannon ? (int)((now - cfSince) / 0.3) % 5 : 0;
-                    int zPhase = cannon ? ((int)((now - cfSince) / 0.3) & 1) : 0;
-                    double useYaw = cannon ? farmYaw : rot.y;
-                    double wantX = cannon ? chest.x + kShift[shiftIdx][0] : chest.x - 700.0;
-                    double wantY = cannon ? chest.y + kShift[shiftIdx][1] : chest.y;
-                    double wantZ = cannon ? chest.z + (zPhase ? 90.0 : 40.0) : chest.z + 220.0;
+                    int pi = (cannon && planN > 0) ? ((int)((now - cfSince) / 0.17) % planN) : 0;
+                    BOOL usePlan = cannon && planN > 0;
+                    double useYaw = usePlan ? plan[pi].yaw : rot.y;
+                    double wantX = usePlan ? chest.x + plan[pi].dx : chest.x - 700.0;
+                    double wantY = usePlan ? chest.y + plan[pi].dy : chest.y;
+                    double wantZ = usePlan ? chest.z + plan[pi].dz : chest.z + 220.0;
                     double ddx = wantX - mp.x, ddy = wantY - mp.y, ddz = wantZ - mp.z;
                     if (cannon || (sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0 && now - cfTp > 0.03)) {
                         static int tpChain = 0, tpFail = 0, tpN = 0;
