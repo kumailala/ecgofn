@@ -1139,12 +1139,15 @@ static BOOL boolMask(uintptr_t cls, const char *prop, int *off, uint8_t *mask) {
         if (b4[0] == 1 && b4[1] < 8 && b4[2] && !(b4[2] & (b4[2] - 1)) && b4[3] == b4[2]) {
             scanOff = o + b4[1]; scanMask = b4[2]; scanPos = pos; break;
         }
+        if (b4[3] == 1 && b4[1] < 8 && b4[0] && !(b4[0] & (b4[0] - 1)) && b4[2] == b4[0]) {
+            scanOff = o + b4[1]; scanMask = b4[0]; scanPos = pos; break;
+        }
     }
     uint8_t dump[0x30];
     NSMutableString *hx = [NSMutableString string];
     if (safe_read(f + 0x60, dump, sizeof dump)) for (int i = 0; i < 0x30; i++) [hx appendFormat:@"%02x", dump[i]];
     metalNote([NSString stringWithFormat:@"bool %s: off 0x%x inferred 0x%x/0x%x scan %d/0x%x @0x%x raw+0x60 %@", prop, o, infOff, infMask, scanOff, scanMask, scanPos, hx]);
-    BOOL preferScan = (strcmp(prop, "bIsDBNO") == 0);
+    BOOL preferScan = YES;
     if (preferScan && scanOff >= 0) { *off = scanOff; *mask = scanMask; return YES; }
     if (infOff >= 0) { *off = infOff; *mask = infMask; return YES; }
     if (scanOff >= 0) { *off = scanOff; *mask = scanMask; return YES; }
@@ -1674,6 +1677,28 @@ static BOOL containerSearched(uintptr_t a, uintptr_t cls) {
     }
     if (sv.intValue < 0) return NO;
     return (rd_u8(a + (uintptr_t)(sv.intValue >> 8)) & (uint8_t)(sv.intValue & 0xff)) != 0;
+}
+
+static BOOL containerBroken(uintptr_t a) {
+    uintptr_t cls = rd_ptr(a + (uintptr_t)gOffClass);
+    static NSMutableDictionary<NSNumber *, NSArray<NSNumber *> *> *cache = nil;
+    if (!cache) cache = [NSMutableDictionary dictionary];
+    NSArray<NSNumber *> *list = cache[@(cls)];
+    if (!list) {
+        NSMutableArray *arr = [NSMutableArray array];
+        static const char *kNames[3] = { "bPlayedDying", "bDestroyed", "bAlreadySearched" };
+        for (int i = 0; i < 3; i++) {
+            int o = -1; uint8_t m = 1;
+            if (boolMask(cls, kNames[i], &o, &m) && o > 0) [arr addObject:@((o << 8) | m)];
+        }
+        list = arr;
+        cache[@(cls)] = list;
+    }
+    for (NSNumber *n in list) {
+        int v = n.intValue;
+        if (rd_u8(a + (uintptr_t)(v >> 8)) & (uint8_t)(v & 0xff)) return YES;
+    }
+    return NO;
 }
 
 static void freezeCannon(uintptr_t actor, BOOL freeze) {
@@ -3940,7 +3965,7 @@ static void engineEspFrame(void *cv) {
             double bd = 1e30;
             for (EchoLoot *lo in lootNow) {
                 if (lo.tier != -2) continue;
-                if (lo.actor && (!looks_like_uobject(lo.actor) || containerSearched(lo.actor, rd_ptr(lo.actor + (uintptr_t)gOffClass)))) continue;
+                if (lo.actor && (!looks_like_uobject(lo.actor) || containerBroken(lo.actor))) continue;
                 long long sk = (long long)(lo.x * 0.5) ^ ((long long)(lo.y * 0.5) << 20);
                 if ([cfSkip containsObject:@(sk)]) continue;
                 double dx = lo.x - mp.x, dy = lo.y - mp.y, dz = lo.z - mp.z;
@@ -3958,10 +3983,10 @@ static void engineEspFrame(void *cv) {
                     if (cfKey != 0) metalNote([NSString stringWithFormat:@"farm: next chest after %.2f s", now - cfSince]);
                     cfKey = key; cfSince = now;
                 }
-                if (now - cfSince > (cannon ? 0.6 : 7.0)) {
+                if (now - cfSince > (cannon ? 0.5 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
                     cfKey = 0;
-                    metalNote(cannon ? @"farm: chest not broken after 0.6 s, next chest" : @"farm: skipping a chest after 7 s");
+                    metalNote(cannon ? @"farm: chest not broken after 0.5 s, next chest" : @"farm: skipping a chest after 7 s");
                 } else {
                     static int ramFlip = 0;
                     static double testKey = 0;
