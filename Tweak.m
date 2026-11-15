@@ -112,9 +112,42 @@ static NSInteger hook_thermalState(id self, SEL _cmd) {
     return 0; // NSProcessInfoThermalStateNominal
 }
 
+typedef struct { float minimum, maximum, preferred; } EchoFRR;
+static NSHashTable *gLinks = nil;
+
 static void (*orig_setPreferredFPS)(id, SEL, NSInteger);
 static void hook_setPreferredFPS(id self, SEL _cmd, NSInteger v) {
-    orig_setPreferredFPS(self, _cmd, 0); // 0 == maximum supported refresh rate
+    orig_setPreferredFPS(self, _cmd, 60);
+}
+
+static void (*orig_setFRR)(id, SEL, EchoFRR);
+static void hook_setFRR(id self, SEL _cmd, EchoFRR r) {
+    EchoFRR f = { 60.0f, 60.0f, 60.0f };
+    orig_setFRR(self, _cmd, f);
+}
+
+static void (*orig_addToRunLoop)(id, SEL, NSRunLoop *, NSRunLoopMode);
+static void hook_addToRunLoop(id self, SEL _cmd, NSRunLoop *rl, NSRunLoopMode m) {
+    @synchronized (gLinks) { [gLinks addObject:self]; }
+    orig_addToRunLoop(self, _cmd, rl, m);
+    ((CADisplayLink *)self).preferredFramesPerSecond = 60;
+}
+
+static void repinFrameRate(void) {
+    NSArray *links;
+    @synchronized (gLinks) { links = gLinks.allObjects; }
+    SEL frr = NSSelectorFromString(@"setPreferredFrameRateRange:");
+    for (CADisplayLink *l in links) {
+        l.preferredFramesPerSecond = 60;
+        if ([l respondsToSelector:frr]) {
+            IMP imp = class_getMethodImplementation([CADisplayLink class], frr);
+            EchoFRR f = { 60.0f, 60.0f, 60.0f };
+            ((void (*)(id, SEL, EchoFRR))imp)(l, frr, f);
+        }
+    }
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    [[NSNotificationCenter defaultCenter] postNotificationName:NSProcessInfoThermalStateDidChangeNotification object:pi];
+    [[NSNotificationCenter defaultCenter] postNotificationName:NSProcessInfoPowerStateDidChangeNotification object:pi];
 }
 
 #pragma mark - 2) real render counter
@@ -4467,7 +4500,6 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Show aim FOV circle", gOptShowFov, 6);
         addSwitch(panel, &y, @"Trigger bot (fires on enemy in crosshair)", gOptTrigger, 9);
         addSwitch(panel, &y, @"Aimbot: lead moving targets", gOptLead, 37);
-        addSwitch(panel, &y, @"Force low graphics (next launch)", gOptLowGfx, 11);
         addSwitch(panel, &y, @"Weapon ESP (rarity colour)", gOptWeaponEsp, 24);
         addSwitch(panel, &y, @"Loot ESP", gOptLoot, 23);
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
@@ -4584,7 +4616,7 @@ static void updateScreenDiag(void) {
 
 static void forceLowGraphics(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    BOOL low = ([d objectForKey:@"echo.lowgfx"] && [d boolForKey:@"echo.lowgfx"]);
+    (void)d;
 
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (!docs) return;
@@ -4598,35 +4630,12 @@ static void forceLowGraphics(void) {
         @"bAllowControllers=True\n"
         @"bGameSupportsMultipleActiveControllers=True\n\n";
 
-    NSString *engine = ctl;
-    if (low) {
-        engine = [ctl stringByAppendingString:
-            @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]\n"
-            @"FrameRateLock=PUFRL_60\n\n"
-            @"[/Script/Engine.Engine]\n"
-            @"bSmoothFrameRate=False\n"
-            @"bUseFixedFrameRate=False\n\n"
-            @"[SystemSettings]\n"
-            @"t.MaxFPS=120\n"
-            @"sg.ResolutionQuality=100\n"
-            @"sg.ViewDistanceQuality=0\n"
-            @"sg.AntiAliasingQuality=0\n"
-            @"sg.ShadowQuality=0\n"
-            @"sg.PostProcessQuality=0\n"
-            @"sg.TextureQuality=0\n"
-            @"sg.EffectsQuality=0\n"
-            @"sg.FoliageQuality=0\n"];
-    }
-    NSString *profiles = low ?
-        @"[IPhoneX DeviceProfile]\n"
-        @"+CVars=sg.ResolutionQuality=100\n"
-        @"+CVars=sg.ViewDistanceQuality=0\n"
-        @"+CVars=sg.AntiAliasingQuality=0\n"
-        @"+CVars=sg.ShadowQuality=0\n"
-        @"+CVars=sg.PostProcessQuality=0\n"
-        @"+CVars=sg.TextureQuality=0\n"
-        @"+CVars=sg.EffectsQuality=0\n"
-        @"+CVars=sg.FoliageQuality=0\n" : @"";
+    NSString *engine = [ctl stringByAppendingString:
+        @"[/Script/IOSRuntimeSettings.IOSRuntimeSettings]\n"
+        @"FrameRateLock=PUFRL_60\n\n"
+        @"[SystemSettings]\n"
+        @"t.MaxFPS=60\n"];
+    NSString *profiles = @"";
     for (NSString *dd in @[ dir, dir2 ]) {
         [engine writeToFile:[dd stringByAppendingPathComponent:@"Engine.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [ctl writeToFile:[dd stringByAppendingPathComponent:@"Game.ini"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -4649,10 +4658,22 @@ __attribute__((constructor)) static void EchoModInit(void) {
                  (IMP)hook_thermalState, (IMP *)&orig_thermalState);
     }
 
+    gLinks = [NSHashTable weakObjectsHashTable];
     Class dl = objc_getClass("CADisplayLink");
     if (dl) {
         exchange(dl, @selector(setPreferredFramesPerSecond:),
                  (IMP)hook_setPreferredFPS, (IMP *)&orig_setPreferredFPS);
+        exchange(dl, NSSelectorFromString(@"setPreferredFrameRateRange:"),
+                 (IMP)hook_setFRR, (IMP *)&orig_setFRR);
+        exchange(dl, @selector(addToRunLoop:forMode:),
+                 (IMP)hook_addToRunLoop, (IMP *)&orig_addToRunLoop);
+    }
+    for (NSNotificationName nm in @[ UIApplicationDidBecomeActiveNotification, UIApplicationWillEnterForegroundNotification, UIApplicationWillResignActiveNotification ]) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:nm object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+            repinFrameRate();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ repinFrameRate(); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ repinFrameRate(); });
+        }];
     }
 
     Class ml = objc_getClass("CAMetalLayer");
