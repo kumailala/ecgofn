@@ -4038,7 +4038,7 @@ static void engineEspFrame(void *cv) {
                         if (planN == 0) { plan[0].dx = 0; plan[0].dy = 0; plan[0].dz = 40.0; plan[0].yaw = farmYaw; planN = 1; if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: no free spot found after %d tests, using the chest centre", tests]); }
                         else if (planLog++ < 40) metalNote([NSString stringWithFormat:@"farm: %d free spots after %d tests, first offset (%.0f, %.0f, %.0f) yaw %+.0f", planN, tests, plan[0].dx, plan[0].dy, plan[0].dz, plan[0].yaw - farmYaw]);
                     }
-                    int pi = (cannon && planN > 0) ? ((int)((now - cfSince) / 0.17) % planN) : 0;
+                    int pi = (cannon && planN > 1 && now - cfSince > 0.25) ? 1 : 0;
                     BOOL usePlan = cannon && planN > 0;
                     double useYaw = usePlan ? plan[pi].yaw : rot.y;
                     double wantX = usePlan ? chest.x + plan[pi].dx : chest.x - 700.0;
@@ -4056,6 +4056,18 @@ static void engineEspFrame(void *cv) {
                         int useMethod = (gFarmMethodSel >= 0 && gFarmMethodSel < 8) ? gFarmMethodSel : autoMethod;
                         if (tpHaveLast && gFarmMethodSel < 0) {
                             double lx = tpLastWant.x - mp.x, ly = tpLastWant.y - mp.y, lz = tpLastWant.z - mp.z;
+                            {
+                                double dl = sqrt(lx * lx + ly * ly + lz * lz);
+                                static double drMax = 0, drSum = 0;
+                                static int drN = 0;
+                                static CFTimeInterval drLog = 0;
+                                if (dl < 400.0) { if (dl > drMax) drMax = dl; drSum += dl; drN++; }
+                                if (now - drLog > 2.0) {
+                                    drLog = now;
+                                    if (drN) metalNote([NSString stringWithFormat:@"farm: hold drift avg %.1f max %.1f units over %d frames", drSum / drN, drMax, drN]);
+                                    drMax = 0; drSum = 0; drN = 0;
+                                }
+                            }
                             if (sqrt(lx * lx + ly * ly + lz * lz) > 400.0) {
                                 if (++tpFail >= 60) {
                                     tpFail = 0;
