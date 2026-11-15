@@ -3481,13 +3481,19 @@ static void engineEspFrame(void *cv) {
     CFTimeInterval now = CACurrentMediaTime();
 
     {
-        static CFTimeInterval lastFpsCmd = 0;
-        static int fpsCmdLog = 0;
-        double every = (now < gFpsBurstUntil) ? 1.0 : 10.0;
-        if (now - lastFpsCmd > every) {
+        static CFTimeInterval lastFpsCmd = 0, fpsT0 = 0;
+        static int fpsCmdLog = 0, fpsFrames = 0;
+        static double fpsNow = 60.0;
+        fpsFrames++;
+        if (fpsT0 == 0) fpsT0 = now;
+        if (now - fpsT0 >= 1.0) {
+            fpsNow = fpsFrames / (now - fpsT0);
+            fpsFrames = 0; fpsT0 = now;
+        }
+        if (fpsNow > 34.0 && fpsNow < 57.0 && now - lastFpsCmd > 3.0) {
             lastFpsCmd = now;
             engineConsole(pc, "t.MaxFPS 60");
-            if (fpsCmdLog++ < 8) metalNote(@"fps: ran console command t.MaxFPS 60");
+            if (fpsCmdLog++ < 20) metalNote([NSString stringWithFormat:@"fps: %.0f fps, ran t.MaxFPS 60", fpsNow]);
         }
     }
 
