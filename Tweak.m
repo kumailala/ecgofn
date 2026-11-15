@@ -114,6 +114,7 @@ static NSInteger hook_thermalState(id self, SEL _cmd) {
 
 typedef struct { float minimum, maximum, preferred; } EchoFRR;
 static NSHashTable *gLinks = nil;
+static volatile CFTimeInterval gFpsBurstUntil = 0;
 
 static void (*orig_setPreferredFPS)(id, SEL, NSInteger);
 static void hook_setPreferredFPS(id self, SEL _cmd, NSInteger v) {
@@ -3456,6 +3457,17 @@ static int gDbgTargetingFrames = 0, gDbgCand = 0, gDbgInFov = 0, gDbgDownedSkip 
 static double gDbgFov = 0, gDbgBase = 0;
 static double gAimScreenX = 0, gAimScreenY = 0;
 
+static void engineConsole(uintptr_t pc, const char *cmd) {
+    uintptr_t fn = SYM(0x100f155cc);
+    if (fn < gImgBase || fn >= gImgEnd || !looks_like_uobject(pc)) return;
+    uint16_t buf[64];
+    int n = 0;
+    while (cmd[n] && n < 62) { buf[n] = (uint16_t)cmd[n]; n++; }
+    buf[n] = 0;
+    struct { uint16_t *d; int32_t num, max; } fs = { buf, n + 1, 64 };
+    ((void (*)(void *, void *, void *))fn)((void *)pc, &fs, (void *)pc);
+}
+
 static void engineEspFrame(void *cv) {
     int sx = rd_i32((uintptr_t)cv + 0x40), sy = rd_i32((uintptr_t)cv + 0x44);
     if (sx < 200 || sy < 200 || sx > 8000 || sy > 8000) return;
@@ -3467,6 +3479,17 @@ static void engineEspFrame(void *cv) {
     DV3 cam, rot; float fov, ts;
     if (!readCameraStable(pc, &cam, &rot, &fov, &ts)) return;
     CFTimeInterval now = CACurrentMediaTime();
+
+    {
+        static CFTimeInterval lastFpsCmd = 0;
+        static int fpsCmdLog = 0;
+        double every = (now < gFpsBurstUntil) ? 1.0 : 10.0;
+        if (now - lastFpsCmd > every) {
+            lastFpsCmd = now;
+            engineConsole(pc, "t.MaxFPS 60");
+            if (fpsCmdLog++ < 8) metalNote(@"fps: ran console command t.MaxFPS 60");
+        }
+    }
 
     if (gVPOff < 0 && gVPTries < 400) { gVPTries++; vpProbe(cv, cam, rot, fov); }
     const double *vpm = NULL;
@@ -4677,6 +4700,7 @@ __attribute__((constructor)) static void EchoModInit(void) {
     }
     for (NSNotificationName nm in @[ UIApplicationDidBecomeActiveNotification, UIApplicationWillEnterForegroundNotification, UIApplicationWillResignActiveNotification ]) {
         [[NSNotificationCenter defaultCenter] addObserverForName:nm object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+            gFpsBurstUntil = CACurrentMediaTime() + 10.0;
             repinFrameRate();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ repinFrameRate(); });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ repinFrameRate(); });
