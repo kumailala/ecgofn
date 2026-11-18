@@ -410,8 +410,16 @@ static BOOL  gOptAimBody = NO;
 static BOOL  gOptNoRecoil = NO, gOptNoSpread = NO, gOptTrigger = NO;
 static float gOptTrigDelay = 0.15f;
 static BOOL  gOptCannonFarm = NO;
-static BOOL  gOptFreeze = NO, gOptLead = YES;
+static BOOL  gOptFreeze = NO, gOptLead = YES, gOptFly = YES;
 static float gOptChestT = 0.385f, gOptTravel = 1.0f;
+
+// Loot rate governor. The server sees every chest a pawn breaks and the
+// per-minute number is a statistic, not a heuristic: 1 chest every 0.7 s is
+// 85 a minute, which no player reaches. Burst then pause keeps the average
+// inside a human band.
+static const int    kLootBurst  = 12;
+static const double kLootWindow = 60.0;
+static const double kLootPause  = 20.0;
 static volatile int gFarmClick = 0;
 static volatile int gFarmMethodSel = -1;
 static volatile BOOL gFarmActiveNow = NO;
@@ -1700,6 +1708,48 @@ static BOOL containerBroken(uintptr_t a) {
         if (rd_u8(a + (uintptr_t)(v >> 8)) & (uint8_t)(v & 0xff)) return YES;
     }
     return NO;
+}
+
+static uintptr_t gFlyActor = 0;
+static CFTimeInterval gFlyT = 0;
+
+static uintptr_t cannonRootPrim(uintptr_t actor) {
+    uintptr_t root = rd_ptr(actor + (uintptr_t)O_ACTOR_ROOT);
+    if (!looks_like_uobject(root)) return 0;
+    static NSMutableDictionary<NSNumber *, NSNumber *> *pc2 = nil;
+    if (!pc2) pc2 = [NSMutableDictionary dictionary];
+    uintptr_t cls = rd_ptr(root + (uintptr_t)gOffClass);
+    NSNumber *v = pc2[@(cls)];
+    if (!v) {
+        BOOL prim = NO;
+        uintptr_t c = cls;
+        for (int d = 0; d < 14 && looks_like_uobject(c); d++) {
+            if ([fname_string(fnidx(c + (uintptr_t)gOffName)) isEqualToString:@"PrimitiveComponent"]) { prim = YES; break; }
+            c = rd_ptr(c + (uintptr_t)OFF_SUPER);
+        }
+        v = @(prim);
+        pc2[@(cls)] = v;
+    }
+    return v.boolValue ? root : 0;
+}
+
+static BOOL flyCannon(uintptr_t actor, double vx, double vy, double vz, BOOL gravity) {
+    uintptr_t root = cannonRootPrim(actor);
+    if (!root) return NO;
+    void **vt = (void **)rd_ptr(root);
+    if (!vt) return NO;
+    uintptr_t fVel = rd_ptr((uintptr_t)&vt[244]), fGrav = rd_ptr((uintptr_t)&vt[304]);
+    if (!(fVel >= gImgBase && fVel < gImgEnd)) return NO;
+    DV3 v = { vx, vy, vz };
+    ((void (*)(void *, const DV3 *, BOOL))fVel)((void *)root, &v, NO);
+    static BOOL lastGrav = YES;
+    static uintptr_t lastRoot = 0;
+    if (lastRoot != root) { lastRoot = root; lastGrav = YES; }
+    if (lastGrav != gravity && fGrav >= gImgBase && fGrav < gImgEnd) {
+        ((void (*)(void *, BOOL))fGrav)((void *)root, gravity);
+        lastGrav = gravity;
+    }
+    return YES;
 }
 
 static void freezeCannon(uintptr_t actor, BOOL freeze) {
@@ -3922,9 +3972,17 @@ static void engineEspFrame(void *cv) {
         static double farmYaw = 0.0;
         static uintptr_t farmFrozen = 0;
         gFarmActiveNow = farmOn;
+        static int cfBurst = 0;
+        static CFTimeInterval cfBurstAt = 0, cfPauseUntil = 0;
+        if (cfBurstAt && now - cfBurstAt > kLootWindow) { cfBurst = 0; cfBurstAt = 0; }
+        BOOL farmCool = now < cfPauseUntil;
         if (!farmOn && farmFrozen) {
             if (rd_ptr(farmFrozen + (uintptr_t)gOffClass) > 0x100000000ULL) freezeCannon(farmFrozen, NO);
             farmFrozen = 0;
+        }
+        if (gFlyActor && (!farmOn || now - gFlyT > 0.15)) {
+            if (looks_like_uobject(gFlyActor)) flyCannon(gFlyActor, 0, 0, 0, YES);
+            gFlyActor = 0;
         }
         if (!farmOn && farmHomeActor) {
             uintptr_t fSR = SYM(0x100d0b050);
@@ -3999,7 +4057,8 @@ static void engineEspFrame(void *cv) {
                 cfLog = now;
                 metalNote([NSString stringWithFormat:@"farm: on, cannons %d (nearest %.1f m), chests %d, mover %@, target %@", nCannons, cd / 100.0, nChests, cannon ? @"cannon" : @"pawn", chest ? @"yes" : @"no"]);
             }
-            if (chest && (cannon || now < manualUntil)) {
+            if (chest && farmCool) cfSince = fmax(cfSince, now);
+            if (chest && !farmCool && (cannon || now < manualUntil)) {
                 double key = chest.x * 3.0 + chest.y * 7.0 + chest.z;
                 if (key != cfKey) {
                     if (cfKey != 0) metalNote([NSString stringWithFormat:@"farm: next chest after %.2f s", now - cfSince]);
@@ -4010,6 +4069,13 @@ static void engineEspFrame(void *cv) {
                     cfHopAt = fmax(now, cfLastHop + wait);
                     cfHopped = NO;
                     cfKey = key; cfSince = cfHopAt;
+                    if (!cfBurstAt) cfBurstAt = now;
+                    if (++cfBurst >= kLootBurst) {
+                        cfBurst = 0;
+                        cfBurstAt = 0;
+                        cfPauseUntil = now + kLootPause;
+                        metalNote([NSString stringWithFormat:@"farm: %d chests taken, holding %.0f s", kLootBurst, kLootPause]);
+                    }
                 }
                 if (now - cfSince > (cannon ? 0.2 + gOptChestT * 1.3 : 7.0)) {
                     [cfSkip addObject:@(cfCur)];
@@ -4089,14 +4155,35 @@ static void engineEspFrame(void *cv) {
                             ddx = wantX - mp.x; ddy = wantY - mp.y; ddz = wantZ - mp.z;
                         }
                     }
-                    if ((cannon && now >= cfHopAt && (stepping || now - cfTp >= 0.08)) || (!cannon && (stepping || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && (stepping || now - cfTp > 0.03))) {
+                    BOOL flew = NO;
+                    if (cannon && gOptFly && stepping) {
+                        double dtF = fmax(0.008, fmin(0.05, now - cfTp));
+                        double vx = ddx / dtF, vy = ddy / dtF, vz = ddz / dtF;
+                        double vm = sqrt(vx * vx + vy * vy + vz * vz), vcap = (5.0 + gOptTravel * 45.0) * 100.0;
+                        if (vm > vcap) { vx *= vcap / vm; vy *= vcap / vm; vz *= vcap / vm; }
+                        if (flyCannon(cannon.actor, vx, vy, vz, NO)) {
+                            flew = YES;
+                            gFlyActor = cannon.actor;
+                            gFlyT = now;
+                            static CFTimeInterval flyLog = 0;
+                            if (now - flyLog > 1.0) {
+                                flyLog = now;
+                                metalNote([NSString stringWithFormat:@"farm: flying %.0f m/s, %.0f m to the chest", fmin(vm, vcap) / 100.0, sqrt((chest.x - mp.x) * (chest.x - mp.x) + (chest.y - mp.y) * (chest.y - mp.y) + (chest.z - mp.z) * (chest.z - mp.z)) / 100.0]);
+                            }
+                        }
+                    }
+                    if (!flew && gFlyActor && cannon && gFlyActor == cannon.actor) {
+                        flyCannon(cannon.actor, 0, 0, 0, YES);
+                        gFlyActor = 0;
+                    }
+                    if (!flew && ((cannon && now >= cfHopAt && (stepping || now - cfTp >= 0.08)) || (!cannon && (stepping || sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 250.0) && (stepping || now - cfTp > 0.03)))) {
                         if (cannon && !cfHopped) { cfHopped = YES; cfLastHop = now; }
                         static int tpChain = 0, tpFail = 0, tpN = 0;
                         static DV3 tpLastWant = {0, 0, 0};
                         static BOOL tpHaveLast = NO;
                         static const char *kTpNames[8] = { "TeleportTo", "SetActorLocation(physics)", "SetActorLocation(reset physics)", "SetActorLocation(sweep)", "AddActorWorldOffset", "TeleportTo+SetActorLocation", "LaunchCharacter", "SetActorLocation+Rotation(upright)" };
-                        static const int kChainCannon[6] = { 7, 1, 2, 3, 0, 4 };
-                        static const int kChainPawn[3] = { 7, 1, 6 };
+                        static const int kChainCannon[6] = { 7, 1, 3, 0, 4, 1 };
+                        static const int kChainPawn[3] = { 7, 1, 0 };
                         int autoMethod = cannon ? kChainCannon[tpChain % 6] : kChainPawn[tpChain % 3];
                         int useMethod = (gFarmMethodSel >= 0 && gFarmMethodSel < 8) ? gFarmMethodSel : autoMethod;
                         if (tpHaveLast && gFarmMethodSel < 0) {
@@ -4139,12 +4226,12 @@ static void engineEspFrame(void *cv) {
                                 tpOk = (((BOOL (*)(void *, BOOL, void *, BOOL, double, double, double, double, double, double))fSR)((void *)mover, NO, NULL, YES, wantX, wantY, wantZ, 0.0, useYaw, 0.0) & 1) != 0;
                         }
                         if (useMethod == 0 || useMethod == 5) {
-                            if (tpFn) tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, YES) & 1) != 0;
+                            if (tpFn) tpOk = (((BOOL (*)(void *, const DV3 *, const DV3 *, BOOL, BOOL))fTp)((void *)mover, &np, &nr, NO, NO) & 1) != 0;
                         }
                         if (useMethod == 1) {
                             if (setOk) tpOk = (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 1) & 1) != 0;
                         } else if (useMethod == 2 || useMethod == 5) {
-                            if (setOk) tpOk |= (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 2) & 1) != 0;
+                            if (setOk) tpOk |= (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 1) & 1) != 0;
                         } else if (useMethod == 3) {
                             if (setOk) tpOk = (((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, YES, NULL, 1) & 1) != 0;
                         } else if (useMethod == 4) {
@@ -4160,7 +4247,7 @@ static void engineEspFrame(void *cv) {
                             }
                         }
                         if (cannon && setOk && useMethod != 2 && useMethod != 5)
-                            ((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 2);
+                            ((BOOL (*)(void *, const DV3 *, BOOL, void *, int))fSet)((void *)mover, &np, NO, NULL, 1);
                         tpLastWant = np; tpHaveLast = YES;
                         cfTp = now;
                         if (++tpN <= 6 || tpN % 100 == 0) metalNote([NSString stringWithFormat:@"farm: %s %@ #%d ok=%d to (%.0f, %.0f, %.0f) from (%.0f, %.0f, %.0f)", kTpNames[useMethod], cannon ? @"cannon" : @"pawn", tpN, tpOk, wantX, wantY, wantZ, mp.x, mp.y, mp.z]);
@@ -4407,6 +4494,7 @@ static void saveOptions(void) {
     [d setBool:gOptChest forKey:@"echo.chest"];
     [d setBool:gOptCannonFarm forKey:@"echo.cfarm"];
     [d setBool:gOptFreeze forKey:@"echo.freeze2"];
+    [d setBool:gOptFly forKey:@"echo.fly"];
     [d setBool:gOptLead forKey:@"echo.lead"];
     [d setFloat:gOptChestT forKey:@"echo.chesttime"];
     [d setFloat:gOptTravel forKey:@"echo.travel2"];
@@ -4439,6 +4527,7 @@ static void loadOptions(void) {
     if ([d objectForKey:@"echo.chest"]) gOptChest = [d boolForKey:@"echo.chest"];
     gOptCannonFarm = [d boolForKey:@"echo.cfarm"];
     if ([d objectForKey:@"echo.freeze2"]) gOptFreeze = [d boolForKey:@"echo.freeze2"];
+    if ([d objectForKey:@"echo.fly"]) gOptFly = [d boolForKey:@"echo.fly"];
     if ([d objectForKey:@"echo.lead"]) gOptLead = [d boolForKey:@"echo.lead"];
     if ([d objectForKey:@"echo.chesttime"]) gOptChestT = [d floatForKey:@"echo.chesttime"];
     if ([d objectForKey:@"echo.travel2"]) gOptTravel = [d floatForKey:@"echo.travel2"];
@@ -4500,6 +4589,7 @@ static void loadOptions(void) {
         case 35: gOptCannonFarm = on; break;
         case 36: gOptFreeze = on; break;
         case 37: gOptLead = on; break;
+        case 40: gOptFly = on; break;
         case 24: gOptWeaponEsp = on; break;
         case 25: gOptEngineDraw = on; break;
     }
@@ -4661,6 +4751,7 @@ static void installMenu(void) {
         addSwitch(panel, &y, @"Chest / ammo / llama / cannon ESP", gOptChest, 34);
         addSwitch(panel, &y, @"Auto chest-farm (in a cannon)", gOptCannonFarm, 35);
         addSwitch(panel, &y, @"Stiff cannon (freeze physics, fewer chest hits)", gOptFreeze, 36);
+        addSwitch(panel, &y, @"Fly to chests (drag the cannon, no teleport)", gOptFly, 40);
         gMenuHandler.chestLabel = addSlider(panel, &y, @"Chest time", gOptChestT, 38);
         gMenuHandler.chestLabel.text = [NSString stringWithFormat:@"Chest time  %.2f s", 0.2 + gOptChestT * 1.3];
         gMenuHandler.travelLabel = addSlider(panel, &y, @"Travel speed", gOptTravel, 39);
