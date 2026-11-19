@@ -4156,12 +4156,25 @@ static void engineEspFrame(void *cv) {
                         }
                     }
                     BOOL flew = NO;
+                    if (cannon) {
+                        static uintptr_t loggedCannon = 0;
+                        if (loggedCannon != cannon.actor) {
+                            loggedCannon = cannon.actor;
+                            NSMutableString *ch = [NSMutableString string];
+                            uintptr_t c = rd_ptr(cannon.actor + (uintptr_t)gOffClass);
+                            for (int d = 0; d < 14 && looks_like_uobject(c); d++) {
+                                [ch appendFormat:@" %@", fname_string(fnidx(c + (uintptr_t)gOffName))];
+                                c = rd_ptr(c + (uintptr_t)OFF_SUPER);
+                            }
+                            metalNote([NSString stringWithFormat:@"farm: cannon actor class chain:%@", ch]);
+                        }
+                    }
                     if (cannon && gOptFly && stepping) {
                         double dtF = fmax(0.008, fmin(0.05, now - cfTp));
                         double vx = ddx / dtF, vy = ddy / dtF, vz = ddz / dtF;
                         double vm = sqrt(vx * vx + vy * vy + vz * vz), vcap = (5.0 + gOptTravel * 45.0) * 100.0;
                         if (vm > vcap) { vx *= vcap / vm; vy *= vcap / vm; vz *= vcap / vm; }
-                        if (flyCannon(cannon.actor, vx, vy, vz, NO)) {
+                        if (flyCannon(cannon.actor, vx, vy, vz, YES)) {
                             flew = YES;
                             gFlyActor = cannon.actor;
                             gFlyT = now;
